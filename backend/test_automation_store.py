@@ -28,6 +28,17 @@ def test_automation_store_records_runs_and_ai_decisions(tmp_path):
     assert decision["status"] == "executed"
     assert store.list_ai_decisions()[0]["actions"][0]["type"] == "run_virtual_trade"
 
+    snapshot = store.record_market_snapshot(
+        [{"代码": "000001", "最新价": 11.2}],
+        market_session="morning",
+        source="unit",
+        captured_at="2026-01-02T10:00:00",
+    )
+
+    latest_snapshot = store.latest_snapshot(include_rows=True)
+    assert latest_snapshot["snapshot_id"] == snapshot["snapshot_id"]
+    assert latest_snapshot["rows"][0]["代码"] == "000001"
+
     work_id = store.start_ai_work("factor_lab_iteration", "unit", target_date="2026-01-02", title="AI 因子实验托管")
     work_log = store.finish_ai_work(
         work_id,
@@ -159,3 +170,38 @@ def test_ai_cycle_uses_local_fallback_when_external_ai_fails(tmp_path):
     assert decision["actor"] == "local_guardrail"
     assert decision["source"] == "ai_cycle_fallback"
     assert decision["actions"][0]["params"]["target_date"] == "2026-01-02"
+
+
+def test_market_snapshot_falls_back_to_eastmoney_when_akshare_unavailable(tmp_path, monkeypatch):
+    store = AutomationStore(tmp_path / "automation.db")
+
+    class FakeDataManager:
+        def get_latest_market_overview(self, limit=10):
+            return [{"代码": "fallback", "最新价": 1.0}][:limit]
+
+    orchestrator = AutomationOrchestrator(
+        store=store,
+        data_manager=FakeDataManager(),
+        data_lake_service=object(),
+        ai_service=object(),
+        virtual_trade_runner=lambda: {"status": "success"},
+        context_builder=lambda: {},
+    )
+
+    monkeypatch.setattr(AutomationOrchestrator, "_try_akshare_frame", staticmethod(lambda _name: None))
+
+    def fake_eastmoney_fetch(cls, *, asset_type, limit, **_kwargs):
+        if asset_type == "a_share":
+            return [{"代码": "000001", "名称": "平安银行", "最新价": 11.2, "涨跌幅": 1.1, "昨收": 11.0}]
+        return [{"代码": "518880", "名称": "黄金ETF", "最新价": 9.8, "涨跌幅": 0.6, "昨收": 9.7}]
+
+    monkeypatch.setattr(
+        AutomationOrchestrator,
+        "_fetch_eastmoney_clist_snapshot",
+        classmethod(fake_eastmoney_fetch),
+    )
+
+    rows, source = orchestrator._fetch_market_snapshot(limit=6000)
+
+    assert source == "eastmoney_a+eastmoney_etf"
+    assert [row["代码"] for row in rows] == ["000001", "518880"]

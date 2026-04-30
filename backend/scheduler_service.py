@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
+import requests
 
 from ai_automation import AIAutomationService
 from automation_store import AutomationStore
@@ -21,6 +22,21 @@ logger = logging.getLogger("AutomationScheduler")
 VirtualTradeRunner = Callable[[], Dict[str, Any]]
 ContextBuilder = Callable[[], Dict[str, Any]]
 
+EASTMONEY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://quote.eastmoney.com/",
+    "Accept": "application/json,text/plain,*/*",
+    "Connection": "close",
+}
+EASTMONEY_A_SHARE_URL = "https://82.push2delay.eastmoney.com/api/qt/clist/get"
+EASTMONEY_ETF_URL = "https://88.push2delay.eastmoney.com/api/qt/clist/get"
+EASTMONEY_A_SHARE_FS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
+EASTMONEY_ETF_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827"
+EASTMONEY_FIELDS = "f12,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18"
 
 INTRADAY_SNAPSHOT_TIMES = ["09:35", "10:30", "11:30", "13:30", "14:55"]
 EOD_UPDATE_TIMES = ["16:30", "18:00"]
@@ -47,7 +63,7 @@ MANAGED_WORK_PROFILES: Dict[str, Dict[str, Any]] = {
         "title": "AI 盘中巡检",
         "objective": "抓取盘中快照并识别异常，只记录观察和提示，不写入历史 K 线。",
         "preferred_actions": [
-            {"type": "realtime_snapshot", "params": {"limit": 200}},
+            {"type": "realtime_snapshot", "params": {"limit": 6000}},
             {"type": "check_data_integrity", "params": {"max_scan": 300}},
             {"type": "generate_daily_report", "params": {"mode": "intraday_review"}},
         ],
@@ -137,7 +153,7 @@ class AutomationOrchestrator:
     def set_ai_handlers(self, handlers: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]) -> None:
         self.ai_handlers = handlers
 
-    def run_realtime_snapshot(self, *, trigger: str = "manual", limit: int = 200) -> Dict[str, Any]:
+    def run_realtime_snapshot(self, *, trigger: str = "manual", limit: int = 6000) -> Dict[str, Any]:
         run_id = self.store.start_run("realtime_snapshot", trigger)
         try:
             rows, source = self._fetch_market_snapshot(limit=limit)
@@ -147,6 +163,17 @@ class AutomationOrchestrator:
                 source=source,
             )
             summary = {"snapshot": snapshot, "row_count": len(rows), "source": source}
+            self._record_ai_work_message(
+                work_id=run_id,
+                work_type="realtime_snapshot",
+                trigger=trigger,
+                target_date=None,
+                action_type="realtime_snapshot",
+                status="success",
+                title="盘中快照已更新",
+                body=self._snapshot_message_body(rows, snapshot),
+                details={"snapshot": snapshot, "top_movers": self._top_snapshot_rows(rows, limit=5)},
+            )
             return self.store.finish_run(run_id, "success", summary=summary)
         except Exception as exc:
             logger.exception("realtime snapshot failed")
@@ -679,7 +706,7 @@ class AutomationOrchestrator:
         elif action_type == "generate_daily_report":
             params.setdefault("target_date", target_date)
         elif action_type == "realtime_snapshot":
-            params.setdefault("limit", 200)
+            params.setdefault("limit", 6000)
         return {"type": action_type, "params": params}
 
     def _managed_action_allowed_now(self, action_type: str, context: Dict[str, Any]) -> bool:
@@ -747,19 +774,184 @@ class AutomationOrchestrator:
             return "failed"
         return "skipped"
 
-    def _fetch_market_snapshot(self, *, limit: int) -> tuple[List[Dict[str, Any]], str]:
-        limit = max(1, min(int(limit or 200), 1000))
+    @staticmethod
+    def _try_akshare_frame(fetcher_name: str) -> Optional[pd.DataFrame]:
         try:
             ak = __import__("akshare")
-            frame = ak.stock_zh_a_spot_em()
-            if frame is not None and not frame.empty:
-                if "涨跌幅" in frame.columns:
-                    frame = frame.sort_values("涨跌幅", ascending=False)
-                return frame.head(limit).to_dict(orient="records"), "akshare_spot_em"
+            fetcher = getattr(ak, fetcher_name, None)
+            if not callable(fetcher):
+                return None
+            frame = fetcher()
+            if frame is None or frame.empty:
+                return None
+            return frame
         except Exception as exc:
-            logger.warning("akshare spot snapshot failed, falling back to latest cache: %s", exc)
+            logger.warning("%s snapshot failed: %s", fetcher_name, exc)
+            return None
+
+    @staticmethod
+    def _to_number(value: Any) -> Optional[float]:
+        if value in (None, "", "-"):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _normalize_eastmoney_row(cls, row: Dict[str, Any], *, asset_type: str) -> Dict[str, Any]:
+        return {
+            "代码": str(row.get("f12") or "").strip(),
+            "名称": row.get("f14"),
+            "最新价": cls._to_number(row.get("f2")),
+            "涨跌幅": cls._to_number(row.get("f3")),
+            "涨跌额": cls._to_number(row.get("f4")),
+            "成交量": cls._to_number(row.get("f5")),
+            "成交额": cls._to_number(row.get("f6")),
+            "最高": cls._to_number(row.get("f15")),
+            "最低": cls._to_number(row.get("f16")),
+            "今开": cls._to_number(row.get("f17")),
+            "昨收": cls._to_number(row.get("f18")),
+            "asset_type": asset_type,
+            "source": "eastmoney_direct",
+        }
+
+    @classmethod
+    def _fetch_eastmoney_clist_snapshot(
+        cls,
+        *,
+        url: str,
+        fs: str,
+        asset_type: str,
+        limit: int,
+        page_size: int = 200,
+    ) -> List[Dict[str, Any]]:
+        request_limit = max(1, min(int(limit or 1), 8000))
+        total_pages = max(1, (request_limit + page_size - 1) // page_size)
+        rows: List[Dict[str, Any]] = []
+        session = requests.Session()
+        session.headers.update(EASTMONEY_HEADERS)
+        session.trust_env = False
+        try:
+            for page in range(1, total_pages + 1):
+                response = session.get(
+                    url,
+                    params={
+                        "pn": str(page),
+                        "pz": str(page_size),
+                        "po": "1",
+                        "np": "1",
+                        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                        "fltt": "2",
+                        "invt": "2",
+                        "fid": "f12",
+                        "fs": fs,
+                        "fields": EASTMONEY_FIELDS,
+                        "wbp2u": "|0|0|0|web",
+                    },
+                    timeout=15,
+                    proxies={"http": None, "https": None},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                diff = (((payload or {}).get("data") or {}).get("diff")) or []
+                if not diff:
+                    break
+                rows.extend(
+                    cls._normalize_eastmoney_row(item, asset_type=asset_type)
+                    for item in diff
+                    if isinstance(item, dict)
+                )
+                if len(diff) < page_size or len(rows) >= request_limit:
+                    break
+                time.sleep(0.12)
+        finally:
+            session.close()
+        return rows[:request_limit]
+
+    def _fetch_market_snapshot(self, *, limit: int) -> tuple[List[Dict[str, Any]], str]:
+        limit = max(1, min(int(limit or 6000), 8000))
+        frames: List[pd.DataFrame] = []
+        sources: List[str] = []
+
+        stock_frame = self._try_akshare_frame("stock_zh_a_spot_em")
+        if stock_frame is not None:
+            frames.append(stock_frame)
+            sources.append("akshare_a")
+        else:
+            try:
+                stock_rows = self._fetch_eastmoney_clist_snapshot(
+                    url=EASTMONEY_A_SHARE_URL,
+                    fs=EASTMONEY_A_SHARE_FS,
+                    asset_type="a_share",
+                    limit=limit,
+                )
+                if stock_rows:
+                    frames.append(pd.DataFrame(stock_rows))
+                    sources.append("eastmoney_a")
+            except Exception as exc:
+                logger.warning("eastmoney a-share snapshot failed: %s", exc)
+
+        etf_frame = self._try_akshare_frame("fund_etf_spot_em")
+        if etf_frame is not None:
+            frames.append(etf_frame)
+            sources.append("akshare_etf")
+        else:
+            try:
+                etf_rows = self._fetch_eastmoney_clist_snapshot(
+                    url=EASTMONEY_ETF_URL,
+                    fs=EASTMONEY_ETF_FS,
+                    asset_type="etf",
+                    limit=limit,
+                )
+                if etf_rows:
+                    frames.append(pd.DataFrame(etf_rows))
+                    sources.append("eastmoney_etf")
+            except Exception as exc:
+                logger.warning("eastmoney etf snapshot failed: %s", exc)
+
+        if frames:
+            combined = pd.concat(frames, ignore_index=True, sort=False)
+            if "代码" in combined.columns:
+                combined = combined.drop_duplicates(subset=["代码"], keep="last")
+            if "涨跌幅" in combined.columns:
+                combined = combined.sort_values("涨跌幅", ascending=False, na_position="last")
+            source = "+".join(sources) if sources else "snapshot_mixed"
+            return combined.head(limit).to_dict(orient="records"), source
+
         rows = self.data_manager.get_latest_market_overview(limit=limit)
         return rows[:limit], "latest_market_overview"
+
+    @staticmethod
+    def _top_snapshot_rows(rows: List[Dict[str, Any]], *, limit: int) -> List[Dict[str, Any]]:
+        top_rows = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                continue
+            top_rows.append(
+                {
+                    "symbol": row.get("代码") or row.get("stock_code") or row.get("symbol") or row.get("code"),
+                    "name": row.get("名称") or row.get("stock_name") or row.get("name"),
+                    "price": row.get("最新价") or row.get("current_price") or row.get("close"),
+                    "pct_chg": row.get("涨跌幅") or row.get("pct_chg") or row.get("change_pct"),
+                }
+            )
+        return top_rows
+
+    @classmethod
+    def _snapshot_message_body(cls, rows: List[Dict[str, Any]], snapshot: Dict[str, Any]) -> str:
+        movers = cls._top_snapshot_rows(rows, limit=3)
+        mover_text = "；".join(
+            f"{item.get('name') or item.get('symbol')} {item.get('pct_chg')}%"
+            for item in movers
+            if item.get("symbol") or item.get("name")
+        )
+        suffix = f" 领涨：{mover_text}。" if mover_text else ""
+        return (
+            f"已抓取 {snapshot.get('row_count', len(rows))} 条盘中行情，"
+            "后续会作为实盘模拟页的盘中估值覆盖层，并进入 AI 汇报上下文；不会写入历史 K 线。"
+            f"{suffix}"
+        )
 
     @staticmethod
     def _market_session(now: datetime) -> str:
