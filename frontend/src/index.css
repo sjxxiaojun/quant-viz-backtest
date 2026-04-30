@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+:root {
+  --bg-deep: #0a1628;
+  --bg-mid: #0f1d32;
+  --bg-surface: #132240;
+  --accent-blue: #3b82f6;
+}
+
+body {
+  @apply min-h-screen font-sans antialiased;
+  background: linear-gradient(135deg, #0a1628 0%, #0d1f3c 40%, #101b33 70%, #0b1726 100%);
+  color: #e2e8f0;
+}
+
+/* Glass panels with navy tint */
+.glass {
+  background: rgba(15, 30, 56, 0.55);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(59, 130, 246, 0.08);
+  border-radius: 1rem;
+  padding: 1.5rem;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+}
+
+.input-field {
+  @apply border rounded px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all;
+  background: rgba(10, 22, 40, 0.6);
+  border-color: rgba(59, 130, 246, 0.15);
+}
+
+.btn-primary {
+  @apply bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-lg transition-all shadow-lg active:scale-95;
+}
+
+/* Custom scrollbars */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(10, 22, 40, 0.5);
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  @apply rounded-full;
+  background: rgba(59, 130, 246, 0.3);
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(59, 130, 246, 0.6);
+}
+
+/* Date input styling for webkit */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.6) sepia(1) saturate(3) hue-rotate(190deg);
+  cursor: pointer;
+}

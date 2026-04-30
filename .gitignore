@@ -1,0 +1,65 @@
+# Runtime state
+.omc/
+.omx/
+
+# Secrets and local environment
+.env
+.env.*
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+backend/venv/
+
+# Node / frontend builds
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# Logs
+logs/
+*.log
+backend/*_stdout.log
+backend/*_stderr.log
+frontend/*_stdout.log
+frontend/*_stderr.log
+
+# Local databases and runtime stores
+*.db
+*.db-shm
+*.db-wal
+backend/database/
+
+# Market data, caches, generated reports, and backtest outputs
+data/
+cache/
+outputs/
+reports/
+results/
+backtest_results/
+quant_data_lake/
+backend/data_cache/
+backend/quant_data_lake/
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.joblib
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.sw?
+*.swo
