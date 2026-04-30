@@ -18,6 +18,7 @@ interface HoldingDetail {
   shares: number;
   cost_price: number;
   current_price: number;
+  eod_price?: number | null;
   market_value: number;
   weight: number;
   entry_date?: string | null;
@@ -34,6 +35,15 @@ interface Account {
   top_holdings: string[];
   top_holding_details?: HoldingDetail[];
   return_rate: number;
+  eod_total_value?: number | null;
+  eod_return_rate?: number | null;
+  intraday_total_value?: number | null;
+  intraday_return_rate?: number | null;
+  valuation_source?: string | null;
+  valuation_time?: string | null;
+  snapshot_coverage?: number | null;
+  snapshot_price_count?: number | null;
+  snapshot_total_positions?: number | null;
 }
 
 interface Trade {
@@ -165,6 +175,7 @@ function normalizeHoldingDetail(item: unknown): HoldingDetail | null {
     shares: numberValue(item.shares),
     cost_price: numberValue(item.cost_price),
     current_price: numberValue(item.current_price),
+    eod_price: item.eod_price == null ? null : numberValue(item.eod_price),
     market_value: numberValue(item.market_value),
     weight: numberValue(item.weight),
     entry_date: item.entry_date == null ? null : String(item.entry_date),
@@ -187,6 +198,15 @@ function normalizeAccount(item: unknown): Account {
     top_holdings: Array.isArray(item.top_holdings) ? item.top_holdings.map(String) : [],
     top_holding_details: topHoldingDetails,
     return_rate: numberValue(item.return_rate),
+    eod_total_value: item.eod_total_value == null ? null : numberValue(item.eod_total_value),
+    eod_return_rate: item.eod_return_rate == null ? null : numberValue(item.eod_return_rate),
+    intraday_total_value: item.intraday_total_value == null ? null : numberValue(item.intraday_total_value),
+    intraday_return_rate: item.intraday_return_rate == null ? null : numberValue(item.intraday_return_rate),
+    valuation_source: item.valuation_source == null ? null : String(item.valuation_source),
+    valuation_time: item.valuation_time == null ? null : String(item.valuation_time),
+    snapshot_coverage: item.snapshot_coverage == null ? null : numberValue(item.snapshot_coverage),
+    snapshot_price_count: item.snapshot_price_count == null ? null : numberValue(item.snapshot_price_count),
+    snapshot_total_positions: item.snapshot_total_positions == null ? null : numberValue(item.snapshot_total_positions),
   };
 }
 
@@ -393,7 +413,7 @@ export function VirtualTrading() {
       setAutomationError(null);
       setNotice(null);
       if (kind === 'snapshot') {
-        await apiPost('/api/automation/jobs/realtime-snapshot', { limit: 200 }, { timeout: 60000 });
+        await apiPost('/api/automation/jobs/realtime-snapshot', { limit: 6000 }, { timeout: 60000 });
       } else if (kind === 'eodDryRun') {
         await apiPost('/api/automation/jobs/eod-update', { dry_run: true, limit_a_share: 1, limit_etf: 1 }, { timeout: 120000 });
       } else if (kind === 'virtualTrade') {
@@ -828,7 +848,10 @@ export function VirtualTrading() {
           </div>
         </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-        {accounts.map((acc, index) => (
+        {accounts.map((acc, index) => {
+          const isIntraday = acc.valuation_source === 'intraday_snapshot';
+          const coverageText = `${Math.round((acc.snapshot_coverage || 0) * 100)}%`;
+          return (
           <div 
             key={acc.strategy_id}
             onClick={() => fetchDetails(acc)}
@@ -848,20 +871,32 @@ export function VirtualTrading() {
                 <div>
                   <h3 className="text-xl font-black text-slate-100">{acc.name}</h3>
                   <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">{acc.strategy_id}</div>
+                  {isIntraday && (
+                    <div className="mt-2 inline-flex items-center gap-2 rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-2.5 py-1 text-[10px] font-black text-cyan-200">
+                      <Activity className="h-3 w-3" />
+                      盘中估值 {formatAutomationTime(acc.valuation_time)} · 覆盖 {coverageText}
+                    </div>
+                  )}
                 </div>
               </div>
 
               <div className="grid grid-cols-2 gap-8">
                 <div className="space-y-2">
-                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em]">账户总值</p>
+                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em]">{isIntraday ? '盘中总值' : '账户总值'}</p>
                   <p className="text-2xl font-black text-white">¥{acc.total_value.toLocaleString(undefined, { maximumFractionDigits: 0 })}</p>
+                  {isIntraday && acc.eod_total_value != null && (
+                    <p className="text-[10px] font-bold text-slate-500">昨收估值 ¥{acc.eod_total_value.toLocaleString(undefined, { maximumFractionDigits: 0 })}</p>
+                  )}
                 </div>
                 <div className="space-y-2">
-                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em]">累计回报</p>
+                  <p className="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em]">{isIntraday ? '盘中回报' : '累计回报'}</p>
                   <div className={cn("text-2xl font-black flex items-center gap-1.5", acc.return_rate >= 0 ? "text-emerald-400" : "text-rose-400")}>
                     {acc.return_rate >= 0 ? <TrendingUp className="w-5 h-5" /> : <TrendingDown className="w-5 h-5" />}
                     {acc.return_rate.toFixed(2)}%
                   </div>
+                  {isIntraday && acc.eod_return_rate != null && (
+                    <p className="text-[10px] font-bold text-slate-500">昨收 {acc.eod_return_rate.toFixed(2)}%</p>
+                  )}
                 </div>
               </div>
 
@@ -884,7 +919,8 @@ export function VirtualTrading() {
               </div>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
       </section>
       )}
@@ -1047,7 +1083,12 @@ export function VirtualTrading() {
                         <div className="text-right">
                           <p className="text-[8px] font-bold text-slate-500 uppercase">当前占比</p>
                           <p className="text-xs font-black text-slate-300">{(holding.weight * 100).toFixed(1)}%</p>
-                          <p className="mt-1 text-[10px] font-mono text-slate-500">¥{holding.current_price.toFixed(2)}</p>
+	                          <p className="mt-1 text-[10px] font-mono text-slate-500">
+                              ¥{holding.current_price.toFixed(2)}
+                              {selectedStrategy.valuation_source === 'intraday_snapshot' && holding.eod_price != null && holding.eod_price !== holding.current_price
+                                ? ` · 昨收 ${holding.eod_price.toFixed(2)}`
+                                : ''}
+                            </p>
                         </div>
                         <ArrowRightLeft className="w-3.5 h-3.5 text-slate-700" />
                       </div>

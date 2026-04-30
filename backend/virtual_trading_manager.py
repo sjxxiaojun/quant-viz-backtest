@@ -526,7 +526,13 @@ class VirtualTradingManager:
         )
         return selected
 
-    def get_accounts(self) -> List[Dict]:
+    def get_accounts(
+        self,
+        price_overrides: Optional[Dict[str, float]] = None,
+        valuation_meta: Optional[Dict[str, object]] = None,
+    ) -> List[Dict]:
+        price_overrides = price_overrides or {}
+        valuation_meta = valuation_meta or {}
         conn = self._get_conn()
         try:
             # 获取账户基本信息
@@ -548,11 +554,28 @@ class VirtualTradingManager:
                 
                 # 获取前 3 大重仓
                 strat_pos = positions_df[positions_df['strategy_id'] == strategy_id]
+                matched_snapshot_quotes = 0
                 if not strat_pos.empty:
                     strat_pos = strat_pos.copy()
+                    strat_pos["eod_price"] = strat_pos["current_price"]
+                    if price_overrides:
+                        effective_prices = []
+                        for _, pos in strat_pos.iterrows():
+                            symbol = str(pos["symbol"])
+                            live_price = price_overrides.get(symbol)
+                            if live_price is not None and live_price > 0:
+                                matched_snapshot_quotes += 1
+                                effective_prices.append(float(live_price))
+                            else:
+                                effective_prices.append(float(pos["current_price"]))
+                        strat_pos["current_price"] = effective_prices
                     strat_pos["market_value"] = strat_pos["shares"] * strat_pos["current_price"]
-                    strat_pos["weight"] = strat_pos["market_value"] / float(acc["total_value"] or 1.0)
+                    live_total_value = float(acc["cash"] or 0.0) + float(strat_pos["market_value"].sum())
+                    weight_base = live_total_value or float(acc["total_value"] or 1.0)
+                    strat_pos["weight"] = strat_pos["market_value"] / float(weight_base or 1.0)
                     strat_pos = strat_pos.sort_values('market_value', ascending=False)
+                else:
+                    live_total_value = float(acc["total_value"] or 0.0)
                 top_3 = strat_pos.head(3)['symbol'].tolist() if not strat_pos.empty else []
                 top_details = []
                 for _, pos in (strat_pos.head(5).iterrows() if not strat_pos.empty else []):
@@ -562,24 +585,39 @@ class VirtualTradingManager:
                         "shares": int(pos["shares"]),
                         "cost_price": float(pos["cost_price"]),
                         "current_price": float(pos["current_price"]),
+                        "eod_price": float(pos["eod_price"]) if "eod_price" in pos and pd.notna(pos["eod_price"]) else float(pos["current_price"]),
                         "market_value": float(pos["market_value"]),
                         "weight": float(pos["weight"]),
                         "entry_date": pos.get("entry_date"),
                         "entry_price": float(pos["entry_price"]) if pd.notna(pos.get("entry_price")) else None,
                     })
                 start_value = float(acc["start_value"] or 0.0)
-                total_value = float(acc["total_value"] or 0.0)
+                eod_total_value = float(acc["total_value"] or 0.0)
+                total_positions = len(strat_pos) if not strat_pos.empty else 0
+                has_intraday_valuation = bool(price_overrides and matched_snapshot_quotes > 0)
+                total_value = live_total_value if has_intraday_valuation else eod_total_value
                 return_rate = (total_value / start_value - 1) * 100 if start_value > 0 else 0.0
+                eod_return_rate = (eod_total_value / start_value - 1) * 100 if start_value > 0 else 0.0
                 
                 res.append({
                     "strategy_id": strategy_id,
                     "name": acc['strategy_name'],
-                    "total_value": acc['total_value'],
+                    "total_value": total_value,
                     "cash": acc['cash'],
                     "start_value": acc['start_value'],
                     "last_update": acc['last_update'],
                     "top_holdings": top_3,
                     "top_holding_details": top_details,
+                    "eod_total_value": eod_total_value,
+                    "eod_return_rate": eod_return_rate,
+                    "intraday_total_value": total_value if has_intraday_valuation else None,
+                    "intraday_return_rate": return_rate if has_intraday_valuation else None,
+                    "valuation_source": "intraday_snapshot" if has_intraday_valuation else "eod_close",
+                    "valuation_time": valuation_meta.get("captured_at") if has_intraday_valuation else None,
+                    "valuation_snapshot_id": valuation_meta.get("snapshot_id") if has_intraday_valuation else None,
+                    "snapshot_coverage": (matched_snapshot_quotes / total_positions) if total_positions > 0 and has_intraday_valuation else 0.0,
+                    "snapshot_price_count": matched_snapshot_quotes,
+                    "snapshot_total_positions": total_positions,
                     "strategy_pool": report["pool"] if report is not None else None,
                     "universe_label": report["universe_label"] if report is not None else None,
                     "universe_method": report["universe_method"] if report is not None else None,

@@ -275,6 +275,26 @@ class AutomationStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def latest_snapshot(self, *, include_rows: bool = False) -> Optional[Dict[str, Any]]:
+        columns = "snapshot_id, captured_at, market_session, row_count, source"
+        if include_rows:
+            columns = f"{columns}, rows_json"
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT {columns}
+                FROM market_snapshots
+                ORDER BY captured_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        if include_rows:
+            data["rows"] = _json_loads(data.pop("rows_json", None), [])
+        return data
+
     def record_ai_decision(
         self,
         *,

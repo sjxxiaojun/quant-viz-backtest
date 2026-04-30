@@ -707,3 +707,34 @@ def test_accounts_tolerate_zero_start_value(tmp_path):
     accounts = manager.get_accounts()
 
     assert accounts[0]["return_rate"] == 0.0
+
+
+def test_accounts_can_use_intraday_snapshot_price_overlay(tmp_path):
+    fake_data = FakeDataManager(tmp_path)
+    manager = VirtualTradingManager(tmp_path / "vt.db", fake_data)
+    _insert_account(manager, "live", cash=1000.0, total_value=11000.0)
+    conn = manager._get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO positions (
+                strategy_id, symbol, shares, cost_price, current_price, entry_date, entry_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("live", "000001", 1000, 10.0, 10.0, "2026-01-02", 10.0),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    accounts = manager.get_accounts(
+        price_overrides={"000001": 12.0},
+        valuation_meta={"captured_at": "2026-01-02T10:30:00", "snapshot_id": "snapshot-unit"},
+    )
+
+    assert accounts[0]["valuation_source"] == "intraday_snapshot"
+    assert accounts[0]["total_value"] == 13000.0
+    assert accounts[0]["eod_total_value"] == 11000.0
+    assert accounts[0]["snapshot_coverage"] == 1.0
+    assert accounts[0]["top_holding_details"][0]["current_price"] == 12.0
+    assert accounts[0]["top_holding_details"][0]["eod_price"] == 10.0

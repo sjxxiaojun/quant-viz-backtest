@@ -9,7 +9,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import logging
 
 import pandas as pd
@@ -134,12 +134,135 @@ def _execute_virtual_trade_locked() -> Dict[str, object]:
         VIRTUAL_TRADE_EXECUTE_LOCK.release()
 
 
+def _number_or_none(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            cleaned = value.replace("%", "").replace(",", "").strip()
+            if cleaned in {"", "-", "--", "nan", "None"}:
+                return None
+            value = cleaned
+        parsed = float(value)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _quote_symbol_from_row(row: Dict[str, object]) -> str:
+    raw = row.get("代码") or row.get("stock_code") or row.get("symbol") or row.get("code")
+    text = str(raw or "").strip()
+    if "." in text:
+        text = text.split(".")[-1]
+    return text.zfill(6) if text.isdigit() and len(text) < 6 else text
+
+
+def _snapshot_price_from_row(row: Dict[str, object]) -> Optional[float]:
+    for key in ("最新价", "current_price", "price", "close", "收盘", "最新"):
+        price = _number_or_none(row.get(key))
+        if price is not None:
+            return price
+    return None
+
+
+def _latest_snapshot_quote_payload() -> Dict[str, object]:
+    snapshot = automation_store.latest_snapshot(include_rows=True)
+    if not snapshot:
+        return {"snapshot": None, "price_map": {}, "top_movers": []}
+
+    rows = snapshot.get("rows") if isinstance(snapshot.get("rows"), list) else []
+    price_map: Dict[str, float] = {}
+    top_movers: List[Dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = _quote_symbol_from_row(row)
+        price = _snapshot_price_from_row(row)
+        if symbol and price is not None:
+            price_map[symbol] = price
+        if len(top_movers) < 8:
+            top_movers.append(
+                {
+                    "symbol": symbol,
+                    "name": row.get("名称") or row.get("stock_name") or row.get("name") or symbol,
+                    "price": price,
+                    "pct_chg": row.get("涨跌幅") or row.get("pct_chg") or row.get("change_pct"),
+                }
+            )
+
+    snapshot_meta = {key: value for key, value in snapshot.items() if key != "rows"}
+    return {"snapshot": snapshot_meta, "price_map": price_map, "top_movers": top_movers}
+
+
+def _virtual_accounts_with_intraday_snapshot() -> List[Dict[str, object]]:
+    payload = _latest_snapshot_quote_payload()
+    price_map = payload.get("price_map")
+    snapshot = payload.get("snapshot")
+    if isinstance(price_map, dict) and price_map and isinstance(snapshot, dict):
+        return vt_manager.get_accounts(price_overrides=price_map, valuation_meta=snapshot)
+    return vt_manager.get_accounts()
+
+
+def _intraday_snapshot_context(accounts: Optional[List[Dict[str, object]]] = None) -> Dict[str, object]:
+    payload = _latest_snapshot_quote_payload()
+    snapshot = payload.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return {"available": False, "message": "暂无盘中快照。"}
+    accounts = accounts if accounts is not None else _virtual_accounts_with_intraday_snapshot()
+    total_positions = sum(int(account.get("snapshot_total_positions") or 0) for account in accounts)
+    priced_positions = sum(int(account.get("snapshot_price_count") or 0) for account in accounts)
+    accounts_marked = sum(1 for account in accounts if account.get("valuation_source") == "intraday_snapshot")
+    coverage = priced_positions / total_positions if total_positions > 0 else 0.0
+    return {
+        "available": True,
+        "snapshot_id": snapshot.get("snapshot_id"),
+        "captured_at": snapshot.get("captured_at"),
+        "market_session": snapshot.get("market_session"),
+        "row_count": snapshot.get("row_count"),
+        "source": snapshot.get("source"),
+        "price_count": len(payload.get("price_map") or {}),
+        "top_movers": payload.get("top_movers") or [],
+        "valuation": {
+            "accounts_marked": accounts_marked,
+            "positions_priced": priced_positions,
+            "positions_total": total_positions,
+            "coverage": coverage,
+            "source": "intraday_snapshot" if accounts_marked else "snapshot_without_position_overlap",
+        },
+    }
+
+
+def _generate_ai_report_payload(params: Dict[str, object]) -> Dict[str, object]:
+    mode = str(params.get("mode") or "daily_report") if isinstance(params, dict) else "daily_report"
+    accounts = _virtual_accounts_with_intraday_snapshot()
+    intraday_snapshot = _intraday_snapshot_context(accounts)
+    valuation = intraday_snapshot.get("valuation") if isinstance(intraday_snapshot.get("valuation"), dict) else {}
+    if intraday_snapshot.get("available"):
+        message = (
+            f"{mode} 已记录。最新盘中快照 {intraday_snapshot.get('captured_at')}，"
+            f"覆盖持仓 {valuation.get('positions_priced', 0)}/{valuation.get('positions_total', 0)}，"
+            f"用于模拟盘盘中估值展示。"
+        )
+    else:
+        message = f"{mode} 已记录。当前没有可用盘中快照，模拟盘仍按最近收盘价估值。"
+    return {
+        "status": "recorded",
+        "mode": mode,
+        "message": message,
+        "data_freshness": data_lake_service.data_freshness(max_scan=300),
+        "intraday_snapshot": intraday_snapshot,
+        "top_accounts": accounts[:5],
+    }
+
+
 def _build_ai_context() -> Dict[str, object]:
     try:
         latest_factor_lab = load_latest_factor_lab_result()
         factor_summary = latest_factor_lab.get("summary", {}) if isinstance(latest_factor_lab, dict) else {}
     except Exception as exc:
         factor_summary = {"status": "unavailable", "error": str(exc)}
+    virtual_accounts = _virtual_accounts_with_intraday_snapshot()
+    intraday_snapshot = _intraday_snapshot_context(virtual_accounts)
     return {
         "system": {
             "engine_version": "Gemini Quant Pro V4.6 (Lake Routed)",
@@ -149,9 +272,11 @@ def _build_ai_context() -> Dict[str, object]:
         },
         "data_freshness": data_lake_service.data_freshness(max_scan=300),
         "virtual_trading": {
-            "accounts": vt_manager.get_accounts(),
+            "accounts": virtual_accounts,
             "recent_trades": vt_manager.get_trade_log(limit=20, offset=0),
+            "valuation_note": "账户 total_value/return_rate 会在有盘中快照覆盖持仓时使用 intraday_snapshot 临时盯市；历史 K 线和 daily_stats 不被污染。",
         },
+        "intraday_snapshot": intraday_snapshot,
         "strategy_versions": strategy_version_store.list_recent_versions(limit=10),
         "factor_lab": {
             "artifact_status": get_factor_lab_artifact_status(),
@@ -533,7 +658,7 @@ class StrategyRollbackRequest(BaseModel):
 
 
 class AutomationSnapshotRequest(BaseModel):
-    limit: int = Field(default=200, ge=1, le=1000)
+    limit: int = Field(default=6000, ge=1, le=8000)
 
 
 class AutomationEodUpdateRequest(BaseModel):
@@ -629,12 +754,7 @@ def _configure_ai_handlers() -> None:
                 switched_by=str(params.get("user") or "ai"),
                 note=str(params.get("note") or "AI requested activation"),
             ),
-            "generate_daily_report": lambda params: {
-                "status": "recorded",
-                "mode": str(params.get("mode") or "daily_report") if isinstance(params, dict) else "daily_report",
-                "data_freshness": data_lake_service.data_freshness(max_scan=300),
-                "top_accounts": vt_manager.get_accounts()[:5],
-            },
+            "generate_daily_report": lambda params: _generate_ai_report_payload(params if isinstance(params, dict) else {}),
         }
     )
 
@@ -2978,7 +3098,7 @@ def list_strategy_versions(strategy_id: str):
 @app.get("/api/virtual-trade/accounts")
 def get_vt_accounts():
     try:
-        return vt_manager.get_accounts()
+        return _virtual_accounts_with_intraday_snapshot()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
