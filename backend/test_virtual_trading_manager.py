@@ -29,7 +29,8 @@ def _spec(pool="core", strategy_func=None, signal_type="stateful", holding_polic
 class FakeDataManager:
     def __init__(self, tmp_path, close_price=10.0, local_codes=None, selected_codes=None):
         self.sample_path = tmp_path / "000001_full_history.parquet"
-        pd.DataFrame({"date": ["2026-01-01", "2026-01-02"]}).to_parquet(self.sample_path, index=False)
+        self.dates = ["2026-01-01", "2026-01-02"]
+        pd.DataFrame({"date": self.dates}).to_parquet(self.sample_path, index=False)
         self.close_price = close_price
         self.pool_calls = []
         self.local_codes = local_codes or ["000001"]
@@ -62,7 +63,7 @@ class FakeDataManager:
         self.pool_calls.append(tuple(symbols))
         rows = [
             {
-                "date": "2026-01-02",
+                "date": date,
                 "stock_code": symbol,
                 "stock_name": symbol,
                 "open": self.close_price,
@@ -74,6 +75,8 @@ class FakeDataManager:
                 "pct_chg": 0.0,
             }
             for symbol in symbols
+            for date in self.dates
+            if start_date <= date <= end_date
         ]
         return pd.DataFrame(rows), {symbol: "CACHE" for symbol in symbols}
 
@@ -384,7 +387,7 @@ def test_match_orders_reserves_fees_for_full_weight_buy(tmp_path):
 
     conn = manager._get_conn()
     try:
-        day_data = pd.DataFrame([{"date": "2026-01-02", "stock_code": "000001", "close": 10.0}])
+        day_data = pd.DataFrame([{"date": "2026-01-02", "stock_code": "000001", "open": 10.0, "close": 10.0}])
         manager._match_orders(
             conn.cursor(),
             "full_weight",
@@ -412,6 +415,132 @@ def test_match_orders_reserves_fees_for_full_weight_buy(tmp_path):
     assert account[1] > 0
 
 
+def test_create_rebalance_orders_records_pending_without_touching_cash_or_positions(tmp_path):
+    fake_data = FakeDataManager(tmp_path, close_price=10.0)
+    manager = VirtualTradingManager(tmp_path / "vt.db", fake_data)
+    _insert_account(manager, "pending_only")
+
+    conn = manager._get_conn()
+    try:
+        day_data = pd.DataFrame([{"date": "2026-01-01", "stock_code": "000001", "open": 10.0, "close": 10.0}])
+        stats = manager._create_rebalance_orders(
+            conn.cursor(),
+            "pending_only",
+            "2026-01-01",
+            "2026-01-02",
+            {"000001": 1.0},
+            {},
+            day_data,
+            100000.0,
+            100000.0,
+        )
+        conn.commit()
+        account = conn.execute(
+            "SELECT cash, total_value, last_update FROM accounts WHERE strategy_id = ?",
+            ("pending_only",),
+        ).fetchone()
+        position_count = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE strategy_id = ?",
+            ("pending_only",),
+        ).fetchone()[0]
+        trade_count = conn.execute(
+            "SELECT COUNT(*) FROM trade_log WHERE strategy_id = ?",
+            ("pending_only",),
+        ).fetchone()[0]
+        order = conn.execute(
+            "SELECT signal_date, intended_trade_date, status, requested_shares, filled_shares FROM virtual_orders WHERE strategy_id = ?",
+            ("pending_only",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert stats["orders_created"] == 1
+    assert account == (100000.0, 100000.0, "2026-01-01")
+    assert position_count == 0
+    assert trade_count == 0
+    assert order == ("2026-01-01", "2026-01-02", "PENDING", 9900, 0)
+
+
+def test_pending_order_executes_next_open_and_records_fill_ledger(tmp_path):
+    fake_data = FakeDataManager(tmp_path, close_price=10.0)
+    manager = VirtualTradingManager(tmp_path / "vt.db", fake_data)
+    _insert_account(manager, "next_open")
+
+    conn = manager._get_conn()
+    try:
+        signal_data = pd.DataFrame([{"date": "2026-01-01", "stock_code": "000001", "open": 11.0, "close": 11.0}])
+        manager._create_rebalance_orders(
+            conn.cursor(),
+            "next_open",
+            "2026-01-01",
+            "2026-01-02",
+            {"000001": 1.0},
+            {},
+            signal_data,
+            100000.0,
+            100000.0,
+        )
+        trade_data = pd.DataFrame([{"date": "2026-01-02", "stock_code": "000001", "open": 11.0, "close": 12.0, "volume": 100000.0}])
+        positions = {}
+        cash, executed = manager._execute_pending_orders(
+            conn.cursor(),
+            "next_open",
+            "2026-01-02",
+            trade_data,
+            positions,
+            100000.0,
+        )
+        manager._mark_positions_to_close(conn.cursor(), "next_open", "2026-01-02", positions, trade_data, cash)
+        conn.commit()
+        position = conn.execute(
+            "SELECT shares, cost_price, current_price, entry_date FROM positions WHERE strategy_id = ? AND symbol = ?",
+            ("next_open", "000001"),
+        ).fetchone()
+        order = conn.execute(
+            "SELECT status, filled_shares FROM virtual_orders WHERE strategy_id = ?",
+            ("next_open",),
+        ).fetchone()
+        fill = conn.execute(
+            "SELECT trade_date, price, shares, fill_status FROM virtual_order_fills WHERE strategy_id = ?",
+            ("next_open",),
+        ).fetchone()
+        trade = conn.execute(
+            "SELECT date, price, shares FROM trade_log WHERE strategy_id = ? AND side = 'BUY'",
+            ("next_open",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert executed["orders_filled"] == 1
+    assert position == (9000, 11.0, 12.0, "2026-01-02")
+    assert order == ("FILLED", 9000)
+    assert fill == ("2026-01-02", 11.0, 9000, "filled")
+    assert trade == ("2026-01-02", 11.0, 9000)
+
+
+def test_create_rebalance_orders_is_idempotent_for_signal_and_trade_date(tmp_path):
+    fake_data = FakeDataManager(tmp_path, close_price=10.0)
+    manager = VirtualTradingManager(tmp_path / "vt.db", fake_data)
+    _insert_account(manager, "idempotent")
+
+    conn = manager._get_conn()
+    try:
+        day_data = pd.DataFrame([{"date": "2026-01-01", "stock_code": "000001", "open": 10.0, "close": 10.0}])
+        first = manager._create_rebalance_orders(conn.cursor(), "idempotent", "2026-01-01", "2026-01-02", {"000001": 1.0}, {}, day_data, 100000.0, 100000.0)
+        second = manager._create_rebalance_orders(conn.cursor(), "idempotent", "2026-01-01", "2026-01-02", {"000001": 1.0}, {}, day_data, 100000.0, 100000.0)
+        conn.commit()
+        order_count = conn.execute(
+            "SELECT COUNT(*) FROM virtual_orders WHERE strategy_id = ?",
+            ("idempotent",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert first["orders_created"] == 1
+    assert second["orders_created"] == 0
+    assert order_count == 1
+
+
 def test_match_orders_uses_target_weight_order_when_cash_is_limited(tmp_path):
     fake_data = FakeDataManager(tmp_path, close_price=10.0)
     manager = VirtualTradingManager(tmp_path / "vt.db", fake_data)
@@ -421,8 +550,8 @@ def test_match_orders_uses_target_weight_order_when_cash_is_limited(tmp_path):
     try:
         day_data = pd.DataFrame(
             [
-                {"date": "2026-01-02", "stock_code": "000001", "close": 10.0},
-                {"date": "2026-01-02", "stock_code": "000002", "close": 10.0},
+                {"date": "2026-01-02", "stock_code": "000001", "open": 10.0, "close": 10.0},
+                {"date": "2026-01-02", "stock_code": "000002", "open": 10.0, "close": 10.0},
             ]
         )
         manager._match_orders(
@@ -461,6 +590,7 @@ def test_match_orders_rejects_halted_and_no_volume_buys(tmp_path):
                 {
                     "date": "2026-01-02",
                     "stock_code": "000001",
+                    "open": 10.0,
                     "close": 10.0,
                     "volume": 0.0,
                     "tradestatus": "1",
@@ -468,6 +598,7 @@ def test_match_orders_rejects_halted_and_no_volume_buys(tmp_path):
                 {
                     "date": "2026-01-02",
                     "stock_code": "000002",
+                    "open": 10.0,
                     "close": 10.0,
                     "volume": 100000.0,
                     "tradestatus": "0",
@@ -493,11 +624,19 @@ def test_match_orders_rejects_halted_and_no_volume_buys(tmp_path):
             "SELECT COUNT(*) FROM trade_log WHERE strategy_id = ?",
             ("tradability",),
         ).fetchone()[0]
+        rejected = conn.execute(
+            "SELECT symbol, status, reject_reason FROM virtual_orders WHERE strategy_id = ? ORDER BY symbol",
+            ("tradability",),
+        ).fetchall()
     finally:
         conn.close()
 
     assert position_count == 0
     assert trade_count == 0
+    assert rejected == [
+        ("000001", "REJECTED", "no_volume"),
+        ("000002", "REJECTED", "halted"),
+    ]
 
 
 def test_match_orders_caps_buy_by_volume_participation(tmp_path, monkeypatch):
@@ -513,6 +652,7 @@ def test_match_orders_caps_buy_by_volume_participation(tmp_path, monkeypatch):
                 {
                     "date": "2026-01-02",
                     "stock_code": "000001",
+                    "open": 10.0,
                     "close": 10.0,
                     "volume": 500.0,
                     "tradestatus": "1",
@@ -538,12 +678,22 @@ def test_match_orders_caps_buy_by_volume_participation(tmp_path, monkeypatch):
             "SELECT shares, msg FROM trade_log WHERE strategy_id = ? AND symbol = ?",
             ("capacity", "000001"),
         ).fetchone()
+        order = conn.execute(
+            "SELECT status, requested_shares, filled_shares, reject_reason FROM virtual_orders WHERE strategy_id = ?",
+            ("capacity",),
+        ).fetchone()
+        fill = conn.execute(
+            "SELECT shares, fill_status FROM virtual_order_fills WHERE strategy_id = ?",
+            ("capacity",),
+        ).fetchone()
     finally:
         conn.close()
 
     assert position == (100,)
     assert trade[0] == 100
     assert "部分成交" in trade[1]
+    assert order == ("PARTIAL_FILLED", 9900, 100, "volume_limit")
+    assert fill == (100, "partial")
 
 
 def test_match_orders_respects_t1_sell_block(tmp_path):
@@ -566,6 +716,7 @@ def test_match_orders_respects_t1_sell_block(tmp_path):
                 {
                     "date": "2026-01-02",
                     "stock_code": "000001",
+                    "open": 10.0,
                     "close": 10.0,
                     "volume": 100000.0,
                     "tradestatus": "1",
@@ -591,11 +742,82 @@ def test_match_orders_respects_t1_sell_block(tmp_path):
             "SELECT COUNT(*) FROM trade_log WHERE strategy_id = ? AND side = 'SELL'",
             ("t1",),
         ).fetchone()[0]
+        order = conn.execute(
+            "SELECT status, reject_reason FROM virtual_orders WHERE strategy_id = ?",
+            ("t1",),
+        ).fetchone()
     finally:
         conn.close()
 
     assert position == (1000,)
     assert sell_count == 0
+    assert order == ("REJECTED", "t1")
+
+
+def test_match_orders_rejects_limit_up_buy_and_limit_down_sell(tmp_path):
+    fake_data = FakeDataManager(tmp_path, close_price=10.0)
+    manager = VirtualTradingManager(tmp_path / "vt.db", fake_data)
+    _insert_account(manager, "limits", cash=90000.0, total_value=100000.0)
+
+    conn = manager._get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO positions (
+                strategy_id, symbol, shares, cost_price, current_price, entry_date, entry_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("limits", "000002", 1000, 10.0, 10.0, "2026-01-01", 10.0),
+        )
+        day_data = pd.DataFrame(
+            [
+                {
+                    "date": "2026-01-02",
+                    "stock_code": "000001",
+                    "open": 11.0,
+                    "close": 11.0,
+                    "prev_close": 10.0,
+                    "volume": 100000.0,
+                    "tradestatus": "1",
+                },
+                {
+                    "date": "2026-01-02",
+                    "stock_code": "000002",
+                    "open": 9.0,
+                    "close": 9.0,
+                    "prev_close": 10.0,
+                    "volume": 100000.0,
+                    "tradestatus": "1",
+                },
+            ]
+        )
+        manager._match_orders(
+            conn.cursor(),
+            "limits",
+            "2026-01-02",
+            {"000001": 0.5},
+            {"000002": vtm_module.MockPosition(1000, 10.0, current_price=10.0, entry_date="2026-01-01")},
+            day_data,
+            cash=90000.0,
+            total_value=100000.0,
+        )
+        conn.commit()
+        rejected = conn.execute(
+            "SELECT symbol, side, status, reject_reason FROM virtual_orders WHERE strategy_id = ? ORDER BY symbol",
+            ("limits",),
+        ).fetchall()
+        trade_count = conn.execute(
+            "SELECT COUNT(*) FROM trade_log WHERE strategy_id = ?",
+            ("limits",),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert rejected == [
+        ("000001", "BUY", "REJECTED", "limit_up"),
+        ("000002", "SELL", "REJECTED", "limit_down"),
+    ]
+    assert trade_count == 0
 
 
 def test_match_orders_keeps_target_for_held_limit_up_stock_before_selling_diff(tmp_path):
@@ -618,6 +840,7 @@ def test_match_orders_keeps_target_for_held_limit_up_stock_before_selling_diff(t
                 {
                     "date": "2026-01-02",
                     "stock_code": "000001",
+                    "open": 11.0,
                     "close": 11.0,
                     "prev_close": 10.0,
                     "pct_chg": 10.0,
