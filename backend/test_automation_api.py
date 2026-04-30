@@ -102,6 +102,48 @@ def test_ai_work_logs_endpoint_reads_store(tmp_path, monkeypatch):
     assert response.json()[0]["summary"] == "已追赶模拟盘。"
 
 
+def test_ai_work_messages_endpoint_reads_store(tmp_path, monkeypatch):
+    store = AutomationStore(tmp_path / "automation.db")
+    store.record_ai_work_message(
+        work_id="aiwork-unit",
+        work_type="simulation_supervision",
+        trigger="unit",
+        action_type="run_virtual_trade",
+        status="executed",
+        title="追赶模拟盘 / 已执行",
+        body="追赶模拟盘已执行。",
+    )
+    monkeypatch.setattr(main, "automation_store", store)
+
+    response = client.get("/api/ai/work-messages")
+
+    assert response.status_code == 200
+    assert response.json()[0]["work_type"] == "simulation_supervision"
+    assert response.json()[0]["body"] == "追赶模拟盘已执行。"
+
+
+def test_ai_decision_callback_receives_each_action_result(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+    service = AIAutomationService(store)
+    seen = []
+
+    result = service.execute_decision(
+        {
+            "actor": "unit-ai",
+            "source": "unit",
+            "summary": "plan report",
+            "actions": [{"type": "generate_daily_report", "params": {"mode": "unit"}}],
+        },
+        handlers={},
+        dry_run=True,
+        on_action_result=seen.append,
+    )
+
+    assert result["decision"]["status"] == "dry_run"
+    assert seen[0]["type"] == "generate_daily_report"
+    assert seen[0]["status"] == "planned"
+
+
 def test_ai_compatible_response_parser_handles_thinking_text(tmp_path):
     service = AIAutomationService(AutomationStore(tmp_path / "automation.db"))
 

@@ -162,6 +162,7 @@ def _build_ai_context() -> Dict[str, object]:
             "recent_snapshots": automation_store.latest_snapshots(limit=5),
             "recent_ai_decisions": automation_store.list_ai_decisions(limit=5),
             "recent_ai_work_logs": automation_store.list_ai_work_logs(limit=5),
+            "recent_ai_work_messages": automation_store.list_ai_work_messages(limit=10),
         },
         "guardrails": {
             "scope": "virtual_trading_and_factor_lab_only",
@@ -2320,16 +2321,42 @@ def get_ai_work_logs(request: Request, work_type: Optional[str] = None, limit: i
     return automation_store.list_ai_work_logs(work_type=work_type, limit=limit)
 
 
+@app.get("/api/ai/work-messages")
+def get_ai_work_messages(request: Request, work_type: Optional[str] = None, limit: int = 50):
+    _require_automation_request(request)
+    return automation_store.list_ai_work_messages(work_type=work_type, limit=limit)
+
+
 @app.post("/api/ai/decisions")
 def post_ai_decision(req: AIDecisionRequest, request: Request):
     _require_automation_request(request)
     _configure_ai_handlers()
     payload = req.model_dump()
+    work_id = req.decision_id or f"external-ai-{uuid.uuid4().hex[:12]}"
+
+    def record_external_action(result: Dict[str, object]) -> None:
+        action_type = str(result.get("type") or result.get("action") or "unknown")
+        status = str(result.get("status") or "unknown")
+        level = "error" if status in {"failed", "rejected"} else "warn" if status in {"skipped", "partial"} else "info"
+        detail = result.get("error") or result.get("reason") or result.get("result") or ""
+        ai_automation_service.store.record_ai_work_message(
+            work_id=work_id,
+            work_type="external_ai_decision",
+            trigger="external_api",
+            action_type=action_type,
+            status=status,
+            level=level,
+            title=f"外部 AI 动作 / {action_type}",
+            body=f"{action_type} / {status}" + (f"：{str(detail)[:240]}" if detail else ""),
+            details={"source": req.source, "actor": req.actor, "result": result},
+        )
+
     return ai_automation_service.execute_decision(
         payload,
         handlers=automation_orchestrator.ai_handlers,
         source=req.source,
         dry_run=req.dry_run,
+        on_action_result=record_external_action,
     )
 
 
