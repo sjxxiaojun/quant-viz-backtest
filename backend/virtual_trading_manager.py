@@ -100,8 +100,44 @@ class VirtualTradingManager:
                 message TEXT
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS virtual_orders (
+                order_id TEXT PRIMARY KEY,
+                strategy_id TEXT,
+                signal_date TEXT,
+                intended_trade_date TEXT,
+                symbol TEXT,
+                side TEXT,
+                requested_shares INTEGER,
+                filled_shares INTEGER DEFAULT 0,
+                order_type TEXT,
+                status TEXT,
+                reject_reason TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS virtual_order_fills (
+                fill_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT,
+                strategy_id TEXT,
+                trade_date TEXT,
+                symbol TEXT,
+                side TEXT,
+                price REAL,
+                shares INTEGER,
+                fee REAL,
+                fill_status TEXT,
+                message TEXT,
+                created_at TEXT
+            )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_trade_log_strategy_date ON trade_log(strategy_id, date, id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_daily_stats_strategy_date ON daily_stats(strategy_id, date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_virtual_orders_strategy_trade_date ON virtual_orders(strategy_id, intended_trade_date, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_virtual_orders_signal ON virtual_orders(strategy_id, signal_date, intended_trade_date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_virtual_order_fills_order ON virtual_order_fills(order_id)")
         cursor.execute("PRAGMA table_info(positions)")
         position_columns = {row[1] for row in cursor.fetchall()}
         if "entry_date" not in position_columns:
@@ -243,6 +279,8 @@ class VirtualTradingManager:
         cursor.execute(f"DELETE FROM trade_log WHERE strategy_id IN ({placeholders})", strategy_ids)
         cursor.execute(f"DELETE FROM daily_stats WHERE strategy_id IN ({placeholders})", strategy_ids)
         cursor.execute(f"DELETE FROM strategy_reports WHERE strategy_id IN ({placeholders})", strategy_ids)
+        cursor.execute(f"DELETE FROM virtual_orders WHERE strategy_id IN ({placeholders})", strategy_ids)
+        cursor.execute(f"DELETE FROM virtual_order_fills WHERE strategy_id IN ({placeholders})", strategy_ids)
 
     def _record_strategy_report(
         self,
@@ -366,6 +404,7 @@ class VirtualTradingManager:
             self._clear_strategy_state(cursor, [acc["strategy_id"] for acc, _ in active_accounts])
         pool_data_cache = {}
         pool_info = {}
+        order_totals = self._empty_order_stats()
         for pool in sorted({spec.pool for _, spec in active_accounts}):
             pool_symbols, selection_info = self._resolve_strategy_pool_symbols(pool, target_date, warmup_start)
             df, _, info = self._load_pool_data_for_day(pool_symbols, warmup_start, target_date)
@@ -405,7 +444,39 @@ class VirtualTradingManager:
                 pos_manager = PositionManager(max_positions=5, strategy_spec=spec)
                 target_weights = {}
                 trading_days = sorted(day for day in df["date"].dropna().astype(str).unique().tolist() if day <= target_date)
+                signal_date = trading_days[-2] if len(trading_days) >= 2 and trading_days[-1] == target_date else self._previous_trading_day(df, target_date)
+                if not signal_date:
+                    cash = float(acc["start_value"] or acc["total_value"] or 100000.0)
+                    cursor.execute(
+                        "UPDATE accounts SET cash = ?, total_value = ?, last_update = ? WHERE strategy_id = ?",
+                        (cash, cash, target_date, strategy_id),
+                    )
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO daily_stats (strategy_id, date, total_value, cash) VALUES (?, ?, ?, ?)",
+                        (strategy_id, target_date, cash, cash),
+                    )
+                    reports.append({
+                        "strategy_id": strategy_id,
+                        "status": "cash",
+                        "selected_symbols": [],
+                        "decision": {},
+                        "universe": pool_info.get(spec.pool, {}),
+                        "message": "没有可用于次日开盘撮合的前一交易日信号，账户保持现金",
+                    })
+                    self._record_strategy_report(
+                        cursor,
+                        strategy_id,
+                        target_date,
+                        "cash",
+                        spec.pool,
+                        pool_info.get(spec.pool, {}),
+                        message="没有可用于次日开盘撮合的前一交易日信号，账户保持现金",
+                    )
+                    continue
+
                 for day in trading_days:
+                    if day > signal_date:
+                        break
                     day_data = df[df["date"] == day]
                     day_signals = df_with_signals[df_with_signals["date"] == day]
                     if day_data.empty or day_signals.empty:
@@ -417,14 +488,43 @@ class VirtualTradingManager:
                         current_positions=None,
                     )
 
+                cash = float(acc["start_value"] or acc["total_value"] or 100000.0)
+                empty_positions: Dict[str, MockPosition] = {}
+                signal_day_data = df[df["date"] == signal_date]
                 target_day_data = df[df["date"] == target_date]
-                selected = self._seed_positions_from_weights(
+                created = self._create_rebalance_orders(
+                    cursor,
+                    strategy_id,
+                    signal_date,
+                    target_date,
+                    target_weights,
+                    empty_positions,
+                    signal_day_data,
+                    cash,
+                    cash,
+                )
+                self._add_order_stats(order_totals, created)
+                cash, executed = self._execute_pending_orders(
                     cursor,
                     strategy_id,
                     target_date,
-                    target_weights,
                     target_day_data,
-                    float(acc["start_value"] or acc["total_value"] or 100000.0),
+                    empty_positions,
+                    cash,
+                )
+                self._add_order_stats(order_totals, executed)
+                cash, final_total_value = self._mark_positions_to_close(
+                    cursor,
+                    strategy_id,
+                    target_date,
+                    empty_positions,
+                    target_day_data,
+                    cash,
+                )
+                selected = list(empty_positions.keys())
+                cursor.execute(
+                    "INSERT OR REPLACE INTO daily_stats (strategy_id, date, total_value, cash) VALUES (?, ?, ?, ?)",
+                    (strategy_id, target_date, final_total_value, cash),
                 )
                 reports.append({
                     "strategy_id": strategy_id,
@@ -432,7 +532,7 @@ class VirtualTradingManager:
                     "selected_symbols": selected,
                     "decision": pos_manager.last_decision_info,
                     "universe": pool_info.get(spec.pool, {}),
-                    "message": "已按历史窗口选股并用目标日收盘价建仓" if selected else "历史窗口未形成持仓信号，账户保持现金",
+                    "message": "已按前一交易日信号生成订单并在目标日开盘撮合" if selected else "历史窗口未形成持仓信号，账户保持现金",
                 })
                 self._record_strategy_report(
                     cursor,
@@ -442,7 +542,7 @@ class VirtualTradingManager:
                     spec.pool,
                     pool_info.get(spec.pool, {}),
                     pos_manager.last_decision_info,
-                    "已按历史窗口选股并用目标日收盘价建仓" if selected else "历史窗口未形成持仓信号，账户保持现金",
+                    "已按前一交易日信号生成订单并在目标日开盘撮合" if selected else "历史窗口未形成持仓信号，账户保持现金",
                 )
             except Exception as exc:
                 logger.error(f"Bootstrap failed for {strategy_id}: {exc}")
@@ -469,62 +569,10 @@ class VirtualTradingManager:
             "mode": mode,
             "pool_info": pool_info,
             "strategy_reports": reports,
+            **order_totals,
+            "pending_remaining": self._pending_order_count(cursor),
+            "execution_date_range": {"start": target_date, "end": target_date},
         }
-
-    def _seed_positions_from_weights(self, cursor, strategy_id: str, date: str, target_weights: Dict[str, float], day_data: pd.DataFrame, account_value: float) -> List[str]:
-        cursor.execute("DELETE FROM positions WHERE strategy_id = ?", (strategy_id,))
-        price_map = day_data.set_index("stock_code")["close"].to_dict() if not day_data.empty else {}
-        row_map = day_data.set_index("stock_code", drop=False).to_dict(orient="index") if not day_data.empty else {}
-        cash = float(account_value)
-        selected = []
-
-        for code, weight in sorted(target_weights.items(), key=lambda item: item[1], reverse=True):
-            price = float(price_map.get(code, 0.0) or 0.0)
-            if price <= 0:
-                continue
-            row = row_map.get(code, {})
-            if self._trade_block_reason(row, "close", "buy") is not None:
-                continue
-            target_value = account_value * float(weight or 0.0) / (1.0 + VIRTUAL_FEE_RATE)
-            shares = int(target_value / price / 100) * 100
-            shares = self._cap_order_shares(row, shares)
-            if shares <= 0:
-                continue
-            cost = shares * price
-            fee = cost * VIRTUAL_FEE_RATE
-            if cash < cost + fee:
-                continue
-            cash -= cost + fee
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO positions (
-                    strategy_id, symbol, shares, cost_price, current_price, entry_date, entry_price
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (strategy_id, code, shares, price, price, date, price),
-            )
-            cursor.execute(
-                "INSERT INTO trade_log (strategy_id, date, symbol, side, price, shares, fee, msg) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (strategy_id, date, code, "BUY", price, shares, fee, "初始建仓：历史窗口选股，目标日收盘价成交"),
-            )
-            selected.append(code)
-
-        final_pos_value = 0.0
-        for code in selected:
-            cursor.execute("SELECT shares, current_price FROM positions WHERE strategy_id = ? AND symbol = ?", (strategy_id, code))
-            row = cursor.fetchone()
-            if row:
-                final_pos_value += float(row[0]) * float(row[1])
-        final_total_value = cash + final_pos_value
-        cursor.execute(
-            "UPDATE accounts SET cash = ?, total_value = ?, last_update = ? WHERE strategy_id = ?",
-            (cash, final_total_value, date, strategy_id),
-        )
-        cursor.execute(
-            "INSERT OR REPLACE INTO daily_stats (strategy_id, date, total_value, cash) VALUES (?, ?, ?, ?)",
-            (strategy_id, date, final_total_value, cash),
-        )
-        return selected
 
     def get_accounts(
         self,
@@ -663,6 +711,423 @@ class VirtualTradingManager:
         finally:
             conn.close()
 
+    def _empty_order_stats(self) -> Dict[str, int]:
+        return {
+            "orders_created": 0,
+            "orders_filled": 0,
+            "orders_rejected": 0,
+            "partial_fills": 0,
+        }
+
+    def _add_order_stats(self, target: Dict[str, int], source: Dict[str, int]) -> None:
+        for key in self._empty_order_stats():
+            target[key] = int(target.get(key, 0)) + int(source.get(key, 0))
+
+    def _pending_order_count(self, cursor) -> int:
+        cursor.execute("SELECT COUNT(*) FROM virtual_orders WHERE status = 'PENDING'")
+        return int(cursor.fetchone()[0] or 0)
+
+    def _current_positions(self, cursor, strategy_id: str, fallback_date: str) -> Dict[str, "MockPosition"]:
+        cursor.execute(
+            """
+            SELECT symbol, shares, cost_price, current_price, entry_date, entry_price
+            FROM positions
+            WHERE strategy_id = ?
+            """,
+            (strategy_id,),
+        )
+        positions: Dict[str, MockPosition] = {}
+        for symbol, shares, cost_price, current_price, entry_date, entry_price in cursor.fetchall():
+            resolved_entry_date = entry_date or fallback_date
+            resolved_entry_price = entry_price if entry_price is not None else cost_price
+            positions[symbol] = MockPosition(
+                int(shares or 0),
+                float(cost_price or 0.0),
+                current_price=float(current_price if current_price is not None else cost_price or 0.0),
+                entry_date=resolved_entry_date,
+                entry_price=float(resolved_entry_price or 0.0),
+            )
+        return positions
+
+    def _day_maps(self, day_data: pd.DataFrame, price_field: str) -> tuple[Dict[str, float], Dict[str, Dict]]:
+        if day_data.empty or "stock_code" not in day_data.columns:
+            return {}, {}
+        resolved_price_field = price_field
+        if resolved_price_field not in day_data.columns and price_field == "open" and "close" in day_data.columns:
+            resolved_price_field = "close"
+        price_map = day_data.set_index("stock_code")[resolved_price_field].to_dict() if resolved_price_field in day_data.columns else {}
+        row_map = day_data.set_index("stock_code", drop=False).to_dict(orient="index")
+        if resolved_price_field != price_field:
+            for row in row_map.values():
+                row[price_field] = row.get(resolved_price_field)
+        return price_map, row_map
+
+    def _mark_positions_to_close(
+        self,
+        cursor,
+        strategy_id: str,
+        date: str,
+        positions: Dict[str, "MockPosition"],
+        day_data: pd.DataFrame,
+        cash: float,
+    ) -> tuple[float, float]:
+        close_map, _ = self._day_maps(day_data, "close")
+        for code, pos in positions.items():
+            price = close_map.get(code)
+            if price and price > 0:
+                pos.current_price = float(price)
+                cursor.execute(
+                    "UPDATE positions SET current_price = ? WHERE strategy_id = ? AND symbol = ?",
+                    (float(price), strategy_id, code),
+                )
+        position_value = sum(
+            float(pos.shares or 0) * float(close_map.get(code, pos.current_price) or pos.current_price or 0.0)
+            for code, pos in positions.items()
+        )
+        total_value = float(cash or 0.0) + position_value
+        cursor.execute(
+            "UPDATE accounts SET cash = ?, total_value = ?, last_update = ? WHERE strategy_id = ?",
+            (float(cash or 0.0), total_value, date, strategy_id),
+        )
+        return float(cash or 0.0), total_value
+
+    def _orders_exist_for_signal(
+        self,
+        cursor,
+        strategy_id: str,
+        signal_date: str,
+        intended_trade_date: str,
+    ) -> bool:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM virtual_orders
+            WHERE strategy_id = ? AND signal_date = ? AND intended_trade_date = ?
+            """,
+            (strategy_id, signal_date, intended_trade_date),
+        )
+        return int(cursor.fetchone()[0] or 0) > 0
+
+    def _pending_orders_exist_for_trade_date(self, cursor, strategy_id: str, trade_date: str) -> bool:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM virtual_orders
+            WHERE strategy_id = ? AND intended_trade_date = ? AND status = 'PENDING'
+            """,
+            (strategy_id, trade_date),
+        )
+        return int(cursor.fetchone()[0] or 0) > 0
+
+    def _previous_trading_day(self, df: pd.DataFrame, trade_date: str) -> Optional[str]:
+        days = sorted(day for day in df["date"].dropna().astype(str).unique().tolist() if day < trade_date)
+        return days[-1] if days else None
+
+    def _order_id(self, strategy_id: str, signal_date: str, intended_trade_date: str, side: str, symbol: str) -> str:
+        return f"{strategy_id}|{signal_date}|{intended_trade_date}|{side}|{symbol}"
+
+    def _create_rebalance_orders(
+        self,
+        cursor,
+        strategy_id: str,
+        signal_date: str,
+        intended_trade_date: str,
+        target_weights: Dict[str, float],
+        current_positions: Dict[str, "MockPosition"],
+        signal_day_data: pd.DataFrame,
+        cash: float,
+        total_value: float,
+    ) -> Dict[str, int]:
+        stats = self._empty_order_stats()
+        if self._orders_exist_for_signal(cursor, strategy_id, signal_date, intended_trade_date):
+            return stats
+
+        close_map, _ = self._day_maps(signal_day_data, "close")
+        marked_value = float(cash or 0.0) + sum(
+            float(pos.shares or 0) * float(close_map.get(code, pos.current_price) or pos.current_price or 0.0)
+            for code, pos in current_positions.items()
+        )
+        live_total_value = marked_value if marked_value > 0 else float(total_value or 0.0)
+
+        target_shares: Dict[str, int] = {}
+        for code, weight in target_weights.items():
+            price = float(close_map.get(code, 0.0) or 0.0)
+            if price <= 0:
+                continue
+            target_val = live_total_value * float(weight or 0.0) / (1.0 + VIRTUAL_FEE_RATE)
+            shares = int(target_val / price / 100) * 100
+            if shares > 0:
+                target_shares[code] = shares
+
+        order_rows = []
+        for code, pos in current_positions.items():
+            current_shares = int(pos.shares or 0)
+            target = target_shares.get(code, 0)
+            if current_shares > target:
+                order_rows.append((code, "SELL", current_shares - target))
+        for code, target in target_shares.items():
+            current_shares = int(current_positions.get(code).shares) if code in current_positions else 0
+            if target > current_shares:
+                order_rows.append((code, "BUY", target - current_shares))
+
+        now = datetime.now().isoformat(timespec="seconds")
+        for code, side, shares in order_rows:
+            if shares <= 0:
+                continue
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO virtual_orders (
+                    order_id, strategy_id, signal_date, intended_trade_date, symbol, side,
+                    requested_shares, filled_shares, order_type, status, reject_reason,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 'PENDING', NULL, ?, ?)
+                """,
+                (
+                    self._order_id(strategy_id, signal_date, intended_trade_date, side, code),
+                    strategy_id,
+                    signal_date,
+                    intended_trade_date,
+                    code,
+                    side,
+                    int(shares),
+                    "market_open",
+                    now,
+                    now,
+                ),
+            )
+            if cursor.rowcount:
+                stats["orders_created"] += 1
+        return stats
+
+    def _ensure_orders_for_trade_day(
+        self,
+        cursor,
+        strategy_id: str,
+        trade_date: str,
+        df: pd.DataFrame,
+        df_with_signals: pd.DataFrame,
+        spec,
+        positions: Dict[str, "MockPosition"],
+        cash: float,
+        total_value: float,
+    ) -> tuple[Dict[str, int], Optional[Dict[str, object]], Dict[str, float]]:
+        stats = self._empty_order_stats()
+        if self._pending_orders_exist_for_trade_date(cursor, strategy_id, trade_date):
+            return stats, None, {}
+
+        signal_date = self._previous_trading_day(df, trade_date)
+        if not signal_date:
+            return stats, None, {}
+
+        signal_day_data = df[df["date"] == signal_date]
+        day_signals = df_with_signals[df_with_signals["date"] == signal_date]
+        if signal_day_data.empty or day_signals.empty:
+            return stats, None, {}
+
+        pos_manager = PositionManager(max_positions=5, strategy_spec=spec)
+        pos_manager.seed_holdings(
+            {
+                code: HoldingInfo(
+                    code=code,
+                    entry_date=pos.entry_date or signal_date,
+                    entry_price=float(pos.entry_price or pos.cost_price or 0.0),
+                )
+                for code, pos in positions.items()
+            }
+        )
+        target_weights = pos_manager.generate_target_weights(
+            signal_date,
+            signal_day_data,
+            day_signals,
+            current_positions=positions,
+        )
+        created = self._create_rebalance_orders(
+            cursor,
+            strategy_id,
+            signal_date,
+            trade_date,
+            target_weights,
+            positions,
+            signal_day_data,
+            cash,
+            total_value,
+        )
+        self._add_order_stats(stats, created)
+        return stats, pos_manager.last_decision_info, target_weights
+
+    def _execute_pending_orders(
+        self,
+        cursor,
+        strategy_id: str,
+        trade_date: str,
+        day_data: pd.DataFrame,
+        positions: Dict[str, "MockPosition"],
+        cash: float,
+    ) -> tuple[float, Dict[str, int]]:
+        stats = self._empty_order_stats()
+        open_map, row_map = self._day_maps(day_data, "open")
+        cursor.execute(
+            """
+            SELECT order_id, symbol, side, requested_shares, filled_shares
+            FROM virtual_orders
+            WHERE strategy_id = ? AND intended_trade_date = ? AND status = 'PENDING'
+            ORDER BY CASE side WHEN 'SELL' THEN 0 ELSE 1 END, created_at, rowid
+            """,
+            (strategy_id, trade_date),
+        )
+        orders = cursor.fetchall()
+        now = datetime.now().isoformat(timespec="seconds")
+
+        for order_id, symbol, side, requested_shares, filled_shares in orders:
+            requested_shares = int(requested_shares or 0)
+            already_filled = int(filled_shares or 0)
+            remaining = max(0, requested_shares - already_filled)
+            row = row_map.get(symbol, {})
+            price = float(open_map.get(symbol, 0.0) or 0.0)
+            reject_reason: Optional[str] = None
+
+            if remaining <= 0:
+                reject_reason = "empty_order"
+                executable_shares = 0
+            elif side == "SELL" and symbol not in positions:
+                reject_reason = "no_position"
+                executable_shares = 0
+            elif side == "SELL" and self._is_t1_sell_blocked(positions[symbol], trade_date):
+                reject_reason = "t1"
+                executable_shares = 0
+            else:
+                block_reason = self._trade_block_reason(row, "open", side.lower())
+                if block_reason is not None:
+                    reject_reason = block_reason
+                    executable_shares = 0
+                else:
+                    executable_shares = self._cap_order_shares(row, remaining)
+                    if executable_shares <= 0:
+                        reject_reason = "volume_limit"
+                    elif executable_shares < remaining:
+                        reject_reason = "volume_limit"
+
+            if side == "SELL" and executable_shares > 0:
+                current_shares = int(positions.get(symbol).shares if symbol in positions else 0)
+                executable_shares = min(executable_shares, current_shares)
+                if executable_shares <= 0:
+                    reject_reason = "no_position"
+                elif executable_shares < remaining and reject_reason is None:
+                    reject_reason = "position_size"
+
+            if side == "BUY" and executable_shares > 0:
+                affordable = int((float(cash or 0.0) / (price * (1.0 + VIRTUAL_FEE_RATE))) // 100) * 100 if price > 0 else 0
+                if affordable <= 0:
+                    reject_reason = "cash_insufficient"
+                    executable_shares = 0
+                elif executable_shares > affordable:
+                    executable_shares = affordable
+                    reject_reason = "cash_insufficient"
+
+            if executable_shares <= 0:
+                cursor.execute(
+                    """
+                    UPDATE virtual_orders
+                    SET status = 'REJECTED', reject_reason = ?, updated_at = ?
+                    WHERE order_id = ?
+                    """,
+                    (reject_reason or "rejected", now, order_id),
+                )
+                stats["orders_rejected"] += 1
+                continue
+
+            fee = executable_shares * price * VIRTUAL_FEE_RATE
+            if side == "SELL":
+                amount = executable_shares * price
+                cash += amount - fee
+                pos = positions[symbol]
+                new_shares = int(pos.shares or 0) - executable_shares
+                if new_shares > 0:
+                    pos.shares = new_shares
+                    pos.current_price = price
+                    cursor.execute(
+                        "UPDATE positions SET shares = ?, current_price = ? WHERE strategy_id = ? AND symbol = ?",
+                        (new_shares, price, strategy_id, symbol),
+                    )
+                else:
+                    cursor.execute("DELETE FROM positions WHERE strategy_id = ? AND symbol = ?", (strategy_id, symbol))
+                    positions.pop(symbol, None)
+                trade_msg = f"订单撮合卖出{'部分成交' if executable_shares < remaining else '成交'} @open"
+            else:
+                cost = executable_shares * price
+                cash -= cost + fee
+                if symbol in positions:
+                    pos = positions[symbol]
+                    new_total_shares = int(pos.shares or 0) + executable_shares
+                    new_avg_cost = (float(pos.shares or 0) * float(pos.cost_price or 0.0) + cost) / new_total_shares
+                    pos.shares = new_total_shares
+                    pos.cost_price = new_avg_cost
+                    pos.current_price = price
+                    cursor.execute(
+                        "UPDATE positions SET shares = ?, cost_price = ?, current_price = ? WHERE strategy_id = ? AND symbol = ?",
+                        (new_total_shares, new_avg_cost, price, strategy_id, symbol),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO positions (
+                            strategy_id, symbol, shares, cost_price, current_price, entry_date, entry_price
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (strategy_id, symbol, executable_shares, price, price, trade_date, price),
+                    )
+                    positions[symbol] = MockPosition(
+                        executable_shares,
+                        price,
+                        current_price=price,
+                        entry_date=trade_date,
+                        entry_price=price,
+                    )
+                trade_msg = f"订单撮合买入{'部分成交' if executable_shares < remaining else '成交'} @open"
+
+            fill_status = "partial" if executable_shares < remaining else "filled"
+            final_status = "PARTIAL_FILLED" if executable_shares < remaining else "FILLED"
+            final_reject_reason = reject_reason if executable_shares < remaining else None
+            cursor.execute(
+                "INSERT INTO trade_log (strategy_id, date, symbol, side, price, shares, fee, msg) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (strategy_id, trade_date, symbol, side, price, executable_shares, fee, trade_msg),
+            )
+            cursor.execute(
+                """
+                INSERT INTO virtual_order_fills (
+                    order_id, strategy_id, trade_date, symbol, side, price, shares, fee,
+                    fill_status, message, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    strategy_id,
+                    trade_date,
+                    symbol,
+                    side,
+                    price,
+                    executable_shares,
+                    fee,
+                    fill_status,
+                    trade_msg,
+                    now,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE virtual_orders
+                SET filled_shares = filled_shares + ?, status = ?, reject_reason = ?, updated_at = ?
+                WHERE order_id = ?
+                """,
+                (executable_shares, final_status, final_reject_reason, now, order_id),
+            )
+            if final_status == "PARTIAL_FILLED":
+                stats["partial_fills"] += 1
+            else:
+                stats["orders_filled"] += 1
+
+        return float(cash or 0.0), stats
+
     def execute_daily(self) -> Dict:
         """
         执行模拟盘撮合，支持追赶模式（自动补齐所有缺失交易日）。
@@ -708,8 +1173,16 @@ class VirtualTradingManager:
         last_update = row[0] if row and row[0] else "2026-04-22"
         
         if last_update >= target_date:
+            pending_remaining = self._pending_order_count(cursor)
             conn.close()
-            return {"status": "skipped", "message": f"所有策略均已更新至最新交易日 ({target_date})。", "date": target_date}
+            return {
+                "status": "skipped",
+                "message": f"所有策略均已更新至最新交易日 ({target_date})。",
+                "date": target_date,
+                **self._empty_order_stats(),
+                "pending_remaining": pending_remaining,
+                "execution_date_range": None,
+            }
 
         # 2. 获取期间所有交易日 (使用 DataManager 或 Baostock)
         # 这里简单起见，从 DataManager 获取 list_local_codes("a_share") 随便一个文件的索引
@@ -724,17 +1197,27 @@ class VirtualTradingManager:
             raise RuntimeError(f"无法确定待补齐的交易日序列: {e}")
 
         if not missing_days:
+            pending_remaining = self._pending_order_count(cursor)
             conn.close()
-            return {"status": "skipped", "message": "未发现待补齐的交易日数据。", "date": target_date}
+            return {
+                "status": "skipped",
+                "message": "未发现待补齐的交易日数据。",
+                "date": target_date,
+                **self._empty_order_stats(),
+                "pending_remaining": pending_remaining,
+                "execution_date_range": None,
+            }
 
         logger.info(f"检测到待补齐日期序列: {missing_days}")
         
         daily_reports = []
         skipped_reports = []
+        order_totals = self._empty_order_stats()
 
         # 3. 循环执行每一天
-        for day in missing_days:
+        for day_index, day in enumerate(missing_days):
             logger.info(f">>> 正在执行日期补齐: {day} ...")
+            next_day = missing_days[day_index + 1] if day_index + 1 < len(missing_days) else None
 
             active_accounts = self._active_accounts()
 
@@ -774,47 +1257,73 @@ class VirtualTradingManager:
                     day_data = df[df['date'] == day]
 
                     # 获取当前真实持仓
-                    cursor.execute("""
-                        SELECT symbol, shares, cost_price, current_price, entry_date, entry_price
-                        FROM positions
-                        WHERE strategy_id = ?
-                    """, (strategy_id,))
-                    current_pos_rows = cursor.fetchall()
-                    current_positions = {}
-                    initial_holdings = {}
-                    for row in current_pos_rows:
-                        symbol, shares, cost_price, current_price, entry_date, entry_price = row
-                        resolved_entry_date = entry_date or acc.get("last_update") or day
-                        resolved_entry_price = entry_price if entry_price is not None else cost_price
-                        current_positions[symbol] = MockPosition(
-                            shares,
-                            cost_price,
-                            current_price=current_price,
-                            entry_date=resolved_entry_date,
-                            entry_price=resolved_entry_price,
-                        )
-                        initial_holdings[symbol] = HoldingInfo(
-                            code=symbol,
-                            entry_date=resolved_entry_date,
-                            entry_price=float(resolved_entry_price or 0.0),
-                        )
+                    current_positions = self._current_positions(cursor, strategy_id, acc.get("last_update") or day)
+                    generated_for_today, _, _ = self._ensure_orders_for_trade_day(
+                        cursor,
+                        strategy_id,
+                        day,
+                        df,
+                        df_with_signals,
+                        spec,
+                        current_positions,
+                        float(acc["cash"] or 0.0),
+                        float(acc["total_value"] or 0.0),
+                    )
+                    self._add_order_stats(order_totals, generated_for_today)
 
-                    # 生成目标权重
+                    cash_after_open, executed = self._execute_pending_orders(
+                        cursor,
+                        strategy_id,
+                        day,
+                        day_data,
+                        current_positions,
+                        float(acc["cash"] or 0.0),
+                    )
+                    self._add_order_stats(order_totals, executed)
+                    cash_after_close, total_after_close = self._mark_positions_to_close(
+                        cursor,
+                        strategy_id,
+                        day,
+                        current_positions,
+                        day_data,
+                        cash_after_open,
+                    )
+
+                    # 生成下一交易日开盘订单。最后一个可用交易日不凭空推断未来交易日。
                     pos_manager = PositionManager(max_positions=5, strategy_spec=spec)
-                    pos_manager.seed_holdings(initial_holdings)
+                    pos_manager.seed_holdings(
+                        {
+                            code: HoldingInfo(
+                                code=code,
+                                entry_date=pos.entry_date or day,
+                                entry_price=float(pos.entry_price or pos.cost_price or 0.0),
+                            )
+                            for code, pos in current_positions.items()
+                        }
+                    )
                     target_weights = pos_manager.generate_target_weights(day, day_data, day_signals, current_positions=current_positions)
-
-                    # 撮合：计算 Target vs Current (差额调仓)
-                    self._match_orders(cursor, strategy_id, day, target_weights, current_positions, day_data, acc['cash'], acc['total_value'])
+                    if next_day:
+                        created_next = self._create_rebalance_orders(
+                            cursor,
+                            strategy_id,
+                            day,
+                            next_day,
+                            target_weights,
+                            current_positions,
+                            day_data,
+                            cash_after_close,
+                            total_after_close,
+                        )
+                        self._add_order_stats(order_totals, created_next)
                     self._record_strategy_report(
                         cursor,
                         strategy_id,
                         day,
-                        "traded" if target_weights else "cash",
+                        "traded" if executed.get("orders_filled") or executed.get("partial_fills") else "planned" if target_weights else "cash",
                         spec.pool,
                         skipped_pools.get(spec.pool, {}) if isinstance(skipped_pools.get(spec.pool), dict) else {"requested": len(day_data["stock_code"].unique())},
                         pos_manager.last_decision_info,
-                        "已按最新信号调仓" if target_weights else "当日未形成持仓信号，账户保持现金",
+                        "已完成开盘撮合并生成下一交易日订单" if next_day and target_weights else "已完成开盘撮合与收盘盯市",
                     )
                     
                     # 记录每日快照
@@ -874,6 +1383,7 @@ class VirtualTradingManager:
                     "skipped_pools": skipped_pools,
                 })
 
+        pending_remaining = self._pending_order_count(cursor)
         conn.close()
         failed_strategies = [
             item
@@ -889,6 +1399,9 @@ class VirtualTradingManager:
                     "processed_days": [],
                     "skipped_days": skipped_reports,
                     "failed_strategies": failed_strategies,
+                    **order_totals,
+                    "pending_remaining": pending_remaining,
+                    "execution_date_range": None,
                 }
             return {
                 "status": "skipped",
@@ -896,6 +1409,9 @@ class VirtualTradingManager:
                 "date": last_update,
                 "processed_days": [],
                 "skipped_days": skipped_reports,
+                **order_totals,
+                "pending_remaining": pending_remaining,
+                "execution_date_range": None,
             }
         return {
             "status": "partial" if failed_strategies else "success",
@@ -904,160 +1420,35 @@ class VirtualTradingManager:
             "processed_days": daily_reports,
             "skipped_days": skipped_reports,
             "failed_strategies": failed_strategies,
+            **order_totals,
+            "pending_remaining": pending_remaining,
+            "execution_date_range": {"start": daily_reports[0], "end": daily_reports[-1]} if daily_reports else None,
         }
 
     def _match_orders(self, cursor, strategy_id, date, target_weights, current_positions, day_data, cash, total_value):
-        """
-        专业差额调仓逻辑：计算目标股数与当前股数的差值，优先执行卖出以释放资金。
-        """
-        price_map = day_data.set_index('stock_code')['close'].to_dict()
-        row_map = day_data.set_index("stock_code", drop=False).to_dict(orient="index")
-
-        # 先逐日盯市。即使当天没有成交，持仓价格、账户净值和 daily_stats 也必须推进。
-        for code, pos in current_positions.items():
-            price = price_map.get(code)
-            if price and price > 0:
-                pos.current_price = price
-                cursor.execute(
-                    "UPDATE positions SET current_price = ? WHERE strategy_id = ? AND symbol = ?",
-                    (price, strategy_id, code),
-                )
-        
-        # 1. 计算当前最新持仓市值 (按今日收盘价)
-        current_market_value = 0
-        for code, pos in current_positions.items():
-            price = price_map.get(code, pos.current_price)
-            current_market_value += pos.shares * price
-        
-        # 实时总资产 (今日收盘价计算)
-        live_total_value = cash + current_market_value
-        
-        # 2. 计算目标持仓股数
-        target_shares = {}
-        for code, weight in target_weights.items():
-            price = price_map.get(code)
-            if not price or price <= 0: continue
-
-            target_val = live_total_value * weight / (1.0 + VIRTUAL_FEE_RATE)
-            # 向上取整一手 (100股)，或者按权重严谨计算
-            shares = int(target_val / price / 100) * 100
-            if shares > 0:
-                target_shares[code] = shares
-
-        # 3. 找出差异并执行
-        # A. 卖出逻辑 (当前有但目标无，或者当前 > 目标)
-        sell_orders = []
-        buy_orders = []
-        
-        for code, pos in current_positions.items():
-            curr_s = pos.shares
-            targ_s = target_shares.get(code, 0)
-            if curr_s > targ_s:
-                sell_orders.append((code, curr_s - targ_s))
-
-        for code, targ_s in target_shares.items():
-            curr_s = current_positions.get(code).shares if code in current_positions else 0
-            if targ_s > curr_s:
-                buy_orders.append((code, targ_s - curr_s))
-        
-        # 执行卖出
-        for code, diff_shares in sell_orders:
-            price = price_map.get(code)
-            if not price: continue
-            row = row_map.get(code, {})
-            pos = current_positions.get(code)
-            if pos and self._is_t1_sell_blocked(pos, date):
-                logger.info(f"T+1 blocks {strategy_id} from selling {code} on {date}")
-                continue
-            block_reason = self._trade_block_reason(row, "close", "sell")
-            if block_reason is not None:
-                logger.info(f"Tradability blocks {strategy_id} SELL {code} on {date}: {block_reason}")
-                continue
-            filled_shares = self._cap_order_shares(row, diff_shares)
-            if filled_shares <= 0:
-                logger.info(f"Capacity blocks {strategy_id} SELL {code} on {date}: requested={diff_shares}")
-                continue
-            
-            amount = filled_shares * price
-            fee = amount * VIRTUAL_FEE_RATE
-            cash += (amount - fee)
-            
-            # 更新/删除持仓
-            new_shares = current_positions[code].shares - filled_shares if code in current_positions else 0
-            if new_shares > 0:
-                cursor.execute("UPDATE positions SET shares = ?, current_price = ? WHERE strategy_id = ? AND symbol = ?",
-                             (new_shares, price, strategy_id, code))
-                current_positions[code].shares = new_shares
-                current_positions[code].current_price = price
-            else:
-                cursor.execute("DELETE FROM positions WHERE strategy_id = ? AND symbol = ?", (strategy_id, code))
-                current_positions.pop(code, None)
-            
-            fill_note = "部分成交" if filled_shares < diff_shares else "成交"
-            cursor.execute("INSERT INTO trade_log (strategy_id, date, symbol, side, price, shares, fee, msg) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                         (strategy_id, date, code, 'SELL', price, filled_shares, fee, f"调仓减仓{fill_note} (剩余 {new_shares})"))
-
-        # 执行买入 (受限于可用现金)
-        for code, diff_shares in buy_orders:
-            price = price_map.get(code)
-            if not price: continue
-            row = row_map.get(code, {})
-            block_reason = self._trade_block_reason(row, "close", "buy")
-            if block_reason is not None:
-                logger.info(f"Tradability blocks {strategy_id} BUY {code} on {date}: {block_reason}")
-                continue
-            filled_shares = self._cap_order_shares(row, diff_shares)
-            if filled_shares <= 0:
-                logger.info(f"Capacity blocks {strategy_id} BUY {code} on {date}: requested={diff_shares}")
-                continue
-            
-            cost = filled_shares * price
-            fee = cost * VIRTUAL_FEE_RATE
-            total_cost = cost + fee
-            
-            if cash >= total_cost:
-                cash -= total_cost
-                # 更新/新增持仓
-                if code in current_positions:
-                    # 摊薄成本 (简单算术平均)
-                    old_pos = current_positions[code]
-                    new_total_shares = old_pos.shares + filled_shares
-                    new_avg_cost = (old_pos.shares * old_pos.cost_price + cost) / new_total_shares
-                    cursor.execute("UPDATE positions SET shares = ?, cost_price = ?, current_price = ? WHERE strategy_id = ? AND symbol = ?",
-                                 (new_total_shares, new_avg_cost, price, strategy_id, code))
-                    old_pos.shares = new_total_shares
-                    old_pos.cost_price = new_avg_cost
-                    old_pos.current_price = price
-                else:
-                    cursor.execute("""
-                        INSERT INTO positions (
-                            strategy_id, symbol, shares, cost_price, current_price, entry_date, entry_price
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (strategy_id, code, filled_shares, price, price, date, price))
-                    current_positions[code] = MockPosition(
-                        filled_shares,
-                        price,
-                        current_price=price,
-                        entry_date=date,
-                        entry_price=price,
-                    )
-                
-                fill_note = "部分成交" if filled_shares < diff_shares else "成交"
-                cursor.execute("INSERT INTO trade_log (strategy_id, date, symbol, side, price, shares, fee, msg) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                             (strategy_id, date, code, 'BUY', price, filled_shares, fee, f"调仓增仓{fill_note}"))
-            else:
-                # 现金不足，跳过或部分成交
-                logger.warning(f"Cash insufficient for {strategy_id} to buy {code}: needs {total_cost:.2f}, has {cash:.2f}")
-
-        # 4. 更新账户状态
-        final_pos_value = sum(
-            pos.shares * (price_map.get(code, pos.current_price) or pos.current_price)
-            for code, pos in current_positions.items()
+        """Legacy compatibility shim: use the order ledger and open auction matching."""
+        stats = self._create_rebalance_orders(
+            cursor,
+            strategy_id,
+            date,
+            date,
+            target_weights,
+            current_positions,
+            day_data,
+            cash,
+            total_value,
         )
-        final_total_value = cash + final_pos_value
-        
-        cursor.execute("UPDATE accounts SET cash = ?, total_value = ?, last_update = ? WHERE strategy_id = ?",
-                     (cash, final_total_value, date, strategy_id))
+        cash, executed = self._execute_pending_orders(
+            cursor,
+            strategy_id,
+            date,
+            day_data,
+            current_positions,
+            cash,
+        )
+        self._add_order_stats(stats, executed)
+        self._mark_positions_to_close(cursor, strategy_id, date, current_positions, day_data, cash)
+        return stats
 
     def _safe_float(self, value) -> Optional[float]:
         if value is None:
