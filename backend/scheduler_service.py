@@ -91,6 +91,29 @@ MANAGED_WORK_PROFILES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+AI_ACTION_LABELS = {
+    "run_virtual_trade": "追赶模拟盘",
+    "check_data_integrity": "数据完整性检查",
+    "trigger_eod_update": "触发收盘补数",
+    "realtime_snapshot": "盘中快照",
+    "run_factor_lab": "Factor Lab 研究",
+    "run_factor_lab_backtest": "Factor Lab 回测",
+    "run_factor_lab_stress_test": "Factor Lab 压力测试",
+    "promote_factor_lab_candidate": "候选策略推进",
+    "start_shadow_observation": "影子观察",
+    "approve_strategy_version": "策略版本审批",
+    "activate_strategy_version": "策略版本激活",
+    "generate_daily_report": "生成日报",
+}
+
+AI_ACTION_STATUS_LABELS = {
+    "executed": "已执行",
+    "planned": "已规划",
+    "skipped": "已跳过",
+    "rejected": "已拒绝",
+    "failed": "失败",
+}
+
 
 class AutomationOrchestrator:
     def __init__(
@@ -214,26 +237,90 @@ class AutomationOrchestrator:
         decision: Optional[Dict[str, Any]] = None,
         dry_run: bool = False,
     ) -> Dict[str, Any]:
-        run_id = self.store.start_run("ai_cycle", trigger, self.data_lake_service.default_target_date())
+        target_date = self.data_lake_service.default_target_date()
+        run_id = self.store.start_run("ai_cycle", trigger, target_date)
+        self._record_ai_work_message(
+            work_id=run_id,
+            work_type="ai_cycle",
+            trigger=trigger,
+            target_date=target_date,
+            action_type="cycle_start",
+            status="running",
+            title="AI cycle 开始",
+            body="开始读取系统状态、请求 AI 决策，并在白名单权限内执行模拟盘相关动作。",
+            details={"dry_run": dry_run},
+        )
         try:
             context = self.context_builder()
-            decision_payload = decision or self.ai_service.call_external_ai(context)
+            context_target_date = self._context_target_date(context)
+            decision_payload = decision or self._call_ai_cycle_with_fallback(context)
             execution = self.ai_service.execute_decision(
                 decision_payload,
                 handlers=self.ai_handlers,
                 source=str(decision_payload.get("source") or trigger or "ai_cycle"),
                 dry_run=dry_run,
+                on_action_result=lambda result: self._record_ai_action_message(
+                    result,
+                    work_id=run_id,
+                    work_type="ai_cycle",
+                    trigger=trigger,
+                    target_date=context_target_date,
+                ),
             )
             summary = {
-                "context_target_date": context.get("data_freshness", {}).get("target_date"),
+                "context_target_date": context_target_date,
                 "decision": execution.get("decision"),
                 "action_results": execution.get("action_results"),
             }
             status = "success" if execution.get("decision", {}).get("status") not in {"failed", "rejected"} else "partial"
+            decision_record = execution.get("decision") or {}
+            action_results = execution.get("action_results") or []
+            self._record_ai_work_message(
+                work_id=run_id,
+                work_type="ai_cycle",
+                trigger=trigger,
+                target_date=context_target_date,
+                action_type="cycle_finish",
+                status=status,
+                level=self._message_level_for_status(status),
+                title="AI cycle 完成" if status == "success" else "AI cycle 部分完成",
+                body=str(decision_record.get("summary") or "AI cycle 已完成。"),
+                details={
+                    "decision_id": decision_record.get("decision_id"),
+                    "decision_status": decision_record.get("status"),
+                    "action_count": len(action_results) if isinstance(action_results, list) else 0,
+                },
+            )
             return self.store.finish_run(run_id, status, summary=summary)
         except Exception as exc:
             logger.exception("ai cycle failed")
+            self._record_ai_work_message(
+                work_id=run_id,
+                work_type="ai_cycle",
+                trigger=trigger,
+                target_date=target_date,
+                action_type="cycle_failed",
+                status="failed",
+                level="error",
+                title="AI cycle 失败",
+                body=f"AI cycle 执行失败：{exc}",
+                details={"error": str(exc)},
+            )
             return self.store.finish_run(run_id, "failed", summary={}, error=str(exc))
+
+    def _call_ai_cycle_with_fallback(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return self.ai_service.call_external_ai(context)
+        except Exception as exc:
+            logger.warning("external ai cycle call failed, using local fallback: %s", exc)
+            target_date = self._context_target_date(context)
+            return {
+                "actor": "local_guardrail",
+                "source": "ai_cycle_fallback",
+                "summary": f"外部 AI 调用失败，已生成本地 AI cycle 日报兜底。原因：{exc}",
+                "confidence": 1.0,
+                "actions": [{"type": "generate_daily_report", "params": {"mode": "ai_cycle_fallback", "target_date": target_date}}],
+            }
 
     def run_ai_managed_work(
         self,
@@ -247,16 +334,35 @@ class AutomationOrchestrator:
         target_date = self.data_lake_service.default_target_date()
         run_id = self.store.start_run("ai_managed_work", trigger, target_date)
         work_id = self.store.start_ai_work(work_type, trigger, target_date=target_date, title=str(profile["title"]))
+        self._record_ai_work_message(
+            work_id=work_id,
+            work_type=work_type,
+            trigger=trigger,
+            target_date=target_date,
+            action_type="work_start",
+            status="running",
+            title=f"{profile['title']}开始",
+            body=str(profile["objective"]),
+            details={"run_id": run_id, "dry_run": dry_run},
+        )
         try:
             context = self.context_builder()
+            context_target_date = self._context_target_date(context)
             managed_context = self._managed_context(context, work_type, profile, dry_run=dry_run)
-            decision_payload = decision or self.ai_service.call_external_ai(managed_context)
+            decision_payload = decision or self._call_managed_ai_with_fallback(work_type, profile, managed_context)
             decision_payload = self._prepare_managed_decision(decision_payload, work_type, profile, context, dry_run=dry_run)
             execution = self.ai_service.execute_decision(
                 decision_payload,
                 handlers=self.ai_handlers,
                 source=str(decision_payload.get("source") or trigger or work_type),
                 dry_run=dry_run,
+                on_action_result=lambda result: self._record_ai_action_message(
+                    result,
+                    work_id=work_id,
+                    work_type=work_type,
+                    trigger=trigger,
+                    target_date=context_target_date,
+                ),
             )
             action_results = execution.get("action_results") or []
             decision_record = execution.get("decision") or {}
@@ -279,6 +385,23 @@ class AutomationOrchestrator:
                 "action_results": action_results,
                 "work_type": work_type,
             }
+            self._record_ai_work_message(
+                work_id=work_id,
+                work_type=work_type,
+                trigger=trigger,
+                target_date=context_target_date,
+                action_type="work_finish",
+                status=status,
+                level=self._message_level_for_status(status),
+                title=f"{profile['title']}完成" if status in {"success", "dry_run"} else f"{profile['title']}结束",
+                body=summary_text or str(profile["objective"]),
+                details={
+                    "run_id": run_id,
+                    "work_log_id": work_log.get("work_id"),
+                    "decision_id": decision_record.get("decision_id"),
+                    "action_count": len(action_results) if isinstance(action_results, list) else 0,
+                },
+            )
             return self.store.finish_run(run_id, status, summary=summary, error=work_log.get("error"))
         except Exception as exc:
             logger.exception("ai managed work failed")
@@ -289,7 +412,37 @@ class AutomationOrchestrator:
                 summary=f"{profile['title']} 执行失败: {exc}",
                 error=str(exc),
             )
+            self._record_ai_work_message(
+                work_id=work_id,
+                work_type=work_type,
+                trigger=trigger,
+                target_date=target_date,
+                action_type="work_failed",
+                status="failed",
+                level="error",
+                title=f"{profile['title']}失败",
+                body=f"{profile['title']}执行失败：{exc}",
+                details={"run_id": run_id, "error": str(exc)},
+            )
             return self.store.finish_run(run_id, "failed", summary={"work_type": work_type}, error=str(exc))
+
+    def _call_managed_ai_with_fallback(
+        self,
+        work_type: str,
+        profile: Dict[str, Any],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            return self.ai_service.call_external_ai(context)
+        except Exception as exc:
+            logger.warning("external ai managed work call failed, using local fallback: %s", exc)
+            return {
+                "actor": "local_guardrail",
+                "source": f"{work_type}_fallback",
+                "summary": f"外部 AI 调用失败，按内置托管动作继续执行。原因：{exc}",
+                "confidence": 1.0,
+                "actions": profile.get("preferred_actions") if isinstance(profile.get("preferred_actions"), list) else [],
+            }
 
     def status_payload(self, scheduler: Optional["LightweightScheduler"] = None) -> Dict[str, Any]:
         freshness = self.data_lake_service.data_freshness(max_scan=300)
@@ -300,9 +453,137 @@ class AutomationOrchestrator:
             "recent_snapshots": self.store.latest_snapshots(limit=5),
             "ai_decisions": self.store.list_ai_decisions(limit=5),
             "ai_work_logs": self.store.list_ai_work_logs(limit=8),
+            "ai_work_messages": self.store.list_ai_work_messages(limit=30),
             "last_eod_update": self.store.get_state("last_eod_update", {}),
             "last_virtual_trade": self.store.get_state("last_virtual_trade", {}),
         }
+
+    def _record_ai_work_message(
+        self,
+        *,
+        work_id: str,
+        work_type: str,
+        trigger: str,
+        target_date: Optional[str],
+        action_type: str,
+        status: str,
+        title: str,
+        body: str,
+        level: str = "info",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            self.store.record_ai_work_message(
+                work_id=work_id,
+                work_type=work_type,
+                trigger=trigger,
+                target_date=target_date,
+                action_type=action_type,
+                status=status,
+                level=level,
+                title=title,
+                body=body,
+                details=details or {},
+            )
+        except Exception:
+            logger.exception("failed to record ai work message")
+
+    def _record_ai_action_message(
+        self,
+        result: Dict[str, Any],
+        *,
+        work_id: str,
+        work_type: str,
+        trigger: str,
+        target_date: Optional[str],
+    ) -> None:
+        if not isinstance(result, dict):
+            return
+        action_type = str(result.get("type") or result.get("action") or "unknown")
+        status = str(result.get("status") or "unknown")
+        label = AI_ACTION_LABELS.get(action_type, action_type)
+        status_label = AI_ACTION_STATUS_LABELS.get(status, status)
+        self._record_ai_work_message(
+            work_id=work_id,
+            work_type=work_type,
+            trigger=trigger,
+            target_date=target_date,
+            action_type=action_type,
+            status=status,
+            level=self._message_level_for_status(status),
+            title=f"{label} / {status_label}",
+            body=self._action_message_body(action_type, status, result),
+            details=self._compact_message_details(result),
+        )
+
+    @staticmethod
+    def _message_level_for_status(status: str) -> str:
+        if status in {"failed", "rejected", "blocked"}:
+            return "error"
+        if status in {"partial", "skipped", "degraded"}:
+            return "warn"
+        return "info"
+
+    @staticmethod
+    def _action_message_body(action_type: str, status: str, result: Dict[str, Any]) -> str:
+        label = AI_ACTION_LABELS.get(action_type, action_type or "AI 动作")
+        if status == "planned":
+            return f"{label}已加入 dry-run 计划，未改变系统状态。"
+        if status == "skipped":
+            return f"{label}已跳过：{result.get('reason') or '当前条件或处理器未满足'}。"
+        if status == "rejected":
+            return f"{label}被权限边界拒绝：{result.get('reason') or '动作不在允许范围内'}。"
+        if status == "failed":
+            return f"{label}执行失败：{result.get('error') or result.get('reason') or '未知错误'}。"
+        if status == "executed":
+            detail = AutomationOrchestrator._action_result_detail(result.get("result"))
+            return f"{label}已执行。{detail}" if detail else f"{label}已执行。"
+        return f"{label}状态更新：{status}。"
+
+    @staticmethod
+    def _action_result_detail(value: Any) -> str:
+        if isinstance(value, dict):
+            for key in ("message", "summary", "status", "run_id", "work_id"):
+                if value.get(key):
+                    return str(value[key])[:240]
+            if "date" in value:
+                return f"日期 {value['date']}"
+            if "score" in value or "target_date" in value:
+                parts = []
+                if value.get("target_date"):
+                    parts.append(f"目标 {value['target_date']}")
+                if value.get("status"):
+                    parts.append(f"状态 {value['status']}")
+                if value.get("score") is not None:
+                    parts.append(f"评分 {value['score']}")
+                return "，".join(parts)[:240]
+        if isinstance(value, str):
+            return value[:240]
+        return ""
+
+    @classmethod
+    def _compact_message_details(cls, value: Any) -> Dict[str, Any]:
+        compacted = cls._compact_value(value)
+        return compacted if isinstance(compacted, dict) else {"value": compacted}
+
+    @classmethod
+    def _compact_value(cls, value: Any, *, depth: int = 0) -> Any:
+        if depth >= 3:
+            return "..."
+        if isinstance(value, dict):
+            items = list(value.items())[:12]
+            compacted = {str(key): cls._compact_value(val, depth=depth + 1) for key, val in items}
+            if len(value) > len(items):
+                compacted["_truncated_keys"] = len(value) - len(items)
+            return compacted
+        if isinstance(value, list):
+            items = [cls._compact_value(item, depth=depth + 1) for item in value[:8]]
+            if len(value) > len(items):
+                items.append({"_truncated_items": len(value) - len(items)})
+            return items
+        if isinstance(value, str):
+            return value if len(value) <= 400 else value[:400] + "..."
+        return value
 
     def _managed_work_profile(self, work_type: str) -> Dict[str, Any]:
         profile = MANAGED_WORK_PROFILES.get(work_type)

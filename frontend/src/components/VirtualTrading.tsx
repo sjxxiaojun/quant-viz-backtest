@@ -106,6 +106,21 @@ interface AIWorkLog {
   error?: string | null;
 }
 
+interface AIWorkMessage {
+  message_id: string;
+  work_id?: string | null;
+  work_type: string;
+  trigger?: string;
+  target_date?: string | null;
+  action_type?: string | null;
+  status: string;
+  level: string;
+  title?: string;
+  body?: string;
+  created_at: string;
+  details?: Record<string, unknown>;
+}
+
 interface AutomationStatus {
   scheduler?: {
     enabled?: boolean;
@@ -123,11 +138,13 @@ interface AutomationStatus {
   recent_snapshots?: AutomationSnapshot[];
   ai_decisions?: AIDecision[];
   ai_work_logs?: AIWorkLog[];
+  ai_work_messages?: AIWorkMessage[];
   last_eod_update?: Record<string, unknown>;
   last_virtual_trade?: Record<string, unknown>;
 }
 
 type AutomationJobKind = 'snapshot' | 'eodDryRun' | 'virtualTrade' | 'aiCycle' | 'aiSimulationCare' | 'aiFactorLabCare';
+type VirtualTradingSection = 'ai' | 'strategies' | 'flow';
 
 function getErrorMessage(error: unknown, fallback: string): string {
   return getApiErrorMessage(error, error instanceof Error ? error.message : fallback);
@@ -218,9 +235,36 @@ function statusTone(status?: string): string {
   return 'text-slate-400';
 }
 
+function messageTone(message?: AIWorkMessage): string {
+  if (message?.level === 'error' || ['failed', 'rejected', 'blocked'].includes(message?.status || '')) {
+    return 'border-rose-500/20 bg-rose-500/10 text-rose-100';
+  }
+  if (message?.level === 'warn' || ['partial', 'skipped', 'degraded'].includes(message?.status || '')) {
+    return 'border-amber-500/20 bg-amber-500/10 text-amber-100';
+  }
+  if (message?.status === 'running') {
+    return 'border-cyan-500/20 bg-cyan-500/10 text-cyan-100';
+  }
+  return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100';
+}
+
 function formatAutomationTime(value?: string | null): string {
   if (!value) return '--';
   return value.slice(0, 16).replace('T', ' ');
+}
+
+function findUnresolvedProblemRun(runs?: AutomationRun[]): AutomationRun | undefined {
+  const recoveredJobTypes = new Set<string>();
+  for (const run of runs || []) {
+    if (['failed', 'partial'].includes(run.status)) {
+      if (!recoveredJobTypes.has(run.job_type)) return run;
+      continue;
+    }
+    if (['success', 'dry_run', 'executed', 'skipped'].includes(run.status)) {
+      recoveredJobTypes.add(run.job_type);
+    }
+  }
+  return undefined;
 }
 
 export function VirtualTrading() {
@@ -238,6 +282,7 @@ export function VirtualTrading() {
   const [automationStatus, setAutomationStatus] = useState<AutomationStatus | null>(null);
   const [automationError, setAutomationError] = useState<string | null>(null);
   const [automationRunning, setAutomationRunning] = useState<string | null>(null);
+  const [activeSection, setActiveSection] = useState<VirtualTradingSection>('ai');
   const mountedRef = useRef(false);
   const dataRequestRef = useRef(0);
   const detailsRequestRef = useRef(0);
@@ -431,10 +476,11 @@ export function VirtualTrading() {
   const tickerTrades = history.slice(0, 5);
   const freshness = automationStatus?.data_freshness;
   const latestRun = automationStatus?.recent_runs?.[0];
-  const latestProblemRun = automationStatus?.recent_runs?.find((run) => ['failed', 'partial'].includes(run.status));
+  const latestProblemRun = findUnresolvedProblemRun(automationStatus?.recent_runs);
   const latestSnapshot = automationStatus?.recent_snapshots?.[0];
   const latestDecision = automationStatus?.ai_decisions?.[0];
   const latestWorkLog = automationStatus?.ai_work_logs?.[0];
+  const latestMessage = automationStatus?.ai_work_messages?.[0];
   const nextJob = automationStatus?.scheduler?.next_jobs?.[0];
   const automationActions: Array<{ kind: AutomationJobKind; label: string; Icon: LucideIcon }> = [
     { kind: 'snapshot', label: '抓盘中快照', Icon: Activity },
@@ -443,6 +489,11 @@ export function VirtualTrading() {
     { kind: 'aiCycle', label: '运行 AI cycle', Icon: Bot },
     { kind: 'aiSimulationCare', label: 'AI 托管模拟池', Icon: ClipboardList },
     { kind: 'aiFactorLabCare', label: 'AI 照料因子实验', Icon: FlaskConical },
+  ];
+  const tradingSections: Array<{ key: VirtualTradingSection; label: string; Icon: LucideIcon; meta: string }> = [
+    { key: 'ai', label: 'AI', Icon: Bot, meta: latestMessage ? `${latestMessage.work_type} / ${latestMessage.status}` : '消息与托管' },
+    { key: 'strategies', label: '策略', Icon: Briefcase, meta: `${accounts.length} 个账户` },
+    { key: 'flow', label: '流水', Icon: History, meta: `${history.length} 条记录` },
   ];
 
   return (
@@ -532,6 +583,39 @@ export function VirtualTrading() {
         </div>
       </div>
 
+      <nav className="grid grid-cols-1 md:grid-cols-3 gap-3 rounded-[2rem] border border-slate-800 bg-slate-950/50 p-2 backdrop-blur-xl">
+        {tradingSections.map(({ key, label, Icon, meta }) => {
+          const active = activeSection === key;
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setActiveSection(key)}
+              className={cn(
+                "flex items-center justify-between gap-4 rounded-2xl border px-5 py-4 text-left transition-all",
+                active
+                  ? "border-cyan-500/30 bg-cyan-500/10 text-white shadow-lg shadow-cyan-950/20"
+                  : "border-transparent bg-transparent text-slate-400 hover:border-slate-700 hover:bg-slate-900/60 hover:text-slate-100"
+              )}
+            >
+              <span className="flex items-center gap-3">
+                <span className={cn(
+                  "flex h-10 w-10 items-center justify-center rounded-xl border",
+                  active ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200" : "border-slate-800 bg-slate-900/60 text-slate-500"
+                )}>
+                  <Icon className="h-4 w-4" />
+                </span>
+                <span>
+                  <span className="block text-lg font-black">{label}</span>
+                  <span className="mt-0.5 block text-[10px] font-bold uppercase tracking-widest text-slate-500">{meta}</span>
+                </span>
+              </span>
+            </button>
+          );
+        })}
+      </nav>
+
+      {activeSection === 'ai' && (
       <section className="rounded-[2rem] border border-cyan-500/10 bg-slate-900/50 backdrop-blur-xl p-6 shadow-2xl space-y-6">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-5">
           <div className="space-y-2">
@@ -627,9 +711,54 @@ export function VirtualTrading() {
                 <Bot className="w-4 h-4 text-cyan-300" />
               </div>
               <div>
-                <h4 className="text-sm font-black text-white">AI 托管工作台</h4>
-                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">模拟池 · Factor Lab · 工作总结</p>
+                <h4 className="text-sm font-black text-white">AI 消息入口</h4>
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">每次操作 · 时间 · 内容 · 结果</p>
               </div>
+            </div>
+            <div className={cn("text-xs font-black", statusTone(latestWorkLog?.status))}>
+              {latestMessage ? `${latestMessage.work_type} / ${latestMessage.status}` : '暂无消息'}
+            </div>
+          </div>
+          <div className="divide-y divide-slate-800/60">
+            {(automationStatus?.ai_work_messages || []).slice(0, 12).map((message) => (
+              <div key={message.message_id} className="px-5 py-4 grid grid-cols-1 lg:grid-cols-[210px_1fr_240px] gap-3 text-xs">
+                <div>
+                  <div className="font-black text-slate-200">{message.title || `${message.action_type || 'AI 动作'} / ${message.status}`}</div>
+                  <div className="mt-1 font-mono text-[10px] text-slate-500">
+                    {formatAutomationTime(message.created_at)} · {message.trigger || '--'}
+                  </div>
+                </div>
+                <div className="text-slate-300 leading-5">
+                  {message.body || 'AI 已记录一次操作。'}
+                </div>
+                <div className="flex flex-wrap gap-2 lg:justify-end">
+                  <span className={cn("px-2.5 py-1 rounded-lg border text-[10px] font-black", messageTone(message))}>
+                    {message.status}
+                  </span>
+                  <span className="px-2.5 py-1 rounded-lg border border-slate-700 bg-slate-900/60 text-[10px] font-black text-slate-400">
+                    {message.work_type}
+                  </span>
+                  {message.action_type && (
+                    <span className="px-2.5 py-1 rounded-lg border border-slate-700 bg-slate-900/60 text-[10px] font-black text-slate-400">
+                      {message.action_type}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+            {!(automationStatus?.ai_work_messages || []).length && (
+              <div className="px-5 py-6 text-xs text-slate-500">
+                等待 AI 首次运行。之后每一次动作都会在这里按时间记录，包括执行内容、状态和摘要。
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-800 bg-slate-950/30 overflow-hidden">
+          <div className="flex items-center justify-between gap-4 px-5 py-4 border-b border-slate-800/70">
+            <div>
+              <h4 className="text-sm font-black text-white">AI 托管任务总结</h4>
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">一轮任务完成后的汇总记录</p>
             </div>
             <div className={cn("text-xs font-black", statusTone(latestWorkLog?.status))}>
               {latestWorkLog ? `${latestWorkLog.work_type} / ${latestWorkLog.status}` : '暂无托管日志'}
@@ -668,7 +797,7 @@ export function VirtualTrading() {
             ))}
             {!(automationStatus?.ai_work_logs || []).length && (
               <div className="px-5 py-6 text-xs text-slate-500">
-                等待 AI 托管任务首次运行，完成后会在这里按时间记录工作内容、动作和结果。
+                等待 AI 托管任务首次运行，完成后会在这里按轮次记录工作总结。
               </div>
             )}
           </div>
@@ -676,13 +805,28 @@ export function VirtualTrading() {
 
         {latestProblemRun && (
           <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-5 py-4 text-xs text-amber-100">
-            最近异常：{latestProblemRun.job_type} / {latestProblemRun.status}
+            最近未恢复异常：{latestProblemRun.job_type} / {latestProblemRun.status}
+            {latestProblemRun.started_at ? ` · ${formatAutomationTime(latestProblemRun.started_at)}` : ''}
             {latestProblemRun.error ? ` · ${latestProblemRun.error}` : ''}
           </div>
         )}
       </section>
+      )}
 
       {/* 策略网格 */}
+      {activeSection === 'strategies' && (
+      <section className="space-y-6">
+        <div className="flex items-center justify-between px-2">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-xl bg-blue-500/10 border border-blue-500/20">
+              <Briefcase className="w-5 h-5 text-blue-400" />
+            </div>
+            <div>
+              <h3 className="text-2xl font-black text-white">策略账户</h3>
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mt-0.5">收益排行 · 持仓概览 · 净值详情</p>
+            </div>
+          </div>
+        </div>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
         {accounts.map((acc, index) => (
           <div 
@@ -742,9 +886,12 @@ export function VirtualTrading() {
           </div>
         ))}
       </div>
+      </section>
+      )}
 
       {/* 交易历史列表 */}
-      <div className="space-y-6 pt-10">
+      {activeSection === 'flow' && (
+      <div className="space-y-6">
         <div className="flex items-center justify-between px-2">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-xl bg-indigo-500/10 border border-indigo-500/20">
@@ -803,6 +950,7 @@ export function VirtualTrading() {
           </table>
         </div>
       </div>
+      )}
 
       {/* 策略详情弹窗/抽屉 */}
       {selectedStrategy && (

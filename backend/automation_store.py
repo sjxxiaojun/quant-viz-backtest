@@ -104,6 +104,25 @@ class AutomationStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS ai_work_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT UNIQUE NOT NULL,
+                    work_id TEXT,
+                    work_type TEXT NOT NULL,
+                    trigger TEXT NOT NULL,
+                    target_date TEXT,
+                    action_type TEXT,
+                    status TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    title TEXT,
+                    body TEXT,
+                    created_at TEXT NOT NULL,
+                    details_json TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS market_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     snapshot_id TEXT UNIQUE NOT NULL,
@@ -120,6 +139,8 @@ class AutomationStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_decisions_time ON ai_decisions(created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_logs_type_time ON ai_work_logs(work_type, started_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_logs_status ON ai_work_logs(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_messages_time ON ai_work_messages(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_work_messages_work ON ai_work_messages(work_id, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_market_snapshots_time ON market_snapshots(captured_at)")
             conn.commit()
 
@@ -400,6 +421,72 @@ class AutomationStore:
                 ).fetchall()
         return [self._work_log_row_to_dict(row) for row in rows]
 
+    def record_ai_work_message(
+        self,
+        *,
+        work_type: str,
+        trigger: str,
+        status: str,
+        title: str,
+        body: str,
+        work_id: Optional[str] = None,
+        target_date: Optional[str] = None,
+        action_type: Optional[str] = None,
+        level: str = "info",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        message_id = f"aimsg-{uuid.uuid4().hex[:12]}"
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_work_messages (
+                    message_id, work_id, work_type, trigger, target_date, action_type,
+                    status, level, title, body, created_at, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    work_id,
+                    work_type,
+                    trigger,
+                    target_date,
+                    action_type,
+                    status,
+                    level,
+                    title,
+                    body,
+                    _now_iso(),
+                    _json_dumps(details or {}),
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM ai_work_messages WHERE message_id = ?", (message_id,)).fetchone()
+        return self._work_message_row_to_dict(row) if row else {}
+
+    def list_ai_work_messages(self, work_type: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit or 50), 300))
+        with self._lock, self._connect() as conn:
+            if work_type:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM ai_work_messages
+                    WHERE work_type = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (work_type, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM ai_work_messages
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        return [self._work_message_row_to_dict(row) for row in rows]
+
     @staticmethod
     def _run_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         data = dict(row)
@@ -419,4 +506,10 @@ class AutomationStore:
         data["work_items"] = _json_loads(data.pop("work_items_json", None), [])
         data["actions"] = _json_loads(data.pop("actions_json", None), [])
         data["result"] = _json_loads(data.pop("result_json", None), {})
+        return data
+
+    @staticmethod
+    def _work_message_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        data["details"] = _json_loads(data.pop("details_json", None), {})
         return data

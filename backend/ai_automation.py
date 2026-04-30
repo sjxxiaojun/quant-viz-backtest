@@ -12,6 +12,7 @@ from automation_store import AutomationStore
 
 
 ActionHandler = Callable[[Dict[str, Any]], Dict[str, Any]]
+ActionResultCallback = Callable[[Dict[str, Any]], None]
 
 
 ALLOWED_ACTIONS = {
@@ -68,6 +69,7 @@ class AIAutomationService:
         handlers: Dict[str, ActionHandler],
         source: str = "external_ai",
         dry_run: bool = False,
+        on_action_result: Optional[ActionResultCallback] = None,
     ) -> Dict[str, Any]:
         actions = decision.get("actions") if isinstance(decision.get("actions"), list) else []
         actor = str(decision.get("actor") or source or "external_ai")
@@ -79,30 +81,40 @@ class AIAutomationService:
             confidence_value = None
 
         action_results: List[Dict[str, Any]] = []
+
+        def append_result(result: Dict[str, Any]) -> None:
+            action_results.append(result)
+            if on_action_result is None:
+                return
+            try:
+                on_action_result(result)
+            except Exception:
+                pass
+
         for action in actions:
             if not isinstance(action, dict):
-                action_results.append({"status": "rejected", "reason": "action_not_object", "action": action})
+                append_result({"status": "rejected", "reason": "action_not_object", "action": action})
                 continue
             action_type = str(action.get("type") or "").strip()
             params = action.get("params") if isinstance(action.get("params"), dict) else {}
             if not action_type:
-                action_results.append({"status": "rejected", "reason": "missing_type", "action": action})
+                append_result({"status": "rejected", "reason": "missing_type", "action": action})
                 continue
             if action_type in FORBIDDEN_ACTIONS or action_type not in ALLOWED_ACTIONS:
-                action_results.append({"type": action_type, "status": "rejected", "reason": "action_not_allowed"})
+                append_result({"type": action_type, "status": "rejected", "reason": "action_not_allowed"})
                 continue
             if dry_run or bool(decision.get("dry_run")):
-                action_results.append({"type": action_type, "status": "planned", "params": params})
+                append_result({"type": action_type, "status": "planned", "params": params})
                 continue
             handler = handlers.get(action_type)
             if handler is None:
-                action_results.append({"type": action_type, "status": "skipped", "reason": "handler_not_configured"})
+                append_result({"type": action_type, "status": "skipped", "reason": "handler_not_configured"})
                 continue
             try:
                 handler_result = handler(params)
-                action_results.append({"type": action_type, "status": "executed", "result": handler_result})
+                append_result({"type": action_type, "status": "executed", "result": handler_result})
             except Exception as exc:
-                action_results.append({"type": action_type, "status": "failed", "error": str(exc)})
+                append_result({"type": action_type, "status": "failed", "error": str(exc)})
 
         status = self._decision_status(action_results, bool(dry_run or decision.get("dry_run")))
         record = self.store.record_ai_decision(

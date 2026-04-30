@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from automation_store import AutomationStore
-from scheduler_service import LightweightScheduler
+from scheduler_service import AutomationOrchestrator, LightweightScheduler
 
 
 def test_automation_store_records_runs_and_ai_decisions(tmp_path):
@@ -40,6 +40,22 @@ def test_automation_store_records_runs_and_ai_decisions(tmp_path):
 
     assert work_log["summary"] == "完成因子实验巡检。"
     assert store.list_ai_work_logs()[0]["work_items"][0]["action"] == "run_factor_lab"
+
+    message = store.record_ai_work_message(
+        work_id=work_id,
+        work_type="factor_lab_iteration",
+        trigger="unit",
+        target_date="2026-01-02",
+        action_type="run_factor_lab",
+        status="executed",
+        level="info",
+        title="Factor Lab 研究 / 已执行",
+        body="Factor Lab 研究已执行。",
+        details={"action": "run_factor_lab"},
+    )
+
+    assert message["work_id"] == work_id
+    assert store.list_ai_work_messages()[0]["body"] == "Factor Lab 研究已执行。"
 
 
 def test_scheduler_runs_due_trade_day_tasks_once():
@@ -89,3 +105,57 @@ def test_scheduler_runs_due_trade_day_tasks_once():
         ("snapshot", "scheduler"),
         ("ai_work", "premarket_plan", "scheduler"),
     ]
+
+
+def test_ai_managed_work_uses_local_fallback_when_external_ai_fails(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+
+    class FailingAI:
+        def call_external_ai(self, _context):
+            raise RuntimeError("timeout")
+
+    orchestrator = AutomationOrchestrator(
+        store=store,
+        data_manager=object(),
+        data_lake_service=object(),
+        ai_service=FailingAI(),
+        virtual_trade_runner=lambda: {"status": "success"},
+        context_builder=lambda: {"data_freshness": {"target_date": "2026-01-02"}},
+    )
+
+    decision = orchestrator._call_managed_ai_with_fallback(
+        "simulation_supervision",
+        {"preferred_actions": [{"type": "generate_daily_report", "params": {"mode": "unit"}}]},
+        {},
+    )
+
+    assert decision["actor"] == "local_guardrail"
+    assert "外部 AI 调用失败" in decision["summary"]
+    assert decision["actions"][0]["type"] == "generate_daily_report"
+
+
+def test_ai_cycle_uses_local_fallback_when_external_ai_fails(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+
+    class FailingAI:
+        def call_external_ai(self, _context):
+            raise RuntimeError("timeout")
+
+    class FakeDataLake:
+        def default_target_date(self):
+            return "2026-01-02"
+
+    orchestrator = AutomationOrchestrator(
+        store=store,
+        data_manager=object(),
+        data_lake_service=FakeDataLake(),
+        ai_service=FailingAI(),
+        virtual_trade_runner=lambda: {"status": "success"},
+        context_builder=lambda: {"data_freshness": {"target_date": "2026-01-02"}},
+    )
+
+    decision = orchestrator._call_ai_cycle_with_fallback({"data_freshness": {"target_date": "2026-01-02"}})
+
+    assert decision["actor"] == "local_guardrail"
+    assert decision["source"] == "ai_cycle_fallback"
+    assert decision["actions"][0]["params"]["target_date"] == "2026-01-02"
