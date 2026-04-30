@@ -827,13 +827,14 @@ class AutomationOrchestrator:
         page_size: int = 200,
     ) -> List[Dict[str, Any]]:
         request_limit = max(1, min(int(limit or 1), 8000))
-        total_pages = max(1, (request_limit + page_size - 1) // page_size)
         rows: List[Dict[str, Any]] = []
         session = requests.Session()
         session.headers.update(EASTMONEY_HEADERS)
         session.trust_env = False
         try:
-            for page in range(1, total_pages + 1):
+            page = 1
+            inferred_total_pages: Optional[int] = None
+            while len(rows) < request_limit and (inferred_total_pages is None or page <= inferred_total_pages):
                 response = session.get(
                     url,
                     params={
@@ -854,16 +855,24 @@ class AutomationOrchestrator:
                 )
                 response.raise_for_status()
                 payload = response.json()
-                diff = (((payload or {}).get("data") or {}).get("diff")) or []
+                data = (payload or {}).get("data") or {}
+                diff = data.get("diff") or []
                 if not diff:
                     break
+                per_page = max(1, len(diff))
+                total_items = int(data.get("total") or 0)
+                if total_items:
+                    total_pages_by_data = max(1, (total_items + per_page - 1) // per_page)
+                    total_pages_by_limit = max(1, (request_limit + per_page - 1) // per_page)
+                    inferred_total_pages = min(total_pages_by_data, total_pages_by_limit)
                 rows.extend(
                     cls._normalize_eastmoney_row(item, asset_type=asset_type)
                     for item in diff
                     if isinstance(item, dict)
                 )
-                if len(diff) < page_size or len(rows) >= request_limit:
+                if len(rows) >= request_limit or (inferred_total_pages is not None and page >= inferred_total_pages):
                     break
+                page += 1
                 time.sleep(0.12)
         finally:
             session.close()
