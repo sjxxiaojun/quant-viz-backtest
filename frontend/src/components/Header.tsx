@@ -1,10 +1,10 @@
 import React from 'react';
-import { BrainCircuit, LayoutDashboard, Activity, PieChart, GitCompare, BarChart3, Play } from 'lucide-react';
+import { BrainCircuit, LayoutDashboard, Activity, PieChart, GitCompare, BarChart3, Play, Newspaper, Zap } from 'lucide-react';
 import { cn } from '../utils';
 
 interface HeaderProps {
-  view: 'mall' | 'console' | 'dashboard' | 'compare' | 'factorLab' | 'virtualTrade';
-  setView: (v: 'mall' | 'console' | 'dashboard' | 'compare' | 'factorLab' | 'virtualTrade') => void;
+  view: 'mall' | 'console' | 'dashboard' | 'compare' | 'factorLab' | 'virtualTrade' | 'dailyReport' | 'overnight';
+  setView: (v: 'mall' | 'console' | 'dashboard' | 'compare' | 'factorLab' | 'virtualTrade' | 'dailyReport' | 'overnight') => void;
 }
 
 export function Header({ view, setView }: HeaderProps) {
@@ -22,7 +22,7 @@ export function Header({ view, setView }: HeaderProps) {
         <p className="text-slate-500 font-medium ml-13 italic text-xs">集成机器学习与全市场数据的专业量化平台</p>
       </div>
       
-      <nav className="flex gap-2 p-1 rounded-2xl backdrop-blur-xl shadow-2xl" style={{ background: 'rgba(13, 27, 50, 0.6)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.1)' }}>
+      <nav className="flex gap-2 p-1 rounded-2xl backdrop-blur-xl shadow-2xl flex-wrap" style={{ background: 'rgba(13, 27, 50, 0.6)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.1)' }}>
         <button 
           onClick={() => setView('mall')}
           className={cn(
@@ -76,6 +76,24 @@ export function Header({ view, setView }: HeaderProps) {
           )}
         >
           <Play className="w-4 h-4" /> 实盘模拟
+        </button>
+        <button 
+          onClick={() => setView('dailyReport')}
+          className={cn(
+            "px-6 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2",
+            view === 'dailyReport' ? "bg-emerald-600 text-white shadow-lg shadow-emerald-900/20" : "text-slate-400 hover:text-white"
+          )}
+        >
+          <Newspaper className="w-4 h-4" /> 每日晨报
+        </button>
+        <button 
+          onClick={() => setView('overnight')}
+          className={cn(
+            "px-6 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2",
+            view === 'overnight' ? "bg-amber-600 text-white shadow-lg shadow-amber-900/20" : "text-slate-400 hover:text-white"
+          )}
+        >
+          <Zap className="w-4 h-4" /> 隔夜潜伏
         </button>
       </nav>
     </header>

@@ -48,6 +48,8 @@ from factor_lab.strategy import (
     calculate_ml_factor_ranker_signals,
 )
 from strategies.sector_strategy import calculate_power_energy_signals
+from strategies.news_sentiment_strategy import calculate_news_sentiment_signals
+
 
 
 @dataclass(frozen=True)
@@ -399,6 +401,15 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         category="行业轮动",
         signal_type="ranking",
         holding_policy="hold_while_selected",
+    ),
+    "news_sentiment_alpha": StrategySpec(
+        key="news_sentiment_alpha",
+        name="金乌破晓·高息蓝筹跳空主升 (Golden Crow Gap-Up Pro)",
+        func=calculate_news_sentiment_signals,
+        pool="core",
+        category="小G王牌 (Flagship)",
+        signal_type="stateful",
+        holding_policy="sell_on_minus_one",
     ),
 }
 

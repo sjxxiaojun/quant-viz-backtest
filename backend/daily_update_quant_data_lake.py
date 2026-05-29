@@ -150,6 +150,29 @@ def build_a_share_tasks(end_date: str, buffer_days: int, limit: int, dry_run: bo
     if universe_all.empty:
         universe_source = "online"
         universe_all, clean_universe = repair.load_universe()
+
+    # 确保持仓股不会因 ST 或退市等原因被过滤，强制将持仓股加入 clean_universe
+    import sqlite3
+    db_path = BACKEND_DIR / "virtual_trading.db"
+    holding_codes = set()
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT symbol FROM positions")
+            for (sym,) in cursor.fetchall():
+                if sym and len(sym) == 6 and sym.isdigit():
+                    holding_codes.add(sym)
+            conn.close()
+        except Exception as e:
+            pass
+
+    for code in holding_codes:
+        if not clean_universe.empty and code not in clean_universe["code"].values:
+            market = "SH" if code.startswith("6") else "SZ"
+            new_row = pd.DataFrame([{"code": code, "name": code, "market": market}])
+            clean_universe = pd.concat([clean_universe, new_row], ignore_index=True)
+
     if dry_run:
         audit = {
             "moved_counts": {"etf": 0, "st_delisted": 0, "non_universe": 0, "bj": 0},
@@ -163,6 +186,7 @@ def build_a_share_tasks(end_date: str, buffer_days: int, limit: int, dry_run: bo
         audit = repair.audit_and_reorganize(set(universe_all["code"]), set(clean_universe["code"]), end_date)
 
     tasks = []
+    skipped_name_repairs = 0
     for row in clean_universe.itertuples(index=False):
         path = ROOT_DIR / f"{row.code}_full_history.parquet"
         if not path.exists():
@@ -180,16 +204,28 @@ def build_a_share_tasks(end_date: str, buffer_days: int, limit: int, dry_run: bo
         schema_ok = repair.read_schema_columns(path) == a_share_dl.STANDARD_COLUMNS
         meta = repair.read_file_meta(path)
         placeholder_name = not meta["latest_name"] or meta["latest_name"] == row.code
-        if schema_ok and not placeholder_name and meta["max_date"] >= end_date:
+        can_repair_name = universe_source != "local" and placeholder_name
+        if schema_ok and meta["max_date"] >= end_date and not can_repair_name:
+            if placeholder_name:
+                skipped_name_repairs += 1
             continue
+        if not schema_ok:
+            reason = "schema"
+            start_date = START_DATE
+        elif meta["max_date"] < end_date:
+            reason = "stale"
+            start_date = shift_start_date(meta["max_date"], buffer_days)
+        else:
+            reason = "name"
+            start_date = shift_start_date(meta["max_date"], buffer_days)
 
         tasks.append(
             {
                 "code": row.code,
                 "name": row.name,
                 "market": row.market,
-                "start_date": START_DATE if not schema_ok else shift_start_date(meta["max_date"], buffer_days),
-                "reason": "schema" if not schema_ok else ("name" if placeholder_name else "stale"),
+                "start_date": start_date,
+                "reason": reason,
             }
         )
 
@@ -202,6 +238,7 @@ def build_a_share_tasks(end_date: str, buffer_days: int, limit: int, dry_run: bo
         "clean_universe_count": int(len(clean_universe)),
         "excluded_st_from_universe": int(len(universe_all) - len(clean_universe)),
         "audit_moved_counts": audit["moved_counts"],
+        "name_repair_skipped_local_universe": int(skipped_name_repairs),
     }
     return clean_universe, tasks, summary
 
@@ -560,6 +597,19 @@ def run_daily_update(args: argparse.Namespace) -> dict:
     summary_path = DATA_CACHE_DIR / f"daily_update_summary_{timestamp}.json"
     summary["summary_json"] = str(summary_path)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 自动进行合并大文件
+    if not args.dry_run:
+        try:
+            print("Starting automatic lake consolidation...")
+            from scripts.consolidate_lake import consolidate_lake
+            consolidate_lake(lake_dir=str(ROOT_DIR), output_dir=str(ROOT_DIR / "consolidated"))
+            print("Automatic lake consolidation completed successfully.")
+            summary["consolidated"] = "success"
+        except Exception as e:
+            print(f"Failed to perform automatic lake consolidation: {e}")
+            summary["consolidated"] = f"error: {str(e)}"
+
     return summary
 
 

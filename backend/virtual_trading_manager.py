@@ -1226,6 +1226,21 @@ class VirtualTradingManager:
             skipped_pools = {}
             for pool in sorted({spec.pool for _, spec in active_accounts}):
                 pool_symbols, selection_info = self._resolve_strategy_pool_symbols(pool, day, warmup_start)
+                
+                # 确保当前持仓的股票也能加载到数据，避免因 Universe 变化或被剔除导致卖出时报 invalid_price
+                holding_symbols = set()
+                for acc, spec in active_accounts:
+                    if spec.pool == pool:
+                        cursor.execute("SELECT symbol FROM positions WHERE strategy_id = ?", (acc['strategy_id'],))
+                        for (sym,) in cursor.fetchall():
+                            holding_symbols.add(sym)
+                
+                if holding_symbols:
+                    pool_symbols = list(pool_symbols)
+                    for sym in holding_symbols:
+                        if sym not in pool_symbols:
+                            pool_symbols.append(sym)
+
                 if not pool_symbols:
                     logger.warning(f"日期 {day} 策略池 {pool} 未找到可用标的，跳过该池。")
                     skipped_pools[pool] = "未找到可用标的"

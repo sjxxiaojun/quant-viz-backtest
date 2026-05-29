@@ -236,7 +236,11 @@ def test_walk_forward_predictions_cap_retrain_windows(monkeypatch):
 
     monkeypatch.setattr(
         "factor_lab.pipeline._build_model_pipelines",
-        lambda *args, **kwargs: {"baseline": DummyModel(), "nonlinear": DummyModel()},
+        lambda *args, **kwargs: {
+            "baseline": DummyModel(),
+            "nonlinear": DummyModel(),
+            "nonlinear_v2": DummyModel(),
+        },
     )
 
     result = generate_walk_forward_predictions(
@@ -253,4 +257,4 @@ def test_walk_forward_predictions_cap_retrain_windows(monkeypatch):
     assert summary["retrain_windows"] <= 3
     assert summary["max_retrain_windows"] == 3
     assert summary["sampled_walk_forward"] is True
-    assert fit_calls["count"] == summary["retrain_windows"] * 2
+    assert fit_calls["count"] == summary["retrain_windows"] * 3

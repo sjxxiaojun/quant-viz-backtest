@@ -153,7 +153,7 @@ interface AutomationStatus {
   last_virtual_trade?: Record<string, unknown>;
 }
 
-type AutomationJobKind = 'snapshot' | 'eodDryRun' | 'virtualTrade' | 'aiCycle' | 'aiSimulationCare' | 'aiFactorLabCare';
+type AutomationJobKind = 'snapshot' | 'eodUpdate' | 'virtualTrade' | 'aiCycle' | 'aiSimulationCare' | 'aiFactorLabCare';
 type VirtualTradingSection = 'ai' | 'strategies' | 'flow';
 
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -402,7 +402,7 @@ export function VirtualTrading() {
   const runAutomationJob = async (kind: AutomationJobKind) => {
     const labels: Record<AutomationJobKind, string> = {
       snapshot: '盘中快照',
-      eodDryRun: '收盘补数演练',
+      eodUpdate: '收盘补数',
       virtualTrade: '自动模拟盘',
       aiCycle: 'AI cycle',
       aiSimulationCare: 'AI 模拟盘托管',
@@ -414,8 +414,12 @@ export function VirtualTrading() {
       setNotice(null);
       if (kind === 'snapshot') {
         await apiPost('/api/automation/jobs/realtime-snapshot', { limit: 6000 }, { timeout: 60000 });
-      } else if (kind === 'eodDryRun') {
-        await apiPost('/api/automation/jobs/eod-update', { dry_run: true, limit_a_share: 1, limit_etf: 1 }, { timeout: 120000 });
+      } else if (kind === 'eodUpdate') {
+        await apiPost(
+          '/api/automation/jobs/eod-update',
+          { dry_run: false, workers_a_share: 8, workers_etf: 4, retry: 1, task_timeout: 30 },
+          { timeout: 900000 },
+        );
       } else if (kind === 'virtualTrade') {
         await apiPost('/api/automation/jobs/virtual-trade', undefined, { timeout: 120000 });
       } else if (kind === 'aiCycle') {
@@ -496,6 +500,9 @@ export function VirtualTrading() {
   const tickerTrades = history.slice(0, 5);
   const freshness = automationStatus?.data_freshness;
   const latestRun = automationStatus?.recent_runs?.[0];
+  const activeEodUpdate = Boolean(
+    automationStatus?.recent_runs?.some((run) => run.job_type === 'eod_update' && run.status === 'running')
+  );
   const latestProblemRun = findUnresolvedProblemRun(automationStatus?.recent_runs);
   const latestSnapshot = automationStatus?.recent_snapshots?.[0];
   const latestDecision = automationStatus?.ai_decisions?.[0];
@@ -504,7 +511,7 @@ export function VirtualTrading() {
   const nextJob = automationStatus?.scheduler?.next_jobs?.[0];
   const automationActions: Array<{ kind: AutomationJobKind; label: string; Icon: LucideIcon }> = [
     { kind: 'snapshot', label: '抓盘中快照', Icon: Activity },
-    { kind: 'eodDryRun', label: '补数演练', Icon: Shield },
+    { kind: 'eodUpdate', label: '收盘补数', Icon: Shield },
     { kind: 'virtualTrade', label: '追赶模拟盘', Icon: Play },
     { kind: 'aiCycle', label: '运行 AI cycle', Icon: Bot },
     { kind: 'aiSimulationCare', label: 'AI 托管模拟池', Icon: ClipboardList },
@@ -658,23 +665,27 @@ export function VirtualTrading() {
           </div>
 
           <div className="flex flex-wrap gap-3">
-            {automationActions.map(({ kind, label, Icon }) => (
-              <button
-                key={kind}
-                onClick={() => void runAutomationJob(kind)}
-                disabled={automationRunning !== null}
-                className={cn(
-                  "inline-flex items-center gap-2 px-4 py-3 rounded-xl text-xs font-black border transition-all active:scale-95",
-                  automationRunning === kind
-                    ? "bg-cyan-500/20 border-cyan-400/30 text-cyan-100"
-                    : "bg-slate-950/40 border-slate-800 text-slate-300 hover:border-cyan-500/30 hover:text-white",
-                  automationRunning !== null && automationRunning !== kind ? "opacity-40 cursor-not-allowed" : ""
-                )}
-              >
-                <Icon className="w-3.5 h-3.5" />
-                {automationRunning === kind ? '执行中...' : label}
-              </button>
-            ))}
+            {automationActions.map(({ kind, label, Icon }) => {
+              const disabled = automationRunning !== null || (kind === 'eodUpdate' && activeEodUpdate);
+              const buttonLabel = kind === 'eodUpdate' && activeEodUpdate ? '补数运行中' : label;
+              return (
+                <button
+                  key={kind}
+                  onClick={() => void runAutomationJob(kind)}
+                  disabled={disabled}
+                  className={cn(
+                    "inline-flex items-center gap-2 px-4 py-3 rounded-xl text-xs font-black border transition-all active:scale-95",
+                    automationRunning === kind
+                      ? "bg-cyan-500/20 border-cyan-400/30 text-cyan-100"
+                      : "bg-slate-950/40 border-slate-800 text-slate-300 hover:border-cyan-500/30 hover:text-white",
+                    disabled && automationRunning !== kind ? "opacity-40 cursor-not-allowed" : ""
+                  )}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  {automationRunning === kind ? '执行中...' : buttonLabel}
+                </button>
+              );
+            })}
           </div>
         </div>
 
@@ -688,7 +699,9 @@ export function VirtualTrading() {
               目标 {freshness?.target_date || '--'} · {freshness?.status || 'unknown'}
             </p>
             <p className="text-[10px] text-slate-500">
-              A股 {freshness?.a_share?.fresh_count ?? 0}/{freshness?.a_share?.checked_count ?? 0} · ETF {freshness?.etf?.fresh_count ?? 0}/{freshness?.etf?.checked_count ?? 0}
+              抽样 A股 {freshness?.a_share?.fresh_count ?? 0}/{freshness?.a_share?.checked_count ?? 0}
+              （本地 {freshness?.a_share?.total_local ?? 0}） · ETF {freshness?.etf?.fresh_count ?? 0}/{freshness?.etf?.checked_count ?? 0}
+              （本地 {freshness?.etf?.total_local ?? 0}）
             </p>
           </div>
 

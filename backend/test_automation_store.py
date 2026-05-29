@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from automation_store import AutomationStore
 from scheduler_service import AutomationOrchestrator, LightweightScheduler
@@ -67,6 +67,44 @@ def test_automation_store_records_runs_and_ai_decisions(tmp_path):
 
     assert message["work_id"] == work_id
     assert store.list_ai_work_messages()[0]["body"] == "Factor Lab 研究已执行。"
+
+
+def test_store_expires_stale_running_tasks(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+    run_id = store.start_run("eod_update", "unit", "2026-01-02")
+    work_id = store.start_ai_work("factor_lab_iteration", "unit", target_date="2026-01-02", title="AI 因子实验托管")
+    stale_at = (datetime.now() - timedelta(minutes=130)).isoformat(timespec="seconds")
+
+    with store._connect() as conn:
+        conn.execute("UPDATE automation_runs SET started_at = ? WHERE run_id = ?", (stale_at, run_id))
+        conn.execute("UPDATE ai_work_logs SET started_at = ? WHERE work_id = ?", (stale_at, work_id))
+        conn.commit()
+
+    expired_runs = store.expire_stale_runs(max_age_minutes=120)
+    expired_work = store.expire_stale_ai_work_logs(max_age_minutes=120)
+
+    assert expired_runs[0]["run_id"] == run_id
+    assert expired_runs[0]["status"] == "failed"
+    assert expired_runs[0]["summary"]["timeout"] is True
+    assert expired_work[0]["work_id"] == work_id
+    assert expired_work[0]["status"] == "failed"
+    assert expired_work[0]["result"]["timeout"] is True
+
+
+def test_store_uses_job_specific_stale_timeouts(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+    ai_run_id = store.start_run("ai_cycle", "unit", "2026-01-02")
+    eod_run_id = store.start_run("eod_update", "unit", "2026-01-02")
+    stale_at = (datetime.now() - timedelta(minutes=20)).isoformat(timespec="seconds")
+
+    with store._connect() as conn:
+        conn.execute("UPDATE automation_runs SET started_at = ? WHERE run_id IN (?, ?)", (stale_at, ai_run_id, eod_run_id))
+        conn.commit()
+
+    expired = store.expire_stale_runs(max_age_minutes=120, job_timeouts={"ai_cycle": 15, "eod_update": 240})
+
+    assert [run["run_id"] for run in expired] == [ai_run_id]
+    assert store.list_runs(job_type="eod_update")[0]["status"] == "running"
 
 
 def test_scheduler_runs_due_trade_day_tasks_once():
@@ -172,6 +210,115 @@ def test_ai_cycle_uses_local_fallback_when_external_ai_fails(tmp_path):
     assert decision["actions"][0]["params"]["target_date"] == "2026-01-02"
 
 
+def test_eod_update_messages_and_dry_run_state_boundary(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+
+    class FakeDataLake:
+        def default_target_date(self):
+            return "2026-01-02"
+
+        def run_update(self, **kwargs):
+            return {
+                "target_date": kwargs["target_date"],
+                "dry_run": kwargs["dry_run"],
+                "a_share": {"scheduled_updates": 2},
+                "etf": {"scheduled_updates": 1},
+            }
+
+    orchestrator = AutomationOrchestrator(
+        store=store,
+        data_manager=object(),
+        data_lake_service=FakeDataLake(),
+        ai_service=object(),
+        virtual_trade_runner=lambda: {"status": "success"},
+        context_builder=lambda: {},
+    )
+
+    dry_run = orchestrator.run_eod_update(trigger="unit", dry_run=True)
+
+    assert dry_run["status"] == "success"
+    assert store.get_state("last_eod_update") is None
+    messages = store.list_ai_work_messages(work_type="eod_update")
+    assert messages[0]["title"] == "数据湖补数演练完成"
+    assert messages[1]["title"] == "数据湖补数演练开始"
+
+    real_run = orchestrator.run_eod_update(trigger="unit", dry_run=False)
+
+    assert real_run["status"] == "success"
+    assert store.get_state("last_eod_update")["run_id"] == real_run["run_id"]
+    assert store.list_ai_work_messages(work_type="eod_update")[0]["title"] == "数据湖补数完成"
+
+
+def test_eod_update_skips_when_another_update_is_running(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+    active_run_id = store.start_run("eod_update", "unit", "2026-01-02")
+
+    class FakeDataLake:
+        def default_target_date(self):
+            return "2026-01-02"
+
+        def run_update(self, **_kwargs):
+            raise AssertionError("concurrent update should not start")
+
+    orchestrator = AutomationOrchestrator(
+        store=store,
+        data_manager=object(),
+        data_lake_service=FakeDataLake(),
+        ai_service=object(),
+        virtual_trade_runner=lambda: {"status": "success"},
+        context_builder=lambda: {},
+    )
+
+    result = orchestrator.run_eod_update(trigger="unit", dry_run=False)
+
+    assert result["status"] == "skipped"
+    assert result["summary"]["active_run_id"] == active_run_id
+    assert store.list_ai_work_messages(work_type="eod_update")[0]["title"] == "数据湖补数已跳过"
+
+
+def test_eod_progress_message_body_reports_sample_counts():
+    body = AutomationOrchestrator._eod_progress_message_body(
+        {
+            "target_date": "2026-01-02",
+            "score": 42.5,
+            "a_share": {"fresh_count": 20, "checked_count": 50},
+            "etf": {"fresh_count": 5, "checked_count": 20},
+        }
+    )
+
+    assert "2026-01-02 数据湖补数仍在运行" in body
+    assert "A股样本 20/50" in body
+    assert "ETF样本 5/20" in body
+
+
+def test_status_payload_marks_stale_runs_failed_and_messages(tmp_path):
+    store = AutomationStore(tmp_path / "automation.db")
+    run_id = store.start_run("ai_cycle", "unit", "2026-01-02")
+    stale_at = (datetime.now() - timedelta(minutes=130)).isoformat(timespec="seconds")
+    with store._connect() as conn:
+        conn.execute("UPDATE automation_runs SET started_at = ? WHERE run_id = ?", (stale_at, run_id))
+        conn.commit()
+
+    class FakeDataLake:
+        def data_freshness(self, max_scan=300):
+            return {"status": "ready", "score": 100.0, "max_scan": max_scan}
+
+    orchestrator = AutomationOrchestrator(
+        store=store,
+        data_manager=object(),
+        data_lake_service=FakeDataLake(),
+        ai_service=object(),
+        virtual_trade_runner=lambda: {"status": "success"},
+        context_builder=lambda: {},
+    )
+
+    payload = orchestrator.status_payload()
+
+    assert payload["recent_runs"][0]["run_id"] == run_id
+    assert payload["recent_runs"][0]["status"] == "failed"
+    assert store.list_ai_work_messages()[0]["title"] == "自动化任务超时"
+
+
 def test_market_snapshot_falls_back_to_eastmoney_when_akshare_unavailable(tmp_path, monkeypatch):
     store = AutomationStore(tmp_path / "automation.db")
 
@@ -204,4 +351,49 @@ def test_market_snapshot_falls_back_to_eastmoney_when_akshare_unavailable(tmp_pa
     rows, source = orchestrator._fetch_market_snapshot(limit=6000)
 
     assert source == "eastmoney_a+eastmoney_etf"
+    assert [row["代码"] for row in rows] == ["000001", "518880"]
+
+
+def test_market_snapshot_supplements_missing_position_quotes(tmp_path, monkeypatch):
+    store = AutomationStore(tmp_path / "automation.db")
+
+    class FakeDataManager:
+        def get_latest_market_overview(self, limit=10):
+            return []
+
+    orchestrator = AutomationOrchestrator(
+        store=store,
+        data_manager=FakeDataManager(),
+        data_lake_service=object(),
+        ai_service=object(),
+        virtual_trade_runner=lambda: {"status": "success"},
+        context_builder=lambda: {
+            "virtual_trading": {
+                "accounts": [
+                    {"top_holding_details": [{"symbol": "000001"}, {"symbol": "518880"}]},
+                ]
+            }
+        },
+    )
+
+    monkeypatch.setattr(AutomationOrchestrator, "_try_akshare_frame", staticmethod(lambda _name: None))
+    monkeypatch.setattr(
+        AutomationOrchestrator,
+        "_fetch_eastmoney_clist_snapshot",
+        classmethod(lambda cls, **_kwargs: []),
+    )
+    monkeypatch.setattr(
+        AutomationOrchestrator,
+        "_fetch_eastmoney_position_quotes",
+        classmethod(
+            lambda cls, symbols: [
+                {"代码": symbol, "名称": symbol, "最新价": 10.0, "涨跌幅": 0.5, "昨收": 9.9}
+                for symbol in symbols
+            ]
+        ),
+    )
+
+    rows, source = orchestrator._fetch_market_snapshot(limit=6000)
+
+    assert source == "eastmoney_positions"
     assert [row["代码"] for row in rows] == ["000001", "518880"]

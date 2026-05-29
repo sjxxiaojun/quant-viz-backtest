@@ -24,7 +24,7 @@ def verify():
     warmup_start = (start_dt - timedelta(days=120)).strftime("%Y-%m-%d")
     
     print(f"--- Fetching data ({warmup_start} to {end_date}) ---")
-    df = dm.get_stock_pool_data(stocks, warmup_start, end_date)
+    df, _ = dm.get_stock_pool_data(stocks, warmup_start, end_date)
     
     if df.empty:
         print("Error: No data fetched!")
