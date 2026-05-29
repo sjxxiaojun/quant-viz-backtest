@@ -15,6 +15,7 @@ import logging
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -3139,6 +3140,191 @@ def get_vt_stats(strategy_id: str):
         return vt_manager.get_performance_stats(strategy_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Daily Morning Report API Endpoints
+# ============================================================
+
+@app.get("/api/daily-report/latest")
+def get_latest_daily_report():
+    """获取最新晨报（自动修复格式过期的缓存）"""
+    from daily_morning_report import REPORT_DIR, generate_and_save
+    
+    latest_json = REPORT_DIR / "latest.json"
+    if not latest_json.exists():
+        raise HTTPException(status_code=404, detail="暂无晨报数据，请先运行晨报生成")
+    
+    try:
+        with open(latest_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        # 检查报告是否过期（缺少必需字段）
+        needs_regenerate = False
+        recs = data.get("recommendations", [])
+        if recs:
+            first = recs[0]
+            if "current_price" not in first or first.get("current_price") is None:
+                needs_regenerate = True
+            if "stock_name" not in first or not first.get("stock_name"):
+                needs_regenerate = True
+        if data.get("report_date") and data["report_date"] < (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"):
+            needs_regenerate = True
+        
+        if needs_regenerate:
+            logger.info("检测到晨报缓存过期，自动重新生成")
+            result = generate_and_save()
+            data = result.get("report", data)
+        
+        return JSONResponse(content=data, headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取晨报失败: {e}")
+
+
+@app.get("/api/daily-report/{date_str}")
+def get_daily_report_by_date(date_str: str):
+    """获取指定日期晨报"""
+    from daily_morning_report import REPORT_DIR
+    
+    report_path = REPORT_DIR / f"{date_str}.json"
+    if not report_path.exists():
+        raise HTTPException(status_code=404, detail=f"未找到 {date_str} 的晨报")
+    
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取晨报失败: {e}")
+
+
+@app.post("/api/daily-report/generate")
+def generate_daily_report(request: Request):
+    """手动触发晨报生成"""
+    _require_automation_request(request)
+    
+    try:
+        from daily_morning_report import generate_and_save
+        result = generate_and_save()
+        return {
+            "status": "success",
+            "message": "晨报已生成",
+            "paths": result.get("paths", {}),
+            "report_date": result.get("report", {}).get("report_date"),
+            "cleanup": result.get("cleanup", {}),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"晨报生成失败: {e}")
+
+
+# ============================================================
+# Overnight Holding API Endpoints
+# ============================================================
+
+OVERNIGHT_DIR = "/Users/gdxj/.gemini/antigravity/scratch/overnight_holding"
+OVERNIGHT_STATE_FILE = OVERNIGHT_DIR + "/state.json"
+OVERNIGHT_PYTHON = "/Users/gdxj/quant-viz-backtest/backend/venv/bin/python"
+OVERNIGHT_ENGINE = OVERNIGHT_DIR + "/overnight_engine.py"
+
+@app.get("/api/overnight/history")
+def get_overnight_history():
+    """获取隔夜持股的历史状态和参数"""
+    import json
+    import os
+    if not os.path.exists(OVERNIGHT_STATE_FILE):
+        return {"params": {}, "history": {}}
+    try:
+        with open(OVERNIGHT_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取状态失败: {e}")
+
+@app.post("/api/overnight/scan")
+def run_overnight_scan(date: Optional[str] = None):
+    """触发特定日期的隔夜扫描，如果已有数据则直接返回，否则后台实时扫描"""
+    import subprocess
+    import json
+    import os
+    
+    # 1. 检查 state.json 是否已经有这一天的数据
+    if date and os.path.exists(OVERNIGHT_STATE_FILE):
+        try:
+            with open(OVERNIGHT_STATE_FILE, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+            history = state_data.get("history", {})
+            if date in history:
+                return {
+                    "status": "success",
+                    "cached": True,
+                    "date": date,
+                    "data": history[date],
+                    "params": state_data.get("params", {})
+                }
+        except Exception as e:
+            pass
+
+    # 2. 实地运行 Python 脚本进行扫描
+    cmd = [OVERNIGHT_PYTHON, OVERNIGHT_ENGINE]
+    if date:
+        cmd.extend(["--date", date])
+        
+    try:
+        # 执行脚本，最长等待 25 秒
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=25,
+            cwd=OVERNIGHT_DIR
+        )
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"扫描引擎执行出错: {result.stderr}"
+            )
+            
+        # 重新读取最新的 state.json
+        if os.path.exists(OVERNIGHT_STATE_FILE):
+            with open(OVERNIGHT_STATE_FILE, "r", encoding="utf-8") as f:
+                new_state = json.load(f)
+                
+            # 找到目标日期（如果没传 date，那就是今天或最新交易日）
+            target_date = date
+            if not target_date:
+                # 从 stdout 尝试获取启动的日期，例如: "======== 隔夜持股引擎启动 [2026-05-22] ========"
+                import re
+                match = re.search(r"隔夜持股引擎启动\s*\[(.*?)\]", result.stdout)
+                if match:
+                    target_date = match.group(1)
+                else:
+                    # 兜底取 sorted 的最后一项
+                    dates = sorted(list(new_state.get("history", {}).keys()))
+                    if dates:
+                        target_date = dates[-1]
+            
+            history = new_state.get("history", {})
+            if target_date in history:
+                return {
+                    "status": "success",
+                    "cached": False,
+                    "date": target_date,
+                    "data": history[target_date],
+                    "params": new_state.get("params", {}),
+                    "stdout": result.stdout
+                }
+                
+        return {
+            "status": "success",
+            "message": "扫描完成但未能在 state.json 找到对应记录",
+            "stdout": result.stdout
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="扫描超时")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"扫描执行失败: {e}")
 
 
 if __name__ == "__main__":

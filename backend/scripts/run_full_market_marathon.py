@@ -8,7 +8,11 @@ import time
 sys.path.append(str(Path(__file__).parent.parent))
 
 from data_manager import DataManager
-from alpha_factory import AlphaFactory, alpha_momentum_120, alpha_reversal_short, alpha_volume_std_20, alpha_price_volume_corr, alpha_range_pos
+from alpha_factory import (
+    AlphaFactory, alpha_momentum_120, alpha_reversal_short, 
+    alpha_volume_std_20, alpha_price_volume_corr, alpha_range_pos,
+    alpha_trend_macd_diff, alpha_trend_breakout_60, alpha_volatility_adj_mom_20
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MarathonMining")
@@ -24,6 +28,11 @@ def run_full_market_marathon():
     factory.register_factor("vol_std_20", alpha_volume_std_20)
     factory.register_factor("pv_corr_10", alpha_price_volume_corr)
     factory.register_factor("range_pos", alpha_range_pos)
+    
+    # Trend-Following Extensions
+    factory.register_factor("trend_macd", alpha_trend_macd_diff)
+    factory.register_factor("trend_breakout60", alpha_trend_breakout_60)
+    factory.register_factor("trend_vol_adj_mom20", alpha_volatility_adj_mom_20)
     
     # 2. Load Consolidated Data (2022 to 2026)
     logger.info("🚀 Starting Full Market Marathon (2022-2026)...")

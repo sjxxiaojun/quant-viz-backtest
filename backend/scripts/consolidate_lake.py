@@ -8,6 +8,17 @@ import concurrent.futures
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Consolidator")
 
+def read_file(f):
+    try:
+        df = pd.read_parquet(f)
+        # Only keep essential columns for alpha mining to save memory
+        cols = ['date', 'stock_code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
+        available = [c for c in cols if c in df.columns]
+        return df[available]
+    except Exception as e:
+        logger.error(f"Error reading {f.name}: {e}")
+        return None
+
 def consolidate_lake(lake_dir="/Users/gdxj/quant_data_lake", output_dir="/Users/gdxj/quant_data_lake/consolidated"):
     lake_path = Path(lake_dir)
     out_path = Path(output_dir)
@@ -16,26 +27,11 @@ def consolidate_lake(lake_dir="/Users/gdxj/quant_data_lake", output_dir="/Users/
     files = list(lake_path.glob("*_full_history.parquet"))
     logger.info(f"Found {len(files)} files to consolidate.")
     
-    # We will consolidate by Year to keep file sizes manageable
-    # Or just one giant file if memory allows (A-share history is usually ~2-5GB in Parquet)
-    
-    all_data = []
-    
-    def read_file(f):
-        try:
-            df = pd.read_parquet(f)
-            # Only keep essential columns for alpha mining to save memory
-            cols = ['date', 'stock_code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
-            available = [c for c in cols if c in df.columns]
-            return df[available]
-        except Exception as e:
-            logger.error(f"Error reading {f.name}: {e}")
-            return None
-
     start_time = time.time()
     
-    # Concurrent reading
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # Concurrent reading using ProcessPoolExecutor for CPU-bound decompression
+    all_data = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
         results = list(executor.map(read_file, files))
         all_data = [r for r in results if r is not None]
     

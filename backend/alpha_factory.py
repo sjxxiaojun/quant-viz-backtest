@@ -99,3 +99,25 @@ def alpha_price_volume_corr(df):
 def alpha_range_pos(df):
     """Where close sits in the High-Low range of the day"""
     return (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-6)
+
+# --- New Trend-Following Factors (针对科技/强趋势标的优化) ---
+
+def alpha_trend_macd_diff(df):
+    """Normalized MACD-like momentum oscillator (12, 26) - captures medium-term trend acceleration"""
+    def calc_macd(x):
+        ema12 = x.ewm(span=12, adjust=False).mean()
+        ema26 = x.ewm(span=26, adjust=False).mean()
+        return (ema12 - ema26) / ema26
+    return df.groupby('stock_code')['close'].transform(calc_macd)
+
+def alpha_trend_breakout_60(df):
+    """Close position relative to 60-day high (Breakout momentum) - identifies strong upward trends"""
+    return df.groupby('stock_code')['close'].transform(lambda x: x / x.rolling(60).max())
+
+def alpha_volatility_adj_mom_20(df):
+    """Volatility Adjusted Momentum (20 days) - filters out choppy momentum for smoother trends"""
+    def calc_adj_mom(group):
+        mom = group['close'].diff(20)
+        vol = group['close'].diff(1).abs().rolling(20).sum()
+        return mom / (vol + 1e-6)
+    return df.groupby('stock_code', group_keys=False).apply(calc_adj_mom)

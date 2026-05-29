@@ -206,6 +206,15 @@ def _score_with_latest_model(
         return None
 
     features, _ = generate_features(df)
+    try:
+        from .pipeline import _candidate_factor_recipes
+        for name, _, dependencies, builder in _candidate_factor_recipes():
+            if name in feature_columns and name not in features.columns:
+                if set(dependencies).issubset(features.columns):
+                    features[name] = builder(features).replace([np.inf, -np.inf], np.nan)
+    except Exception:
+        pass
+
     missing_features = [column for column in feature_columns if column not in features.columns]
     if missing_features or not feature_columns:
         return None

@@ -40,6 +40,8 @@ FACTOR_NAME_CN = {
     "mom_10d": "10日动量",
     "mom_20d": "20日动量",
     "mom_60d": "60日动量",
+    "mom_120d": "120日动量",
+    "mom_252d": "252日动量",
     "reversal_3d": "3日反转",
     "reversal_5d": "5日反转",
     "ma_gap_5d": "5日均线偏离",
@@ -51,6 +53,7 @@ FACTOR_NAME_CN = {
     "amplitude": "日内振幅",
     "volatility_5d": "5日波动",
     "volatility_20d": "20日波动",
+    "volatility_60d": "60日波动",
     "volume_ratio_5d": "5日量比",
     "volume_ratio_20d": "20日量比",
     "amount_ratio_20d": "20日成交额变化",
@@ -68,6 +71,11 @@ FACTOR_NAME_CN = {
     "relative_strength_20d": "20日相对强弱",
     "market_breadth_20d": "市场广度",
     "market_ret_1d": "市场日收益",
+    "vol_ratio_5d_60d": "波动率期限结构",
+    "corr_ret_vol_20d": "量价相关性",
+    "up_vol_ratio_20d": "涨跌成交量比",
+    "consecutive_up_days": "连涨天数",
+    "intraday_efficiency": "日内趋势效率",
     "risk_adjusted_mom_20d": "波动调整动量",
     "liquidity_momentum_20d": "量价共振动量",
     "reversal_liquidity_5d": "放量反转",
@@ -579,6 +587,22 @@ def _build_model_pipelines(
                 ),
             ]
         ),
+        "nonlinear_v2": Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "model",
+                    RandomForestRegressor(
+                        n_estimators=max(8, int(rf_n_estimators * 1.5)),
+                        max_depth=6,
+                        min_samples_leaf=3,
+                        max_features="sqrt",
+                        random_state=random_state + 1,
+                        n_jobs=rf_n_jobs,
+                    ),
+                ),
+            ]
+        ),
     }
 
 
@@ -595,31 +619,58 @@ def _blend_score(frame: pd.DataFrame, baseline_weight: float, nonlinear_weight: 
     return (baseline * float(baseline_weight) + nonlinear * float(nonlinear_weight)) / total
 
 
+def _blend_score_multi(
+    frame: pd.DataFrame,
+    baseline_weight: float,
+    nonlinear_weight: float,
+    nonlinear_v2_weight: float = 0.0,
+) -> pd.Series:
+    baseline = pd.to_numeric(frame.get("baseline_score"), errors="coerce").fillna(0.5)
+    nonlinear = pd.to_numeric(frame.get("ml_score"), errors="coerce").fillna(0.5)
+    nonlinear_v2 = pd.to_numeric(frame.get("ml_v2_score"), errors="coerce").fillna(0.5)
+    total = max(float(baseline_weight) + float(nonlinear_weight) + float(nonlinear_v2_weight), 1e-9)
+    return (
+        baseline * float(baseline_weight)
+        + nonlinear * float(nonlinear_weight)
+        + nonlinear_v2 * float(nonlinear_v2_weight)
+    ) / total
+
+
 def _optimize_model_blend(scored: pd.DataFrame) -> Dict[str, object]:
     validation = scored[scored["split"] == "valid"].copy() if "split" in scored.columns else scored.iloc[0:0].copy()
     if validation.empty or validation["label_reg"].notna().sum() < 100:
         return {
             "baseline_weight": DEFAULT_BASELINE_WEIGHT,
             "nonlinear_weight": DEFAULT_NONLINEAR_WEIGHT,
+            "nonlinear_v2_weight": 0.0,
             "selection_metric": "fallback_default",
             "selection_split": "valid",
             "reason": "验证集样本不足，沿用默认 35% 线性 + 65% 非线性。",
             "candidates": [],
         }
 
-    candidate_weights = [0.35, 0.45, 0.55, 0.65, 0.75, 0.85]
+    # 三模型融合优化：baseline + nonlinear + nonlinear_v2
+    candidate_weights = []
+    for w1 in [0.25, 0.35, 0.45, 0.55]:
+        for w2 in [0.25, 0.35, 0.45]:
+            w3 = 1.0 - w1 - w2
+            if w3 >= 0.1:
+                candidate_weights.append((w1, w2, w3))
+
     rows = []
     best_row = None
-    for nonlinear_weight in candidate_weights:
-        baseline_weight = 1.0 - nonlinear_weight
+    for baseline_weight, nonlinear_weight, nonlinear_v2_weight in candidate_weights:
         candidate = validation.copy()
-        candidate["candidate_score"] = _blend_score(candidate, baseline_weight, nonlinear_weight)
+        candidate["candidate_score"] = _blend_score_multi(
+            candidate, baseline_weight, nonlinear_weight, nonlinear_v2_weight
+        )
         rank_ic = _rank_ic_by_date(candidate, "candidate_score")
         top20_ret = _top_quantile_return(candidate, "candidate_score")
         objective = rank_ic * 0.75 + top20_ret * 0.25
         row = {
             "baseline_weight": baseline_weight,
             "nonlinear_weight": nonlinear_weight,
+            "nonlinear_v2_weight": nonlinear_v2_weight,
             "valid_rank_ic": rank_ic,
             "valid_top20_ret": top20_ret,
             "objective": objective,
@@ -632,6 +683,7 @@ def _optimize_model_blend(scored: pd.DataFrame) -> Dict[str, object]:
         best_row = {
             "baseline_weight": DEFAULT_BASELINE_WEIGHT,
             "nonlinear_weight": DEFAULT_NONLINEAR_WEIGHT,
+            "nonlinear_v2_weight": 0.0,
             "valid_rank_ic": 0.0,
             "valid_top20_ret": 0.0,
             "objective": 0.0,
@@ -640,12 +692,13 @@ def _optimize_model_blend(scored: pd.DataFrame) -> Dict[str, object]:
     return {
         "baseline_weight": float(best_row["baseline_weight"]),
         "nonlinear_weight": float(best_row["nonlinear_weight"]),
+        "nonlinear_v2_weight": float(best_row["nonlinear_v2_weight"]),
         "selection_metric": "0.75*valid_rank_ic + 0.25*valid_top20_ret",
         "selection_split": "valid",
         "valid_rank_ic": float(best_row["valid_rank_ic"]),
         "valid_top20_ret": float(best_row["valid_top20_ret"]),
         "objective": float(best_row["objective"]),
-        "reason": "每次运行都会在验证集重选线性模型和非线性模型的融合比例。",
+        "reason": "每次运行都会在验证集重选三模型（Ridge + RF + RF_v2）的融合比例。",
         "candidates": rows,
     }
 
@@ -680,29 +733,37 @@ def train_models(
     )
     baseline = pipelines["baseline"]
     nonlinear = pipelines["nonlinear"]
+    nonlinear_v2 = pipelines["nonlinear_v2"]
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         baseline.fit(x_train, y_train)
     nonlinear.fit(x_train, y_train)
+    nonlinear_v2.fit(x_train, y_train)
 
     scored = sample.copy()
     x_all = scored[fit_feature_columns].replace([np.inf, -np.inf], np.nan)
     scored["baseline_pred"] = _safe_predict(baseline, x_all)
     scored["nonlinear_pred"] = _safe_predict(nonlinear, x_all)
+    scored["nonlinear_v2_pred"] = _safe_predict(nonlinear_v2, x_all)
     scored["baseline_pred"] = pd.Series(scored["baseline_pred"], index=scored.index).replace([np.inf, -np.inf], np.nan)
+    scored["nonlinear_pred"] = pd.Series(scored["nonlinear_pred"], index=scored.index).replace([np.inf, -np.inf], np.nan)
+    scored["nonlinear_v2_pred"] = pd.Series(scored["nonlinear_v2_pred"], index=scored.index).replace([np.inf, -np.inf], np.nan)
     scored["baseline_score"] = scored.groupby("date")["baseline_pred"].rank(pct=True)
     scored["ml_score"] = scored.groupby("date")["nonlinear_pred"].rank(pct=True)
+    scored["ml_v2_score"] = scored.groupby("date")["nonlinear_v2_pred"].rank(pct=True)
     model_recipe = _optimize_model_blend(scored)
-    scored["composite_score"] = _blend_score(
+    scored["composite_score"] = _blend_score_multi(
         scored,
         float(model_recipe["baseline_weight"]),
         float(model_recipe["nonlinear_weight"]),
+        float(model_recipe.get("nonlinear_v2_weight", 0.0)),
     )
 
     metrics = [
         _model_metrics(scored, "baseline_score", "baseline_pred", "ridge_baseline"),
         _model_metrics(scored, "ml_score", "nonlinear_pred", "random_forest"),
+        _model_metrics(scored, "ml_v2_score", "nonlinear_v2_pred", "random_forest_v2"),
         _model_metrics(scored, "composite_score", "nonlinear_pred", "composite_score"),
     ]
 
@@ -714,6 +775,14 @@ def train_models(
             "model": "random_forest",
         }
     )
+    rf_v2_model = nonlinear_v2.named_steps["model"]
+    rf_v2_importance = pd.DataFrame(
+        {
+            "feature": fit_feature_columns,
+            "importance": rf_v2_model.feature_importances_,
+            "model": "random_forest_v2",
+        }
+    )
     ridge = baseline.named_steps["model"]
     ridge_importance = pd.DataFrame(
         {
@@ -722,7 +791,7 @@ def train_models(
             "model": "ridge_abs_coef",
         }
     )
-    feature_importance = pd.concat([rf_importance, ridge_importance], ignore_index=True)
+    feature_importance = pd.concat([rf_importance, rf_v2_importance, ridge_importance], ignore_index=True)
     feature_importance["importance"] = feature_importance.groupby("model")["importance"].transform(
         lambda s: s / (s.sum() + 1e-12)
     )
@@ -731,6 +800,7 @@ def train_models(
     return {
         "baseline_model": baseline,
         "nonlinear_model": nonlinear,
+        "nonlinear_v2_model": nonlinear_v2,
         "scored": scored,
         "metrics": pd.DataFrame(metrics),
         "feature_importance": feature_importance,
@@ -750,10 +820,12 @@ def generate_walk_forward_predictions(
     rf_n_jobs: int = -1,
     baseline_weight: float = DEFAULT_BASELINE_WEIGHT,
     nonlinear_weight: float = DEFAULT_NONLINEAR_WEIGHT,
+    nonlinear_v2_weight: float = 0.0,
 ) -> Dict[str, object]:
     scored = scored_base.copy()
     scored["walk_forward_baseline_pred"] = np.nan
     scored["walk_forward_pred"] = np.nan
+    scored["walk_forward_v2_pred"] = np.nan
     unique_dates = sorted(scored["date"].dropna().unique().tolist())
     if len(unique_dates) < 90:
         return {
@@ -765,6 +837,7 @@ def generate_walk_forward_predictions(
                 "score_source": "composite_score",
                 "baseline_weight": float(baseline_weight),
                 "nonlinear_weight": float(nonlinear_weight),
+                "nonlinear_v2_weight": float(nonlinear_v2_weight),
             },
         }
 
@@ -813,25 +886,31 @@ def generate_walk_forward_predictions(
             warnings.simplefilter("ignore", RuntimeWarning)
             pipelines["baseline"].fit(x_train, y_train)
         pipelines["nonlinear"].fit(x_train, y_train)
+        pipelines["nonlinear_v2"].fit(x_train, y_train)
 
         x_infer = infer_chunk[chunk_feature_columns].replace([np.inf, -np.inf], np.nan)
         baseline_pred = _safe_predict(pipelines["baseline"], x_infer)
         nonlinear_pred = _safe_predict(pipelines["nonlinear"], x_infer)
+        nonlinear_v2_pred = _safe_predict(pipelines["nonlinear_v2"], x_infer)
         scored.loc[infer_chunk.index, "walk_forward_baseline_pred"] = baseline_pred
         scored.loc[infer_chunk.index, "walk_forward_pred"] = nonlinear_pred
+        scored.loc[infer_chunk.index, "walk_forward_v2_pred"] = nonlinear_v2_pred
         retrain_windows += 1
         predicted_dates.extend(infer_dates)
 
     scored["walk_forward_baseline_pred"] = scored["walk_forward_baseline_pred"].replace([np.inf, -np.inf], np.nan)
     scored["walk_forward_pred"] = scored["walk_forward_pred"].replace([np.inf, -np.inf], np.nan)
+    scored["walk_forward_v2_pred"] = scored["walk_forward_v2_pred"].replace([np.inf, -np.inf], np.nan)
     scored["walk_forward_baseline_score"] = scored.groupby("date")["walk_forward_baseline_pred"].rank(pct=True)
     scored["walk_forward_score"] = scored.groupby("date")["walk_forward_pred"].rank(pct=True)
+    scored["walk_forward_v2_score"] = scored.groupby("date")["walk_forward_v2_pred"].rank(pct=True)
     oos_mask = scored["walk_forward_pred"].notna() | scored["walk_forward_baseline_pred"].notna()
     scored["walk_forward_composite_score"] = np.nan
-    total_weight = max(float(baseline_weight) + float(nonlinear_weight), 1e-9)
+    total_weight = max(float(baseline_weight) + float(nonlinear_weight) + float(nonlinear_v2_weight), 1e-9)
     scored.loc[oos_mask, "walk_forward_composite_score"] = (
         scored.loc[oos_mask, "walk_forward_baseline_score"].fillna(0.5) * float(baseline_weight)
         + scored.loc[oos_mask, "walk_forward_score"].fillna(0.5) * float(nonlinear_weight)
+        + scored.loc[oos_mask, "walk_forward_v2_score"].fillna(0.5) * float(nonlinear_v2_weight)
     ) / total_weight
 
     metrics_rows = []
@@ -842,6 +921,10 @@ def generate_walk_forward_predictions(
     if scored["walk_forward_pred"].notna().sum() > 0:
         metrics_rows.append(
             _model_metrics(scored, "walk_forward_score", "walk_forward_pred", "walk_forward_random_forest")
+        )
+    if scored["walk_forward_v2_pred"].notna().sum() > 0:
+        metrics_rows.append(
+            _model_metrics(scored, "walk_forward_v2_score", "walk_forward_v2_pred", "walk_forward_random_forest_v2")
         )
         metrics_rows.append(
             _model_metrics(scored, "walk_forward_composite_score", "walk_forward_pred", "walk_forward_composite")
@@ -862,6 +945,7 @@ def generate_walk_forward_predictions(
         "rf_n_estimators": int(rf_n_estimators),
         "baseline_weight": float(baseline_weight),
         "nonlinear_weight": float(nonlinear_weight),
+        "nonlinear_v2_weight": float(nonlinear_v2_weight),
         "sampled_walk_forward": bool(step_size > base_step_size or (max_windows and retrain_windows >= max_windows)),
         "coverage_ratio": coverage,
         "oos_enforced": bool(predicted_dates),
@@ -883,13 +967,17 @@ def _signals_from_scores(scored: pd.DataFrame, top_n: int, score_col: str = "com
         "split",
         "baseline_pred",
         "nonlinear_pred",
+        "nonlinear_v2_pred",
         "baseline_score",
         "ml_score",
+        "ml_v2_score",
         "composite_score",
         "walk_forward_baseline_pred",
         "walk_forward_pred",
+        "walk_forward_v2_pred",
         "walk_forward_baseline_score",
         "walk_forward_score",
+        "walk_forward_v2_score",
         "walk_forward_composite_score",
         "label_end_date",
         "label_horizon",

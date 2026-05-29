@@ -85,60 +85,52 @@ class MultiFactorStrategy:
                 g[f'f_{factor.name}'] = factor.func(g)
             return g
         
-        # In pandas 2.x, include_groups=False removes the grouping column from the chunk.
-        # We need it later, so we fallback or ensure it's there.
         try:
-            # We don't use include_groups=False here because we need 'date' for the next step
             df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
         except Exception:
             df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
         
-        # 2. Cross-sectional Z-Score standardization
+        # 2. Cross-sectional Z-Score standardization (Vectorized)
         factor_names = [f"f_{factor.name}" for factor in self.factors]
         for f in factor_names:
-            df[f'{f}_z'] = df.groupby('date')[f].transform(
-                lambda x: (x - x.mean()) / (x.std() + 1e-9)
-            )
+            mean_f = df.groupby('date')[f].transform('mean')
+            std_f = df.groupby('date')[f].transform('std')
+            df[f'{f}_z'] = (df[f] - mean_f) / (std_f + 1e-9)
             
         # 3. Weighted scoring
         df['score'] = 0.0
         for factor in self.factors:
             df['score'] += df[f'f_{factor.name}_z'] * factor.weight
             
-        # 4. Generate ranking signals
-        def _apply_ranking(day_g: pd.DataFrame) -> pd.DataFrame:
-            day_g = day_g.copy()
-            day_g['signal'] = 0
+        # 4. Generate ranking signals (Vectorized)
+        df['signal'] = 0
+        
+        if self.liquidity_filter_pct is not None:
+            vol_thresholds = df.groupby('date')['volume'].transform('quantile', self.liquidity_filter_pct)
+            in_pool = df['volume'] >= vol_thresholds
+        else:
+            in_pool = pd.Series(True, index=df.index)
             
-            if len(day_g) < self.top_n:
-                return day_g
-                
-            # Optional liquidity filter
-            if self.liquidity_filter_pct is not None:
-                vol_threshold = day_g['volume'].quantile(self.liquidity_filter_pct)
-                pool = day_g[day_g['volume'] >= vol_threshold]
-            else:
-                pool = day_g
-                
-            if len(pool) < self.top_n:
-                return day_g
-
-            # Buy signals
-            top_stocks = pool.nlargest(self.top_n, 'score')
+        pool_df = df[in_pool].copy()
+        if not pool_df.empty:
+            pool_counts = pool_df.groupby('date')['stock_code'].transform('count')
+            
+            # Since rank(method='first') returns stable ordering, we compute ranking
+            rank_desc = pool_df.groupby('date')['score'].rank(ascending=False, method='first')
+            rank_asc = pool_df.groupby('date')['score'].rank(ascending=True, method='first')
+            
+            buy_cond = (rank_desc <= self.top_n) & (pool_counts >= self.top_n)
             if self.score_threshold is not None:
-                top_stocks = top_stocks[top_stocks['score'] >= self.score_threshold]
-            day_g.loc[top_stocks.index, 'signal'] = 1
+                buy_cond = buy_cond & (pool_df['score'] >= self.score_threshold)
+                
+            sell_cond = (rank_asc <= self.top_n) & (pool_counts >= self.top_n)
             
-            # Sell signals
-            bottom_stocks = pool.nsmallest(self.top_n, 'score')
-            day_g.loc[bottom_stocks.index, 'signal'] = -1
+            pool_df.loc[buy_cond, 'signal'] = 1
+            pool_df.loc[sell_cond, 'signal'] = -1
             
-            return day_g
+            df.loc[in_pool, 'signal'] = pool_df['signal']
             
-        try:
-            return df.groupby('date', group_keys=False).apply(_apply_ranking)
-        except Exception:
-            return df.groupby('date', group_keys=False).apply(_apply_ranking)
+        return df
 
 class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
     """
@@ -154,16 +146,16 @@ class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
         if df.empty: return df
         df = df.sort_values(['stock_code', 'date']).copy()
         
-        # 1. Market Regime Detection
+        # 1. Market Regime Detection (Vectorized & Bug Fixed)
         mkt_ret = df.groupby('date')['pct_chg'].mean()
         mkt_trend = mkt_ret.rolling(20).sum()
-        # Use transform to keep size same as df
-        mkt_vol = df.groupby('date')['pct_chg'].transform(lambda x: x.abs().mean())
-        mkt_vol_ma = mkt_vol.rolling(60).mean()
         
-        # Map back to date index for mkt_trend
+        # Correctly calculate daily volatility of the market without mixing stock data
+        mkt_vol_daily = df['pct_chg'].abs().groupby(df['date']).mean()
+        mkt_vol_ma_daily = mkt_vol_daily.rolling(60).mean()
+        
         regime_series = pd.Series(0, index=mkt_ret.index)
-        regime_series[mkt_vol.groupby(df['date']).first() > mkt_vol_ma.groupby(df['date']).first()] = 1
+        regime_series[mkt_vol_daily > mkt_vol_ma_daily] = 1
         regime_series[mkt_trend < -0.05] = 2
         
         regime_df = pd.DataFrame({'date': mkt_ret.index, 'regime': regime_series.values})
@@ -186,10 +178,12 @@ class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
             
         df = df.groupby('stock_code', group_keys=False).apply(_calc_base)
         
-        # 3. Z-Score
+        # 3. Z-Score (Vectorized)
         factors = ['f_lowvol', 'f_value', 'f_momentum', 'f_quality', 'f_rev1', 'f_vol_stab']
         for f in factors:
-            df[f'{f}_z'] = df.groupby('date')[f].transform(lambda x: (x - x.mean()) / (x.std() + 1e-9))
+            mean_f = df.groupby('date')[f].transform('mean')
+            std_f = df.groupby('date')[f].transform('std')
+            df[f'{f}_z'] = (df[f] - mean_f) / (std_f + 1e-9)
             
         # 4. Dynamic Weights
         df['score'] = 0.0
@@ -216,12 +210,19 @@ class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
         return self._generate_signals(df)
 
     def _generate_signals(self, df):
-        def _apply_ranking(day_g):
-            day_g = day_g.copy()
-            day_g['signal'] = 0
-            if len(day_g) < self.top_n: return day_g
-            top_idx = day_g.nlargest(self.top_n, 'score').index
-            day_g.loc[top_idx, 'signal'] = 1
-            day_g.loc[day_g.nsmallest(self.top_n, 'score').index, 'signal'] = -1
-            return day_g
-        return df.groupby('date', group_keys=False).apply(_apply_ranking)
+        df = df.copy()
+        df['signal'] = 0
+        if df.empty:
+            return df
+            
+        day_counts = df.groupby('date')['stock_code'].transform('count')
+        
+        rank_desc = df.groupby('date')['score'].rank(ascending=False, method='first')
+        rank_asc = df.groupby('date')['score'].rank(ascending=True, method='first')
+        
+        buy_cond = (rank_desc <= self.top_n) & (day_counts >= self.top_n)
+        sell_cond = (rank_asc <= self.top_n) & (day_counts >= self.top_n)
+        
+        df.loc[buy_cond, 'signal'] = 1
+        df.loc[sell_cond, 'signal'] = -1
+        return df

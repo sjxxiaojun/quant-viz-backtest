@@ -103,7 +103,7 @@ class DataLakeUpdateService:
 
     def _asset_freshness(self, asset_type: str, target_date: str, max_scan: int) -> Dict[str, object]:
         symbols = self.data_manager.list_local_codes(asset_type)
-        checked = symbols[:max_scan]
+        checked = self._sample_symbols(symbols, max_scan)
         fresh = 0
         stale = []
         missing = 0
@@ -142,3 +142,13 @@ class DataLakeUpdateService:
             "latest_date_seen": latest_date,
             "stale_examples": stale[:10],
         }
+
+    @staticmethod
+    def _sample_symbols(symbols, max_scan: int):
+        if len(symbols) <= max_scan:
+            return list(symbols)
+        if max_scan <= 1:
+            return [symbols[0]]
+        last_index = len(symbols) - 1
+        indices = [round(i * last_index / (max_scan - 1)) for i in range(max_scan)]
+        return [symbols[index] for index in indices]

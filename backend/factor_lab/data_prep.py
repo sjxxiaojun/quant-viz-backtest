@@ -30,6 +30,8 @@ PRICE_FEATURES = [
     "mom_10d",
     "mom_20d",
     "mom_60d",
+    "mom_120d",
+    "mom_252d",
     "reversal_3d",
     "reversal_5d",
     "ma_gap_5d",
@@ -39,16 +41,22 @@ PRICE_FEATURES = [
     "intraday_ret",
     "open_gap",
     "amplitude",
+    "consecutive_up_days",
+    "intraday_efficiency",
 ]
 
 VOL_FEATURES = [
     "volatility_5d",
     "volatility_20d",
+    "volatility_60d",
     "volume_ratio_5d",
     "volume_ratio_20d",
     "amount_ratio_20d",
     "turnover_rate",
     "turnover_z20",
+    "vol_ratio_5d_60d",
+    "corr_ret_vol_20d",
+    "up_vol_ratio_20d",
 ]
 
 VALUE_FEATURES = [
@@ -213,12 +221,13 @@ def generate_features(standardized_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict
         close = group["close"]
         ret = close.pct_change()
         group["ret_1d"] = ret
-        for window in [3, 5, 10, 20, 60]:
+        for window in [3, 5, 10, 20, 60, 120, 252]:
             group["mom_%dd" % window] = close / close.shift(window) - 1.0
         group["reversal_3d"] = -group["mom_3d"]
         group["reversal_5d"] = -group["mom_5d"]
         group["volatility_5d"] = ret.rolling(5, min_periods=3).std() * np.sqrt(252)
         group["volatility_20d"] = ret.rolling(20, min_periods=8).std() * np.sqrt(252)
+        group["volatility_60d"] = ret.rolling(60, min_periods=20).std() * np.sqrt(252)
         group["volume_ratio_5d"] = _safe_divide(group["volume"], group["volume"].rolling(5, min_periods=3).mean())
         group["volume_ratio_20d"] = _safe_divide(group["volume"], group["volume"].rolling(20, min_periods=8).mean())
         group["amount_ratio_20d"] = _safe_divide(group["amount"], group["amount"].rolling(20, min_periods=8).mean())
@@ -231,6 +240,30 @@ def generate_features(standardized_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict
         turnover_mean = group["turnover_rate"].rolling(20, min_periods=8).mean()
         turnover_std = group["turnover_rate"].rolling(20, min_periods=8).std()
         group["turnover_z20"] = _safe_divide(group["turnover_rate"] - turnover_mean, turnover_std)
+
+        # 新增特征：波动率期限结构
+        group["vol_ratio_5d_60d"] = _safe_divide(group["volatility_5d"], group["volatility_60d"])
+
+        # 新增特征：量价相关性（20日滚动）
+        group["corr_ret_vol_20d"] = ret.rolling(20, min_periods=10).corr(group["volume"])
+
+        # 新增特征：上涨日成交量/下跌日成交量比值
+        up_vol = group["volume"].where(ret > 0)
+        down_vol = group["volume"].where(ret < 0)
+        up_vol_mean = up_vol.rolling(20, min_periods=8).mean()
+        down_vol_mean = down_vol.rolling(20, min_periods=8).mean()
+        group["up_vol_ratio_20d"] = _safe_divide(up_vol_mean, down_vol_mean)
+
+        # 新增特征：连涨天数
+        up_mask = (ret > 0).astype(int)
+        group["consecutive_up_days"] = up_mask.groupby((up_mask == 0).cumsum()).cumsum()
+
+        # 新增特征：日内趋势效率 |close-open| / (high-low)
+        group["intraday_efficiency"] = _safe_divide(
+            (group["close"] - group["open"]).abs(),
+            group["high"] - group["low"]
+        )
+
         return group
 
     df = _apply_by_stock(df, _features)
@@ -261,12 +294,13 @@ def generate_features(standardized_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict
     df["market_ret_1d"] = df.groupby("date")["ret_1d"].transform("mean")
 
     groups = {
-        "price_momentum": ["mom_3d", "mom_5d", "mom_10d", "mom_20d", "mom_60d", "ma_gap_20d"],
+        "price_momentum": ["mom_3d", "mom_5d", "mom_10d", "mom_20d", "mom_60d", "mom_120d", "mom_252d", "ma_gap_20d"],
         "reversal": ["reversal_3d", "reversal_5d", "drawdown_20d"],
-        "volatility": ["volatility_5d", "volatility_20d", "amplitude"],
-        "volume_turnover": ["volume_ratio_5d", "volume_ratio_20d", "amount_ratio_20d", "turnover_rate", "turnover_z20"],
+        "volatility": ["volatility_5d", "volatility_20d", "volatility_60d", "amplitude", "vol_ratio_5d_60d"],
+        "volume_turnover": ["volume_ratio_5d", "volume_ratio_20d", "amount_ratio_20d", "turnover_rate", "turnover_z20", "corr_ret_vol_20d", "up_vol_ratio_20d"],
         "valuation": VALUE_FEATURES,
         "cross_section": CROSS_SECTION_FEATURES,
+        "pattern": ["consecutive_up_days", "intraday_efficiency"],
     }
     return df, groups
 

@@ -155,7 +155,9 @@ class DataManager:
         self._trading_calendar_cache = {}
         self._frame_cache_lock = threading.Lock()
         self._cache_write_locks = {}
-        self._frame_cache_max_entries = 64
+        self._cache_write_locks_lock = threading.Lock()
+        self._frame_cache_max_entries = 1024
+        self.api_url = os.environ.get("DATA_LAKE_API_URL")
         # Explicitly disable proxy for this process to avoid AKShare ProxyError
         os.environ['no_proxy'] = '*'
         os.environ['http_proxy'] = ''
@@ -367,7 +369,41 @@ class DataManager:
         normalized = normalized[base_columns + extra_columns]
         return normalized
 
+    def _read_remote_cached_frame(self, symbol):
+        import urllib.request
+        import json
+        import io
+        url = f"{self.api_url}/api/v1/market/history?symbol={symbol}"
+        cache_key = f"remote_api_{symbol}"
+        try:
+            with self._frame_cache_lock:
+                cached = self._frame_cache.get(cache_key)
+                if cached is not None and time.monotonic() - cached[0] < 300:
+                    return cached[1].copy()
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                if response.status != 200:
+                    return pd.DataFrame()
+                data = response.read()
+                frame = pd.read_parquet(io.BytesIO(data))
+                frame = self._normalize_market_frame(symbol, frame)
+                
+            with self._frame_cache_lock:
+                if len(self._frame_cache) >= self._frame_cache_max_entries:
+                    oldest_key = next(iter(self._frame_cache))
+                    self._frame_cache.pop(oldest_key, None)
+                self._frame_cache[cache_key] = (time.monotonic(), frame)
+                start = str(frame["date"].min()) if not frame.empty and "date" in frame.columns else None
+                end = str(frame["date"].max()) if not frame.empty and "date" in frame.columns else None
+                self._cache_window_cache[cache_key] = (time.monotonic(), start, end)
+            return frame.copy()
+        except Exception as e:
+            logger.warning(f"[{symbol}] Remote cache read failed: {e}")
+            return pd.DataFrame()
+
     def _read_cached_frame(self, symbol):
+        if self.api_url:
+            return self._read_remote_cached_frame(symbol)
         cache_path = self.get_cache_path(symbol)
         if not cache_path.exists():
             return pd.DataFrame()
@@ -406,6 +442,29 @@ class DataManager:
 
     def get_cached_window(self, symbol):
         symbol = self._normalize_symbol(symbol)
+        if getattr(self, "api_url", None):
+            cache_key = f"remote_api_{symbol}"
+            with self._frame_cache_lock:
+                cached_window = self._cache_window_cache.get(cache_key)
+                if cached_window is not None and time.monotonic() - cached_window[0] < 300:
+                    return cached_window[1], cached_window[2]
+            
+            import urllib.request
+            import json
+            url = f"{self.api_url}/api/v1/market/window?symbol={symbol}"
+            try:
+                req = urllib.request.Request(url)
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if response.status == 200:
+                        data = json.loads(response.read().decode('utf-8'))
+                        start, end = data.get("start"), data.get("end")
+                        with self._frame_cache_lock:
+                            self._cache_window_cache[cache_key] = (time.monotonic(), start, end)
+                        return start, end
+            except Exception as e:
+                logger.debug(f"[{symbol}] Remote window read failed: {e}")
+            return None, None
+
         cache_path = self.get_cache_path(symbol)
         if not cache_path.exists():
             return None, None
@@ -681,6 +740,9 @@ class DataManager:
         end_date: str,
         allow_late_start: bool = False,
     ) -> Tuple[pd.DataFrame, Dict[str, str], List[str]]:
+        if getattr(self, "api_url", None):
+            return pd.DataFrame(), {}, list(symbols)
+            
         start_year = int(start_date[:4])
         end_year = int(end_date[:4])
         frames = []
@@ -737,8 +799,16 @@ class DataManager:
         merged = pd.concat([cached_df, fetched_df], ignore_index=True, sort=False)
         merged = self._normalize_market_frame(symbol, merged)
         if not merged.empty:
+            if getattr(self, "api_url", None):
+                cache_key = f"remote_api_{symbol}"
+                with self._frame_cache_lock:
+                    self._frame_cache[cache_key] = (time.monotonic(), merged)
+                    self._cache_window_cache.pop(cache_key, None)
+                return merged
+
             cache_path = self.get_cache_path(symbol)
-            lock = self._cache_write_locks.setdefault(str(cache_path), threading.Lock())
+            with self._cache_write_locks_lock:
+                lock = self._cache_write_locks.setdefault(str(cache_path), threading.Lock())
             with lock:
                 tmp_path = cache_path.with_name(f".{cache_path.name}.tmp")
                 merged.to_parquet(tmp_path, index=False)
@@ -1339,7 +1409,7 @@ class DataManager:
         
         return self._normalize_market_frame(symbol, df.drop(columns=['dt']))
 
-    def get_stock_data(self, symbol, start_date, end_date, auto_login=True, allow_mock=True, allow_late_start: bool = False):
+    def get_stock_data(self, symbol, start_date, end_date, auto_login=True, allow_mock=False, allow_late_start: bool = False):
         """
         Fetch historical daily K-line with multiple fallbacks.
         Returns: (df, data_source)
@@ -1388,7 +1458,7 @@ class DataManager:
         logger.error(f"[{symbol}] Data fetching failed from all sources. Generating MOCK data.")
         return self._generate_mock_data(symbol, start_date, end_date), "MOCK"
 
-    def get_stock_pool_data(self, symbols, start_date, end_date, allow_mock=True, allow_late_start: bool = False):
+    def get_stock_pool_data(self, symbols, start_date, end_date, allow_mock=False, allow_late_start: bool = False):
         """
         Fetch historical data for a list of stocks concurrently.
         Optimized Path: Use consolidated yearly files if requesting many symbols.

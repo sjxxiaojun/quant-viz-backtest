@@ -15,10 +15,12 @@ const Dashboard = lazy(() => import('./components/Dashboard').then((mod) => ({ d
 const StrategyCompare = lazy(() => import('./components/StrategyCompare').then((mod) => ({ default: mod.StrategyCompare })));
 const FactorLab = lazy(() => import('./components/FactorLab').then((mod) => ({ default: mod.FactorLab })));
 const VirtualTrading = lazy(() => import('./components/VirtualTrading').then((mod) => ({ default: mod.VirtualTrading })));
+const DailyReport = lazy(() => import('./components/DailyReport').then((mod) => ({ default: mod.DailyReport })));
+const OvernightConsole = lazy(() => import('./components/OvernightConsole').then((mod) => ({ default: mod.OvernightConsole })));
 
 const DEFAULT_START_DATE = "2022-01-01";
 const DEFAULT_END_DATE = new Date().toISOString().slice(0, 10);
-type AppView = 'mall' | 'console' | 'dashboard' | 'compare' | 'factorLab' | 'virtualTrade';
+type AppView = 'mall' | 'console' | 'dashboard' | 'compare' | 'factorLab' | 'virtualTrade' | 'dailyReport' | 'overnight';
 
 function ViewFallback() {
   return (
@@ -108,6 +110,14 @@ export default function App() {
 
           {view === 'virtualTrade' && (
             <VirtualTrading />
+          )}
+
+          {view === 'dailyReport' && (
+            <DailyReport />
+          )}
+
+          {view === 'overnight' && (
+            <OvernightConsole />
           )}
         </Suspense>
       </div>

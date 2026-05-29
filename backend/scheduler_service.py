@@ -10,10 +10,12 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 import requests
 
+import subprocess
 from ai_automation import AIAutomationService
 from automation_store import AutomationStore
 from data_lake_update_service import DataLakeUpdateService
 from data_manager import DataManager
+from data_sentinel import DataSentinel
 
 
 logger = logging.getLogger("AutomationScheduler")
@@ -21,6 +23,13 @@ logger = logging.getLogger("AutomationScheduler")
 
 VirtualTradeRunner = Callable[[], Dict[str, Any]]
 ContextBuilder = Callable[[], Dict[str, Any]]
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 EASTMONEY_HEADERS = {
     "User-Agent": (
@@ -34,9 +43,11 @@ EASTMONEY_HEADERS = {
 }
 EASTMONEY_A_SHARE_URL = "https://82.push2delay.eastmoney.com/api/qt/clist/get"
 EASTMONEY_ETF_URL = "https://88.push2delay.eastmoney.com/api/qt/clist/get"
+EASTMONEY_STOCK_GET_URL = "https://push2delay.eastmoney.com/api/qt/stock/get"
 EASTMONEY_A_SHARE_FS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
 EASTMONEY_ETF_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827"
 EASTMONEY_FIELDS = "f12,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18"
+EASTMONEY_QUOTE_FIELDS = "f43,f57,f58,f46,f44,f45,f60,f170,f169,f47,f48,f168,f50,f49,f161"
 
 INTRADAY_SNAPSHOT_TIMES = ["09:35", "10:30", "11:30", "13:30", "14:55"]
 EOD_UPDATE_TIMES = ["16:30", "18:00"]
@@ -48,6 +59,21 @@ AI_MANAGED_WORK_SCHEDULES: Dict[str, List[str]] = {
     "factor_lab_iteration": ["18:25"],
     "eod_report": ["19:20"],
 }
+STALE_TASK_TIMEOUT_MINUTES = _env_int("QUANT_AUTOMATION_TASK_TIMEOUT_MINUTES", 120)
+STALE_RUN_TIMEOUTS = {
+    "realtime_snapshot": _env_int("QUANT_SNAPSHOT_TIMEOUT_MINUTES", 15),
+    "eod_update": _env_int("QUANT_EOD_UPDATE_TIMEOUT_MINUTES", 240),
+    "virtual_trade": _env_int("QUANT_VIRTUAL_TRADE_TIMEOUT_MINUTES", 30),
+    "ai_cycle": _env_int("QUANT_AI_CYCLE_TIMEOUT_MINUTES", 15),
+}
+STALE_AI_WORK_TIMEOUTS = {
+    "premarket_plan": _env_int("QUANT_AI_WORK_TIMEOUT_MINUTES", 30),
+    "intraday_review": _env_int("QUANT_AI_WORK_TIMEOUT_MINUTES", 30),
+    "simulation_supervision": _env_int("QUANT_AI_WORK_TIMEOUT_MINUTES", 30),
+    "factor_lab_iteration": _env_int("QUANT_FACTOR_LAB_WORK_TIMEOUT_MINUTES", 120),
+    "eod_report": _env_int("QUANT_AI_WORK_TIMEOUT_MINUTES", 30),
+}
+EOD_PROGRESS_MESSAGE_INTERVAL_SECONDS = _env_int("QUANT_EOD_PROGRESS_MESSAGE_SECONDS", 600)
 
 MANAGED_WORK_PROFILES: Dict[str, Dict[str, Any]] = {
     "premarket_plan": {
@@ -148,10 +174,62 @@ class AutomationOrchestrator:
         self.ai_service = ai_service
         self.virtual_trade_runner = virtual_trade_runner
         self.context_builder = context_builder
+        self._eod_update_lock = threading.Lock()
         self.ai_handlers: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+        self.sentinel = DataSentinel()
 
     def set_ai_handlers(self, handlers: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]) -> None:
         self.ai_handlers = handlers
+
+    def run_data_sentinel(self, *, target_date: Optional[str] = None, trigger: str = "manual") -> Dict[str, Any]:
+        target_date = target_date or self.data_lake_service.default_target_date()
+        run_id = self.store.start_run("data_sentinel", trigger, target_date)
+        try:
+            report = self.sentinel.check_data_health(target_date)
+            status = report.get("status", "unknown")
+            self._record_ai_work_message(
+                work_id=run_id,
+                work_type="data_sentinel",
+                trigger=trigger,
+                target_date=target_date,
+                action_type="check_data_integrity",
+                status="success",
+                title=f"数据健康检查完成: {status}",
+                body=f"目标日期: {target_date}, 健康评分: {report.get('health_score')}%",
+                details=report,
+            )
+            return self.store.finish_run(run_id, "success", summary=report)
+        except Exception as exc:
+            logger.exception("data sentinel failed")
+            return self.store.finish_run(run_id, "failed", summary={}, error=str(exc))
+
+    def run_jiucai_capture(self, *, trigger: str = "manual") -> Dict[str, Any]:
+        run_id = self.store.start_run("jiucai_capture", trigger)
+        skill_dir = "/Users/gdxj/.agents/skills/capture-韭菜公社"
+        try:
+            # 抓取异动和产业链（较快）
+            cmd = f"cd {skill_dir} && uv run python -m a_stock_watcher.cli fetch --source action && uv run python -m a_stock_watcher.cli fetch --source industry_chain"
+            process = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+            
+            if process.returncode != 0:
+                raise RuntimeError(f"Jiucai capture failed: {process.stderr}")
+
+            summary = {"status": "success", "output_tail": process.stdout[-1000:]}
+            self._record_ai_work_message(
+                work_id=run_id,
+                work_type="jiucai_capture",
+                trigger=trigger,
+                target_date=None,
+                action_type="sentiment_analysis",
+                status="success",
+                title="韭菜公社舆情抓取完成",
+                body="已更新异动板块和产业链关注度数据。",
+                details=summary,
+            )
+            return self.store.finish_run(run_id, "success", summary=summary)
+        except Exception as exc:
+            logger.exception("jiucai capture failed")
+            return self.store.finish_run(run_id, "failed", summary={}, error=str(exc))
 
     def run_realtime_snapshot(self, *, trigger: str = "manual", limit: int = 6000) -> Dict[str, Any]:
         run_id = self.store.start_run("realtime_snapshot", trigger)
@@ -196,8 +274,83 @@ class AutomationOrchestrator:
         skip_etf: bool = False,
     ) -> Dict[str, Any]:
         target_date = target_date or self.data_lake_service.default_target_date()
+        self._expire_stale_running_tasks()
+        active_run = self._active_running_run("eod_update")
+        if active_run:
+            run_id = self.store.start_run("eod_update", trigger, target_date)
+            summary = {
+                "target_date": target_date,
+                "dry_run": dry_run,
+                "skipped_reason": "already_running",
+                "active_run_id": active_run.get("run_id"),
+                "active_started_at": active_run.get("started_at"),
+            }
+            self.store.record_ai_work_message(
+                work_id=run_id,
+                work_type="eod_update",
+                trigger=trigger,
+                target_date=target_date,
+                action_type="eod_update",
+                status="skipped",
+                level="warning",
+                title="数据湖补数已跳过",
+                body=(
+                    f"已有数据湖补数任务 {active_run.get('run_id')} 正在运行，"
+                    "本次请求没有启动第二个并发补数。"
+                ),
+                details={"active_run": active_run, "request": summary},
+            )
+            return self.store.finish_run(run_id, "skipped", summary=summary)
+
+        if not self._eod_update_lock.acquire(blocking=False):
+            run_id = self.store.start_run("eod_update", trigger, target_date)
+            summary = {"target_date": target_date, "dry_run": dry_run, "skipped_reason": "lock_held"}
+            self.store.record_ai_work_message(
+                work_id=run_id,
+                work_type="eod_update",
+                trigger=trigger,
+                target_date=target_date,
+                action_type="eod_update",
+                status="skipped",
+                level="warning",
+                title="数据湖补数已跳过",
+                body="已有数据湖补数线程正在运行，本次请求没有启动第二个并发补数。",
+                details={"request": summary},
+            )
+            return self.store.finish_run(run_id, "skipped", summary=summary)
+
         run_id = self.store.start_run("eod_update", trigger, target_date)
+        progress_reporter: Optional[tuple[threading.Event, threading.Thread]] = None
         try:
+            self.store.record_ai_work_message(
+                work_id=run_id,
+                work_type="eod_update",
+                trigger=trigger,
+                target_date=target_date,
+                action_type="eod_update",
+                status="running",
+                title="数据湖补数开始" if not dry_run else "数据湖补数演练开始",
+                body=(
+                    f"开始{'演练' if dry_run else '更新'} {target_date} 数据湖；"
+                    f"A股限制 {limit_a_share or '全量'}，ETF限制 {limit_etf or '全量'}。"
+                ),
+                details={
+                    "dry_run": dry_run,
+                    "buffer_days": buffer_days,
+                    "workers_a_share": workers_a_share,
+                    "workers_etf": workers_etf,
+                    "retry": retry,
+                    "task_timeout": task_timeout,
+                    "limit_a_share": limit_a_share,
+                    "limit_etf": limit_etf,
+                },
+            )
+            progress_reporter = self._start_eod_progress_reporter(
+                run_id=run_id,
+                trigger=trigger,
+                target_date=target_date,
+                dry_run=dry_run,
+            )
             summary = self.data_lake_service.run_update(
                 target_date=target_date,
                 dry_run=dry_run,
@@ -212,12 +365,44 @@ class AutomationOrchestrator:
                 skip_etf=skip_etf,
             )
             status = self._update_status_from_summary(summary, dry_run=dry_run)
-            if status in {"success", "partial"}:
+            if not dry_run and status in {"success", "partial"}:
                 self.store.set_state("last_eod_update", {"target_date": target_date, "run_id": run_id, "status": status})
-            return self.store.finish_run(run_id, status, summary=summary)
+            finished = self.store.finish_run(run_id, status, summary=summary)
+            self.store.record_ai_work_message(
+                work_id=run_id,
+                work_type="eod_update",
+                trigger=trigger,
+                target_date=target_date,
+                action_type="eod_update",
+                status=status,
+                level="warning" if status == "partial" else "info",
+                title="数据湖补数完成" if not dry_run else "数据湖补数演练完成",
+                body=self._eod_update_message_body(summary, dry_run=dry_run, status=status),
+                details={"run_id": run_id, "summary": summary},
+            )
+            return finished
         except Exception as exc:
             logger.exception("eod update failed")
-            return self.store.finish_run(run_id, "failed", summary={"target_date": target_date}, error=str(exc))
+            failed = self.store.finish_run(run_id, "failed", summary={"target_date": target_date}, error=str(exc))
+            self.store.record_ai_work_message(
+                work_id=run_id,
+                work_type="eod_update",
+                trigger=trigger,
+                target_date=target_date,
+                action_type="eod_update",
+                status="failed",
+                level="error",
+                title="数据湖补数失败",
+                body=f"{target_date} 数据湖补数失败：{exc}",
+                details={"run_id": run_id, "error": str(exc)},
+            )
+            return failed
+        finally:
+            if progress_reporter:
+                stop_event, thread = progress_reporter
+                stop_event.set()
+                thread.join(timeout=1)
+            self._eod_update_lock.release()
 
     def run_eod_chain(
         self,
@@ -227,16 +412,40 @@ class AutomationOrchestrator:
         retry_run: bool = False,
     ) -> Dict[str, Any]:
         update = self.run_eod_update(trigger=trigger, target_date=target_date)
+        sentinel = self.run_data_sentinel(trigger=trigger, target_date=target_date)
+        jiucai = self.run_jiucai_capture(trigger=trigger)
+        
         freshness = self.data_lake_service.data_freshness(target_date=target_date)
         virtual_trade = None
         ai_cycle = None
         ai_managed_work = None
-        if update.get("status") in {"success", "partial"} and freshness.get("status") != "blocked":
+        # Use sentinel status to guard the rest of the chain if health is critical
+        sentinel_status = sentinel.get("summary", {}).get("status", "healthy")
+        
+        if update.get("status") in {"success", "partial"} and freshness.get("status") != "blocked" and sentinel_status != "critical":
             virtual_trade = self.run_virtual_trade(trigger=trigger)
             ai_cycle = self.run_ai_cycle(trigger=trigger)
             ai_managed_work = self.run_ai_managed_work(work_type="eod_report", trigger=trigger)
+        elif update.get("status") in {"success", "partial"}:
+            self._record_ai_work_message(
+                work_id=str(update.get("run_id") or f"eod_chain-{target_date or 'latest'}"),
+                work_type="eod_update",
+                trigger=trigger,
+                target_date=target_date or freshness.get("target_date"),
+                action_type="eod_chain_blocked",
+                status="blocked",
+                level="warning",
+                title="收盘自动链路阻塞",
+                body=(
+                    f"数据湖补数结束，但数据校验结果为 {sentinel_status} 且新鲜度为 {freshness.get('status')}，"
+                    "本次未继续触发模拟盘和 AI cycle。请检查数据源质量。"
+                ),
+                details={"update": update, "freshness": freshness, "sentinel": sentinel, "retry_run": retry_run},
+            )
         return {
             "update": update,
+            "sentinel": sentinel,
+            "jiucai": jiucai,
             "freshness": freshness,
             "virtual_trade": virtual_trade,
             "ai_cycle": ai_cycle,
@@ -472,6 +681,7 @@ class AutomationOrchestrator:
             }
 
     def status_payload(self, scheduler: Optional["LightweightScheduler"] = None) -> Dict[str, Any]:
+        self._expire_stale_running_tasks()
         freshness = self.data_lake_service.data_freshness(max_scan=300)
         return {
             "scheduler": scheduler.status_payload() if scheduler else {"enabled": False, "running": False},
@@ -484,6 +694,99 @@ class AutomationOrchestrator:
             "last_eod_update": self.store.get_state("last_eod_update", {}),
             "last_virtual_trade": self.store.get_state("last_virtual_trade", {}),
         }
+
+    def _expire_stale_running_tasks(self) -> None:
+        try:
+            expired_runs = self.store.expire_stale_runs(
+                max_age_minutes=STALE_TASK_TIMEOUT_MINUTES,
+                job_timeouts=STALE_RUN_TIMEOUTS,
+            )
+            expired_ai_work = self.store.expire_stale_ai_work_logs(
+                max_age_minutes=STALE_TASK_TIMEOUT_MINUTES,
+                work_timeouts=STALE_AI_WORK_TIMEOUTS,
+            )
+        except AttributeError:
+            return
+        except Exception:
+            logger.exception("failed to expire stale automation tasks")
+            return
+
+        for run in expired_runs:
+            timeout_minutes = (run.get("summary") or {}).get("timeout_minutes", STALE_TASK_TIMEOUT_MINUTES)
+            self._record_ai_work_message(
+                work_id=str(run.get("run_id") or ""),
+                work_type=str(run.get("job_type") or "automation"),
+                trigger=str(run.get("trigger") or "system"),
+                target_date=run.get("target_date"),
+                action_type="timeout",
+                status="failed",
+                level="error",
+                title="自动化任务超时",
+                body=(
+                    f"{run.get('job_type')} 从 {run.get('started_at')} 开始后超过 "
+                    f"{timeout_minutes} 分钟未结束，已自动标记失败。"
+                ),
+                details={"run": run},
+            )
+
+        for work in expired_ai_work:
+            timeout_minutes = (work.get("result") or {}).get("timeout_minutes", STALE_TASK_TIMEOUT_MINUTES)
+            self._record_ai_work_message(
+                work_id=str(work.get("work_id") or ""),
+                work_type=str(work.get("work_type") or "ai_work"),
+                trigger=str(work.get("trigger") or "system"),
+                target_date=work.get("target_date"),
+                action_type="timeout",
+                status="failed",
+                level="error",
+                title="AI 托管任务超时",
+                body=(
+                    f"{work.get('title') or work.get('work_type')} 从 {work.get('started_at')} 开始后超过 "
+                    f"{timeout_minutes} 分钟未结束，已自动标记失败。"
+                ),
+                details={"work": work},
+            )
+
+    def _active_running_run(self, job_type: str) -> Optional[Dict[str, Any]]:
+        for run in self.store.list_runs(job_type=job_type, limit=20):
+            if run.get("status") == "running":
+                return run
+        return None
+
+    def _start_eod_progress_reporter(
+        self,
+        *,
+        run_id: str,
+        trigger: str,
+        target_date: str,
+        dry_run: bool,
+    ) -> Optional[tuple[threading.Event, threading.Thread]]:
+        if dry_run or EOD_PROGRESS_MESSAGE_INTERVAL_SECONDS <= 0:
+            return None
+
+        stop_event = threading.Event()
+
+        def report_loop() -> None:
+            while not stop_event.wait(EOD_PROGRESS_MESSAGE_INTERVAL_SECONDS):
+                try:
+                    freshness = self.data_lake_service.data_freshness(target_date=target_date, max_scan=300)
+                    self._record_ai_work_message(
+                        work_id=run_id,
+                        work_type="eod_update",
+                        trigger=trigger,
+                        target_date=target_date,
+                        action_type="eod_progress",
+                        status="running",
+                        title="数据湖补数进行中",
+                        body=self._eod_progress_message_body(freshness),
+                        details={"freshness": freshness},
+                    )
+                except Exception:
+                    logger.exception("failed to record eod progress message")
+
+        thread = threading.Thread(target=report_loop, daemon=True, name=f"eod-progress-{run_id}")
+        thread.start()
+        return stop_event, thread
 
     def _record_ai_work_message(
         self,
@@ -689,14 +992,14 @@ class AutomationOrchestrator:
             params.setdefault("pool", "core")
             params.setdefault("label", "next_5d_ret")
             params.setdefault("top_n", 5)
-            params.setdefault("max_symbols", 300)
+            params.setdefault("max_symbols", 500)
             if action_type == "run_factor_lab_backtest":
                 params.setdefault("factor", "ml_factor_ranker")
                 params.setdefault("initial_capital", 1000000.0)
                 params.setdefault("max_positions", 5)
         elif action_type == "run_factor_lab_stress_test":
             params.setdefault("pool", "core")
-            params.setdefault("max_symbols", 300)
+            params.setdefault("max_symbols", 500)
             params.setdefault("top_n", 5)
             params.setdefault("anchor_date", target_date)
             params.setdefault("factors", ["ml_factor_ranker"])
@@ -773,6 +1076,32 @@ class AutomationOrchestrator:
         if decision_status in {"failed", "rejected"}:
             return "failed"
         return "skipped"
+
+    @staticmethod
+    def _eod_update_message_body(summary: Dict[str, Any], *, dry_run: bool, status: str) -> str:
+        target_date = summary.get("target_date") or summary.get("end_date") or "--"
+        a_share = summary.get("a_share") if isinstance(summary.get("a_share"), dict) else {}
+        etf = summary.get("etf") if isinstance(summary.get("etf"), dict) else {}
+        a_scheduled = a_share.get("scheduled_updates", 0)
+        etf_scheduled = etf.get("scheduled_updates", 0)
+        mode = "演练" if dry_run else "更新"
+        suffix = "未写入数据。" if dry_run else "已写入可获取的数据。"
+        return (
+            f"{target_date} 数据湖{mode}{status}："
+            f"A股计划 {a_scheduled} 个，ETF计划 {etf_scheduled} 个。{suffix}"
+        )
+
+    @staticmethod
+    def _eod_progress_message_body(freshness: Dict[str, Any]) -> str:
+        target_date = freshness.get("target_date") or "--"
+        a_share = freshness.get("a_share") if isinstance(freshness.get("a_share"), dict) else {}
+        etf = freshness.get("etf") if isinstance(freshness.get("etf"), dict) else {}
+        return (
+            f"{target_date} 数据湖补数仍在运行：新鲜度 {freshness.get('score', 0)}%，"
+            f"A股样本 {a_share.get('fresh_count', 0)}/{a_share.get('checked_count', 0)}，"
+            f"ETF样本 {etf.get('fresh_count', 0)}/{etf.get('checked_count', 0)}。"
+            "补数完成且完整性检查通过后，模拟盘和 AI cycle 才会继续。"
+        )
 
     @staticmethod
     def _try_akshare_frame(fetcher_name: str) -> Optional[pd.DataFrame]:
@@ -878,8 +1207,136 @@ class AutomationOrchestrator:
             session.close()
         return rows[:request_limit]
 
+    @staticmethod
+    def _position_symbols_from_context(context: Dict[str, Any]) -> List[str]:
+        virtual_trading = context.get("virtual_trading") if isinstance(context, dict) else {}
+        accounts = virtual_trading.get("accounts") if isinstance(virtual_trading, dict) else []
+        symbols: List[str] = []
+        for account in accounts:
+            if not isinstance(account, dict):
+                continue
+            for holding in account.get("top_holding_details") or []:
+                if not isinstance(holding, dict):
+                    continue
+                symbol = str(holding.get("symbol") or "").strip()
+                if symbol:
+                    symbols.append(symbol)
+        return sorted(set(symbols))
+
+    @staticmethod
+    def _eastmoney_secid(symbol: str) -> str:
+        normalized = str(symbol or "").strip()
+        market = 1 if normalized.startswith(("5", "6", "9", "11", "13")) else 0
+        return f"{market}.{normalized}"
+
+    @classmethod
+    def _fetch_eastmoney_position_quotes(cls, symbols: List[str]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not symbols:
+            return rows
+        session = requests.Session()
+        session.headers.update(EASTMONEY_HEADERS)
+        session.trust_env = False
+        try:
+            for symbol in symbols:
+                response = session.get(
+                    EASTMONEY_STOCK_GET_URL,
+                    params={
+                        "fltt": "2",
+                        "invt": "2",
+                        "fields": EASTMONEY_QUOTE_FIELDS,
+                        "secid": cls._eastmoney_secid(symbol),
+                    },
+                    timeout=8,
+                    proxies={"http": None, "https": None},
+                )
+                response.raise_for_status()
+                data = (response.json() or {}).get("data") or {}
+                code = str(data.get("f57") or symbol or "").strip()
+                if not code:
+                    continue
+                rows.append(
+                    {
+                        "代码": code,
+                        "名称": data.get("f58"),
+                        "最新价": cls._to_number(data.get("f43")),
+                        "涨跌幅": cls._to_number(data.get("f170")),
+                        "涨跌额": cls._to_number(data.get("f169")),
+                        "成交量": cls._to_number(data.get("f47")),
+                        "成交额": cls._to_number(data.get("f48")),
+                        "最高": cls._to_number(data.get("f44")),
+                        "最低": cls._to_number(data.get("f45")),
+                        "今开": cls._to_number(data.get("f46")),
+                        "昨收": cls._to_number(data.get("f60")),
+                        "换手率": cls._to_number(data.get("f168")),
+                        "量比": cls._to_number(data.get("f50")),
+                        "外盘": cls._to_number(data.get("f49")),
+                        "内盘": cls._to_number(data.get("f161")),
+                        "source": "eastmoney_position_quote",
+                    }
+                )
+                time.sleep(0.04)
+        finally:
+            session.close()
+        return rows
+
+    def _supplement_position_quotes(self, rows: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], bool]:
+        try:
+            position_rows = self._current_position_quote_rows()
+        except Exception as exc:
+            logger.warning("current position quote collection failed: %s", exc)
+            return rows, False
+        if not position_rows:
+            return rows, False
+
+        existing_symbols = {
+            str(row.get("代码") or row.get("symbol") or row.get("code") or "").strip()
+            for row in rows
+            if isinstance(row, dict)
+        }
+        supplemental_rows = [
+            row
+            for row in position_rows
+            if str(row.get("代码") or "").strip() and str(row.get("代码") or "").strip() not in existing_symbols
+        ]
+        if not supplemental_rows:
+            return rows, False
+        return rows + supplemental_rows, True
+
+    def _current_position_quote_rows(self) -> List[Dict[str, Any]]:
+        try:
+            context = self.context_builder()
+        except Exception as exc:
+            logger.warning("context builder failed while collecting position quotes: %s", exc)
+            return []
+
+        required_symbols = self._position_symbols_from_context(context)
+        if not required_symbols:
+            return []
+
+        try:
+            return self._fetch_eastmoney_position_quotes(required_symbols)
+        except Exception as exc:
+            logger.warning("position quote collection failed: %s", exc)
+            return []
+
     def _fetch_market_snapshot(self, *, limit: int) -> tuple[List[Dict[str, Any]], str]:
         limit = max(1, min(int(limit or 6000), 8000))
+        position_rows = self._current_position_quote_rows()
+        if position_rows:
+            cached_getter = getattr(self.data_manager, "get_latest_market_cached", None)
+            cached_overview = cached_getter() if callable(cached_getter) else []
+            cached_overview = cached_overview or []
+            combined = pd.DataFrame(position_rows + list(cached_overview[:20]))
+            if "代码" in combined.columns:
+                combined = combined.drop_duplicates(subset=["代码"], keep="first")
+            if "涨跌幅" in combined.columns:
+                combined = combined.sort_values("涨跌幅", ascending=False, na_position="last")
+            source = "eastmoney_positions"
+            if cached_overview:
+                source += "+market_cache"
+            return combined.head(limit).to_dict(orient="records"), source
+
         frames: List[pd.DataFrame] = []
         sources: List[str] = []
 
@@ -921,14 +1378,22 @@ class AutomationOrchestrator:
 
         if frames:
             combined = pd.concat(frames, ignore_index=True, sort=False)
+            rows = combined.to_dict(orient="records")
+            rows, supplemented = self._supplement_position_quotes(rows)
+            combined = pd.DataFrame(rows)
             if "代码" in combined.columns:
                 combined = combined.drop_duplicates(subset=["代码"], keep="last")
             if "涨跌幅" in combined.columns:
                 combined = combined.sort_values("涨跌幅", ascending=False, na_position="last")
+            if supplemented:
+                sources.append("eastmoney_positions")
             source = "+".join(sources) if sources else "snapshot_mixed"
             return combined.head(limit).to_dict(orient="records"), source
 
         rows = self.data_manager.get_latest_market_overview(limit=limit)
+        rows, supplemented = self._supplement_position_quotes(list(rows[:limit]))
+        if supplemented:
+            return rows[:limit], "latest_market_overview+eastmoney_positions"
         return rows[:limit], "latest_market_overview"
 
     @staticmethod

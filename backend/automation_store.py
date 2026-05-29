@@ -4,7 +4,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -203,6 +203,54 @@ class AutomationStore:
                     (limit,),
                 ).fetchall()
         return [self._run_row_to_dict(row) for row in rows]
+
+    def expire_stale_runs(
+        self,
+        *,
+        max_age_minutes: int = 120,
+        job_timeouts: Optional[Dict[str, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        max_age_minutes = max(5, int(max_age_minutes or 120))
+        now = datetime.now()
+        finished_at = _now_iso()
+        expired: List[Dict[str, Any]] = []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM automation_runs
+                WHERE status = 'running'
+                ORDER BY started_at ASC, id ASC
+                """,
+            ).fetchall()
+            for row in rows:
+                timeout_minutes = max(5, int((job_timeouts or {}).get(row["job_type"], max_age_minutes)))
+                try:
+                    started_at = datetime.fromisoformat(row["started_at"])
+                except Exception:
+                    started_at = now - timedelta(minutes=timeout_minutes + 1)
+                if started_at >= now - timedelta(minutes=timeout_minutes):
+                    continue
+                summary = _json_loads(row["summary_json"], {})
+                if not isinstance(summary, dict):
+                    summary = {}
+                summary.update({"timeout": True, "timeout_minutes": timeout_minutes})
+                error = f"任务超过 {timeout_minutes} 分钟未结束，已自动标记超时。"
+                conn.execute(
+                    """
+                    UPDATE automation_runs
+                    SET status = 'failed', finished_at = ?, summary_json = ?, error = ?
+                    WHERE run_id = ?
+                    """,
+                    (finished_at, _json_dumps(summary), error, row["run_id"]),
+                )
+                data = self._run_row_to_dict(row)
+                data["status"] = "failed"
+                data["finished_at"] = finished_at
+                data["summary"] = summary
+                data["error"] = error
+                expired.append(data)
+            conn.commit()
+        return expired
 
     def latest_success(self, job_type: str) -> Optional[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
@@ -440,6 +488,54 @@ class AutomationStore:
                     (limit,),
                 ).fetchall()
         return [self._work_log_row_to_dict(row) for row in rows]
+
+    def expire_stale_ai_work_logs(
+        self,
+        *,
+        max_age_minutes: int = 120,
+        work_timeouts: Optional[Dict[str, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        max_age_minutes = max(5, int(max_age_minutes or 120))
+        now = datetime.now()
+        finished_at = _now_iso()
+        expired: List[Dict[str, Any]] = []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ai_work_logs
+                WHERE status = 'running'
+                ORDER BY started_at ASC, id ASC
+                """,
+            ).fetchall()
+            for row in rows:
+                timeout_minutes = max(5, int((work_timeouts or {}).get(row["work_type"], max_age_minutes)))
+                try:
+                    started_at = datetime.fromisoformat(row["started_at"])
+                except Exception:
+                    started_at = now - timedelta(minutes=timeout_minutes + 1)
+                if started_at >= now - timedelta(minutes=timeout_minutes):
+                    continue
+                result = _json_loads(row["result_json"], {})
+                if not isinstance(result, dict):
+                    result = {}
+                result.update({"timeout": True, "timeout_minutes": timeout_minutes})
+                error = f"AI 托管任务超过 {timeout_minutes} 分钟未结束，已自动标记超时。"
+                conn.execute(
+                    """
+                    UPDATE ai_work_logs
+                    SET status = 'failed', finished_at = ?, result_json = ?, error = ?
+                    WHERE work_id = ?
+                    """,
+                    (finished_at, _json_dumps(result), error, row["work_id"]),
+                )
+                data = self._work_log_row_to_dict(row)
+                data["status"] = "failed"
+                data["finished_at"] = finished_at
+                data["result"] = result
+                data["error"] = error
+                expired.append(data)
+            conn.commit()
+        return expired
 
     def record_ai_work_message(
         self,
