@@ -1,4 +1,4 @@
-# Quant-Viz-Backtest (Gemini量化Pro)
+# Quant-Viz-Backtest (momo quant pro)
 
 ![Architecture](https://img.shields.io/badge/Architecture-Cloud%20Native-blue)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-009688)
@@ -23,12 +23,64 @@ The engine comes pre-loaded with a diverse arsenal of quantitative strategies:
 - **Signal Factory**: Overnight Hold (一夜持股), Weak-to-Strong Reversal (弱转强), Limit-up Doji (涨停十字星).
 - **Classic Quant**: Industry Selection, High-Frequency Turtle Trading, HFMR, Oversold Reversal, ATM Trend Enhancement.
 
-### 3. 📊 Dual-Layer Architecture (双层架构)
-- **Strategy Hall (策略大厅)**: For parameter tuning, factor discovery, and historical backtesting visualization.
-- **Simulation Console (仿真控制台)**: Real-time virtual trading execution, position management, and performance tracking.
-
-### 4. 📈 Comprehensive Data Coverage (全维度数据覆盖)
+### 3. 📈 Comprehensive Data Coverage (全维度数据覆盖)
 Supports the full A-share market and major ETFs (2022 to Present), deeply integrated with 11+ core factors including PE, PB, Turnover Rate, PS, PCF, and ST status.
+
+---
+
+## 🖥️ Frontend Modules & Workflow (前端功能与工作流)
+
+The React/Vite-powered frontend is built around a dual-layer architecture, delivering blazing-fast charting and seamless interaction.
+
+### 1. Strategy Hall (策略大厅)
+- **Features**: An intuitive dashboard to select strategies, adjust hyper-parameters (e.g., stop-loss, take-profit, holding limits), and trigger multi-year backtests.
+- **Visualization**: Renders comprehensive equity curves, max drawdown charts, win-rate radar charts, and PnL heatmaps. 
+- **Interactions**: Supports deep-dive analysis through interactive tooltips (hovering over any trade node reveals exact entry/exit reasons) and keyboard shortcuts.
+
+### 2. Simulation Console (仿真控制台)
+- **Features**: A real-time virtual trading execution environment. It synchronizes with the data engine to simulate live trading environments based on the latest market ticks.
+- **Operations**: Manages active portfolios, calculates dynamic PnL, tracks overnight holdings, and automatically liquidates positions that hit risk thresholds.
+
+### 3. Daily Morning Report (早盘看板)
+- **Features**: Aggregates pre-market technical trends, ETF momentum shifts, and overnight news sentiment, generating actionable daily briefings before the market opens.
+
+### 🔄 System Workflow Diagram (各板块工作流程)
+
+```mermaid
+graph TD
+    A[User / Quant Researcher] -->|Configure Parameters| B(Strategy Hall)
+    A -->|Monitor Live PnL| C(Simulation Console)
+    A -->|View Morning Briefs| D(Daily Morning Report)
+    
+    subgraph Frontend [Frontend - React/Vite]
+        B
+        C
+        D
+    end
+    
+    subgraph Backend [Backend - FastAPI Engine]
+        E[API Router]
+        F[Backtest Engine]
+        G[Virtual Trading Manager]
+        I[Morning Report Generator]
+    end
+
+    subgraph DataLake [Data Lake - Decoupled API]
+        H[(Remote API Stream / Local Parquet)]
+    end
+
+    B -->|Submit Task| E
+    C -->|Fetch Portfolio State| E
+    D -->|Get Pre-market Insights| E
+    
+    E --> F
+    E --> G
+    E --> I
+    
+    F <-->|Stream Historical K-lines| H
+    G <-->|Fetch Latest Ticks| H
+    I <-->|Fetch Sentiment & Meta| H
+```
 
 ---
 
@@ -42,7 +94,6 @@ export DATA_LAKE_API_URL="http://your-data-lake-gateway.com" # Optional for clou
 pip install -r requirements.txt
 python main.py
 ```
-
 *(If `DATA_LAKE_API_URL` is omitted, the engine will safely read from the local `/Users/gdxj/quant_data_lake` directory).*
 
 ### 2. Start the Frontend (启动前端)
