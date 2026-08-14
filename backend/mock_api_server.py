@@ -8,7 +8,7 @@ import json
 
 app = FastAPI()
 
-CACHE_DIR = Path("/Users/USER/quant_data_lake")
+CACHE_DIR = Path("./quant_data_lake")
 
 @app.get("/api/v1/market/history")
 def get_market_history(symbol: str):

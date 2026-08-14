@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-BACKEND = Path("/Users/USER/quant-viz-backtest/backend")
+BACKEND = Path("./backend")
 DB = BACKEND / "virtual_trading.db"
 BASE_URL = "http://127.0.0.1:8080"
 TARGET_RUN_ID = sys.argv[1] if len(sys.argv) > 1 else ""

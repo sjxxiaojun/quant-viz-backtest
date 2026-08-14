@@ -17,7 +17,7 @@ from typing import List, Optional
 import pandas as pd
 
 BACKEND_DIR = Path(__file__).resolve().parent
-ROOT_DIR = Path("/Users/USER/projects/quant_data_lake")
+ROOT_DIR = Path("./quant_data_lake")
 ETF_DIR = ROOT_DIR / "etf"
 DATA_CACHE_DIR = BACKEND_DIR / "data_cache"
 START_DATE = "2022-01-01"

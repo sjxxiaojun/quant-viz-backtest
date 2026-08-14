@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-PROJECT = Path("/Users/USER/quant-viz-backtest")
+PROJECT = Path(".")
 BACKEND = PROJECT / "backend"
 DB = BACKEND / "virtual_trading.db"
 OLD_PID = int(os.getenv("QUANT_RESTART_OLD_PID", "28686"))
@@ -80,7 +80,7 @@ def count_fresh_files(root: Path, target_date: str) -> tuple[int, int]:
 
 
 def record_progress(target_date: str) -> None:
-    root = Path("/Users/USER/quant_data_lake")
+    root = Path("./quant_data_lake")
     a_fresh, a_total = count_fresh_files(root, target_date)
     etf_fresh, etf_total = count_fresh_files(root / "etf", target_date)
     record_message(

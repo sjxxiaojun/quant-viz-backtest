@@ -5,7 +5,7 @@ import baostock as bs
 from datetime import datetime
 
 def fetch_blackhorse_data():
-    output_dir = "/Users/USER/quant-viz-backtest/backend/data_cache/blackhorse_study"
+    output_dir = "./backend/data_cache/blackhorse_study"
     os.makedirs(output_dir, exist_ok=True)
     
     # 低空经济 & AI 算力 核心标的
@@ -23,7 +23,7 @@ def fetch_blackhorse_data():
         "301091": "深城交", "603611": "建新股份"
     }
     
-    parquet_dir = "/Users/USER/acodex/量化/data/parquet/research/daily_bars/akshare/raw"
+    parquet_dir = "./data/parquet/raw"
     bs.login()
     
     for symbol in blackhorse_pool:

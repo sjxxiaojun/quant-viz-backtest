@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 logger = logging.getLogger("DataSentinel")
 
 class DataSentinel:
-    def __init__(self, data_lake_dir: str = "/Users/USER/quant_data_lake"):
+    def __init__(self, data_lake_dir: str = "./quant_data_lake"):
         self.data_lake_dir = Path(data_lake_dir)
         self.a_share_dir = self.data_lake_dir 
         self.etf_dir = self.data_lake_dir / "etf"

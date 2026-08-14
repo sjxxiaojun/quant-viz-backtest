@@ -50,5 +50,5 @@ def scan_hot_sectors():
         print("Hot scan complete.")
 
 if __name__ == "__main__":
-    os.chdir("/Users/USER/quant-viz-backtest/backend")
+    os.chdir("./backend")
     scan_hot_sectors()

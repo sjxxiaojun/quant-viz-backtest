@@ -90,14 +90,14 @@ Factor Lab 基于现有 A 股股票池与主回测链路，提供以下能力：
 后端测试：
 
 ```bash
-cd /Users/USER/quant-viz-backtest/backend
-PYTHONPATH=/Users/USER/quant-viz-backtest/backend python3 -m pytest -q
+cd ./backend
+PYTHONPATH=./backend python3 -m pytest -q
 ```
 
 前端构建：
 
 ```bash
-cd /Users/USER/quant-viz-backtest/frontend
+cd ./frontend
 npm run build
 ```
 

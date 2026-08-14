@@ -6,7 +6,7 @@ import baostock as bs
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Make sure this runs independently to build the full market data lake
-CACHE_DIR = "/Users/USER/quant_data_lake"
+CACHE_DIR = "./quant_data_lake"
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 

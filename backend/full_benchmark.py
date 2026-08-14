@@ -112,5 +112,5 @@ def run_comprehensive_benchmark():
 
 if __name__ == "__main__":
     # 进入 backend 目录运行
-    os.chdir("/Users/USER/quant-viz-backtest/backend")
+    os.chdir("./backend")
     run_comprehensive_benchmark()

@@ -248,7 +248,7 @@ class PoolDataFetchError(RuntimeError):
 class DataManager:
     def __init__(
         self,
-        cache_dir="/Users/USER/projects/quant_data_lake",
+        cache_dir="./quant_data_lake",
         frame_cache_max_entries: Optional[int] = None,
         frame_cache_eviction: Optional[str] = None,
     ):

@@ -205,7 +205,7 @@ class AutomationOrchestrator:
 
     def run_jiucai_capture(self, *, trigger: str = "manual") -> Dict[str, Any]:
         run_id = self.store.start_run("jiucai_capture", trigger)
-        skill_dir = "/Users/USER/.agents/skills/capture-韭菜公社"
+        skill_dir = "./skills/capture-韭菜公社"
         try:
             # 抓取异动和产业链（较快）
             cmd = f"cd {skill_dir} && uv run python -m a_stock_watcher.cli fetch --source action && uv run python -m a_stock_watcher.cli fetch --source industry_chain"

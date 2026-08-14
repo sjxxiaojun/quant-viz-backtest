@@ -95,7 +95,7 @@ export DATA_LAKE_API_URL="http://您的数据网关地址" # 云端模式可选
 pip install -r requirements.txt
 python main.py
 ```
-*(如果未配置 `DATA_LAKE_API_URL`，引擎会安全地读取本地 `/Users/USER/quant_data_lake` 目录)。*
+*(如果未配置 `DATA_LAKE_API_URL`，引擎会安全地读取本地 `./quant_data_lake` 目录)。*
 
 ### 2. 启动前端
 ```bash
@@ -112,5 +112,4 @@ npm run dev
 - **React/Vite 前端**: 运行于 5173 端口。提供极速图表渲染、键盘快捷键以及悬浮交易详情。
 - **多级缓存架构**: 内存 LRU 缓存 + 磁盘 Parquet + API 数据流，确保回测在毫秒级完成，杜绝冗余的网络请求风暴。
 
----
-*由 K秘 为肖君先生量身定制生成。*
+*Automated Quantitative Backtesting & Visualization Platform.*

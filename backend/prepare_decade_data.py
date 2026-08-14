@@ -5,7 +5,7 @@ import baostock as bs
 from datetime import datetime
 
 def prepare_decade_data():
-    output_dir = "/Users/USER/quant-viz-backtest/backend/data_cache/decade_study"
+    output_dir = "./backend/data_cache/decade_study"
     os.makedirs(output_dir, exist_ok=True)
     
     # 选定 15 只具备 10 年历史的行业代表性股票
@@ -16,7 +16,7 @@ def prepare_decade_data():
         "000002.SZ", "601398.SH", "002415.SZ"
     ]
     
-    parquet_dir = "/Users/USER/acodex/量化/data/parquet/research/daily_bars/akshare/raw"
+    parquet_dir = "./data/parquet/raw"
     bs.login()
     
     for symbol in stock_pool:

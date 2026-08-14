@@ -15,8 +15,8 @@ from pathlib import Path
 import pandas as pd
 
 
-BACKEND_DIR = Path("/Users/USER/projects/quant-viz-backtest/backend")
-ROOT_DIR = Path("/Users/USER/projects/quant_data_lake")
+BACKEND_DIR = Path("./backend")
+ROOT_DIR = Path("./quant_data_lake")
 DATA_CACHE_DIR = BACKEND_DIR / "data_cache"
 START_DATE = "2022-01-01"
 

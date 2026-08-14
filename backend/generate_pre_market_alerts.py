@@ -58,5 +58,5 @@ def generate_pre_market_alerts():
     print(f"Pre-market report generated: {output_path}")
 
 if __name__ == "__main__":
-    os.chdir("/Users/USER/quant-viz-backtest/backend")
+    os.chdir("./backend")
     generate_pre_market_alerts()

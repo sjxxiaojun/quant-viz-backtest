@@ -10,8 +10,8 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 
-BACKEND_DIR = Path("/Users/USER/projects/quant-viz-backtest/backend")
-ROOT_DIR = Path("/Users/USER/projects/quant_data_lake")
+BACKEND_DIR = Path("./backend")
+ROOT_DIR = Path("./quant_data_lake")
 ETF_DIR = ROOT_DIR / "etf"
 REMOVED_ST_DIR = ROOT_DIR / "_removed_st_delisted"
 REMOVED_NON_UNIVERSE_DIR = ROOT_DIR / "_removed_not_in_universe"

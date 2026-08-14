@@ -1,3 +1,7 @@
+*.md.bak
+【新】*.md
+.claude/
+.agents/
 # Runtime state
 .omc/
 .omx/

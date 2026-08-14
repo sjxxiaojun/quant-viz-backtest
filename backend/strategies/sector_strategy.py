@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 
-def run_power_energy_strategy(lake_dir="/Users/USER/quant_data_lake"):
+def run_power_energy_strategy(lake_dir="./quant_data_lake"):
     """
     Executes the Power & Energy Sector Strategy backtest.
     Returns a dictionary with regime, metrics, and top_stocks.
