@@ -1,5 +1,40 @@
+"""行情数据接入与本地数据湖读取。
+
+数据口径约定（引擎/策略侧必须知晓）：
+
+1. 复权方式 adjust='qfq'（前复权）：AKShare 用 adjust="qfq"、Baostock 用 adjustflag="2"。
+   qfq 价格以下载日为基准动态重算，因此：
+   - 除权除息日相邻两日的 qfq 价格比值不等于交易所真实涨跌幅，基于
+     open/prev_close 比值的涨跌停判定在除权除息日会失真；
+   - 数据湖每次刷新后历史价格可能整体变化，回测结果对下载日期敏感；
+   - 现金分红在 qfq 语义下等价于自动再投资。
+   返回帧的 frame.attrs["adjust"] == "qfq"、frame.attrs["adjust_note"] 记录该口径，
+   供引擎层（涨跌停判定等）读取并做相应处理。
+
+2. 成交量单位统一为"股"：AKShare 系接口原始单位为"手"（1 手 = 100 股），
+   Baostock 为"股"。判别优先级为 **源标注 > 兜底启发式**：
+   - 有数据源/缓存单位标注时一律按标注换算，amount/(close*volume) 比值只用于
+     记 WARNING，不允许反过来覆盖标注（该比值 ≈ qfq 复权因子 × 单位倍数，
+     复权因子 >= 10 的长历史高送转标的会被它误判成"手"并 ×100）；
+   - 无标注时才启用兜底判别，判据与复权无关：用不复权成交均价 amount/volume 的
+     ~100 倍台阶切分"单位一致段"，用"比值 <= 5"这类可靠证据（复权因子恒 >= 1，
+     故只有'比值小'能证明单位是股）锚定后沿段传播；
+   - 判不出来时记 WARNING 并保持原样，绝不静默换算。
+   磁盘上的存量 parquet 保持原样，仅在读取时换算。
+   返回帧的 frame.attrs["volume_unit"] == "share"。
+
+3. ST 状态 is_st：仅 Baostock 提供按日 isST 字段；AKShare 源缺失时补 0。
+   帧上的 st_source 列按行标记来源：
+   - "baostock_daily"：真实按日 ST 状态；
+   - "missing"：源数据不含 ST 字段，is_st==0 不代表非 ST；
+   - "unknown"：存量缓存无法回溯来源。
+   引擎层应据此区分"真无 ST"与"数据缺失"。
+"""
+
 import pandas as pd
 import numpy as np
+from collections import OrderedDict
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 import os
 import logging
@@ -10,6 +45,34 @@ import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("DataManager")
+
+# 代理环境变量仅在向上游发起请求的窗口内临时禁用（AKShare 走系统代理时常见 ProxyError），
+# 请求结束后必须恢复原值，不允许污染进程级环境。
+_PROXY_ENV_KEYS = (
+    "no_proxy", "NO_PROXY",
+    "http_proxy", "HTTP_PROXY",
+    "https_proxy", "HTTPS_PROXY",
+    "all_proxy", "ALL_PROXY",
+)
+
+
+@contextmanager
+def _no_proxy_environment():
+    saved = {key: os.environ.get(key) for key in _PROXY_ENV_KEYS}
+    try:
+        os.environ["no_proxy"] = "*"
+        os.environ["NO_PROXY"] = "*"
+        for key in _PROXY_ENV_KEYS:
+            if key.lower() == "no_proxy":
+                continue
+            os.environ.pop(key, None)
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 _AKSHARE = None
 _BAOSTOCK = None
@@ -61,6 +124,54 @@ ETF_PREFIXES = (
 
 CACHE_EDGE_TOLERANCE_DAYS = 7
 LATEST_MARKET_CACHE_TTL_SECONDS = 300
+# A股 1 手 = 100 股；AKShare 系日线接口成交量单位为"手"，Baostock 为"股"
+VOLUME_LOT_SIZE = 100.0
+# 数据源/缓存单位标注 -> 成交量原始单位换算到"股"的倍数。
+# 这是成交量单位判别的**第一优先级**：能解析出标注就按标注走，比值启发式只做无标注兜底。
+# 注意：AKSHARE_SINA（fund_etf_hist_sina）的成交量单位未经核实，故意不列入——
+# 宁可走兜底启发式，也不要凭猜测写死一个可能错 100 倍的标注。
+VOLUME_SOURCE_EXPECTED_SCALE = {
+    "AKSHARE": VOLUME_LOT_SIZE,      # 东财日线：手
+    "AKSHARE_EM": VOLUME_LOT_SIZE,
+    "BAOSTOCK": 1.0,                 # 股
+    "MOCK": 1.0,
+    "CACHE_SHARE": 1.0,              # 缓存文件自带"已归一为股"的单位标注
+    "CACHE_LOT": VOLUME_LOT_SIZE,    # 缓存文件自带"手"的单位标注
+}
+# 缓存帧里可能携带单位/来源标注的列（按优先级排列）。
+# 只认"单位语义"的列：读取路径会把已归一化为股的帧写回磁盘，
+# 通用 provenance 列（source/data_source）描述的是"数据从哪来"而非"盘上存的是什么单位"，
+# 直接拿来换算会在"已归一化 + 标注仍写 AKSHARE"时造成二次 ×100。
+VOLUME_UNIT_HINT_COLUMNS = ("volume_unit", "volume_source")
+VOLUME_UNIT_HINT_ALIASES = {
+    "SHARE": "CACHE_SHARE",
+    "SHARES": "CACHE_SHARE",
+    "股": "CACHE_SHARE",
+    "LOT": "CACHE_LOT",
+    "HAND": "CACHE_LOT",
+    "手": "CACHE_LOT",
+}
+# ---- 无源标注时的兜底判据阈值 ----
+# amount/(close*volume) ≈ 复权因子 × 单位倍数。qfq 复权因子恒 >= 1（送转/分红只会摊薄），
+# 所以"比值小"是可靠证据、"比值大"不是：比值 30 既可能是手(因子 0.3，不可能)，
+# 也可能是深度复权的股(因子 30)。因此只把"比值小"当作可靠锚点。
+VOLUME_UNIT_SHARE_MAX_RATIO = 5.0
+# 帧内找不到任何可靠"股"锚点时，才允许低置信度判为"手"，并且必须记 WARNING。
+# 门槛卡在"整段中位比值"落在 [50, 500]：手 + 复权因子 1~5 才会长这样；
+# 复权因子 10~40 的"股"数据中位比值只有 10~40，落不进来，因而不会被误判 ×100。
+VOLUME_UNIT_LOT_MIN_RATIO = 50.0
+VOLUME_UNIT_LOT_MAX_RATIO = 500.0
+# 1 手 = 100 股 -> 不复权成交均价(amount/volume)在单位切换处出现 10^2 的台阶
+VOLUME_UNIT_STEP_LOG10 = 2.0
+# 台阶识别容差：除权跳空至多数倍(log10 <= 0.7)、涨跌停至多 30%，都落在 [1.3, 2.7] 之外
+VOLUME_UNIT_STEP_TOLERANCE = 0.7
+FRAME_CACHE_MAX_ENTRIES_DEFAULT = 1024
+FRAME_CACHE_EVICTION_DEFAULT = "lru"  # 支持 lru / fifo
+ADJUST_NOTE = (
+    "qfq 前复权价：除权除息日相邻两日价格比值不等于交易所真实涨跌幅，"
+    "涨跌停判定应以不复权 prev_close（除权参考价）为准；"
+    "qfq 以下载日为基准动态重算，历史价格随数据刷新变化。"
+)
 NORMALIZED_NUMERIC_COLUMNS = [
     "open",
     "high",
@@ -135,7 +246,12 @@ class PoolDataFetchError(RuntimeError):
         )
 
 class DataManager:
-    def __init__(self, cache_dir="/Users/USER/quant_data_lake"):
+    def __init__(
+        self,
+        cache_dir="/Users/USER/projects/quant_data_lake",
+        frame_cache_max_entries: Optional[int] = None,
+        frame_cache_eviction: Optional[str] = None,
+    ):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.etf_cache_dir = self.cache_dir / "etf"
@@ -146,7 +262,9 @@ class DataManager:
         self._local_codes_cache_ts = {}
         self._latest_market_cache = None
         self._latest_market_cache_ts = 0.0
-        self._frame_cache = {}
+        # 帧缓存返回共享只读帧：所有对外路径必须经 _filter_by_range 等复制后再交给调用方，
+        # 任何调用方不得原地修改 _frame_cache 中的对象。
+        self._frame_cache = OrderedDict()
         self._cache_window_cache = {}
         self._stock_name_cache = {}
         self._symbol_selection_cache = {}
@@ -156,13 +274,33 @@ class DataManager:
         self._frame_cache_lock = threading.Lock()
         self._cache_write_locks = {}
         self._cache_write_locks_lock = threading.Lock()
-        self._frame_cache_max_entries = 1024
+        if frame_cache_max_entries is None:
+            frame_cache_max_entries = int(
+                os.environ.get("QUANT_FRAME_CACHE_MAX_ENTRIES", str(FRAME_CACHE_MAX_ENTRIES_DEFAULT))
+            )
+        self._frame_cache_max_entries = max(1, int(frame_cache_max_entries))
+        eviction = (
+            frame_cache_eviction
+            or os.environ.get("QUANT_FRAME_CACHE_EVICTION", FRAME_CACHE_EVICTION_DEFAULT)
+        ).strip().lower()
+        if eviction not in ("lru", "fifo"):
+            eviction = FRAME_CACHE_EVICTION_DEFAULT
+        self._frame_cache_eviction = eviction
         self.api_url = os.environ.get("DATA_LAKE_API_URL")
-        # Explicitly disable proxy for this process to avoid AKShare ProxyError
-        os.environ['no_proxy'] = '*'
-        os.environ['http_proxy'] = ''
-        os.environ['https_proxy'] = ''
-        os.environ['all_proxy'] = ''
+
+    def _frame_cache_touch_locked(self, cache_key):
+        # LRU 语义下命中即移动到队尾；FIFO 保持插入序，淘汰始终从队首开始
+        if self._frame_cache_eviction == "lru":
+            try:
+                self._frame_cache.move_to_end(cache_key)
+            except KeyError:
+                pass
+
+    def _frame_cache_store_locked(self, cache_key, value):
+        self._frame_cache.pop(cache_key, None)
+        while len(self._frame_cache) >= self._frame_cache_max_entries:
+            self._frame_cache.popitem(last=False)
+        self._frame_cache[cache_key] = value
 
     def get_market_status(self):
         """
@@ -237,7 +375,214 @@ class DataManager:
         symbol = self._normalize_symbol(symbol)
         return "sz" if symbol.startswith("159") else "sh"
 
-    def _normalize_market_frame(self, symbol, df):
+    def _volume_unit_scale_from_source(self, source):
+        """把数据源/缓存单位标注解析为"换算到股"的倍数；无法解析时返回 None。"""
+        if source is None:
+            return None
+        key = str(source).strip().upper()
+        if not key:
+            return None
+        key = VOLUME_UNIT_HINT_ALIASES.get(key, key)
+        return VOLUME_SOURCE_EXPECTED_SCALE.get(key)
+
+    def _volume_unit_hint_from_frame(self, frame):
+        """从缓存帧自带的单位标注列里取出单一标注；缺失/混标时返回 None。
+
+        只读 volume_unit / volume_source 这类"单位语义"列：读取路径会把已经归一化为
+        "股"的帧写回磁盘，通用 provenance 列（source/data_source）描述的是数据来源而不是
+        盘上存的单位，直接拿来换算会在"已归一化但标注仍是 AKSHARE"时造成二次 ×100。
+        """
+        if frame is None or not hasattr(frame, "columns") or frame.empty:
+            return None
+        for column in VOLUME_UNIT_HINT_COLUMNS:
+            if column not in frame.columns:
+                continue
+            values = frame[column].dropna().astype(str).str.strip()
+            values = values[~values.str.upper().isin(("", "NAN", "NONE", "UNKNOWN"))]
+            unique = pd.unique(values)
+            if len(unique) != 1:
+                continue
+            if self._volume_unit_scale_from_source(unique[0]) is not None:
+                return str(unique[0])
+        return None
+
+    def _apply_volume_unit_normalization(self, symbol, normalized, source, group_column=None):
+        """把 volume 列统一换算为"股"。
+
+        判别优先级（顺序不可颠倒）：
+
+        1. **数据源/缓存单位标注优先**。source 能解析出明确单位时整帧按标注换算，
+           amount/(close*volume) 比值只用来记 WARNING，绝不反过来覆盖标注。
+        2. 无标注时才启用兜底启发式，且判据必须与复权无关：
+           - amount 与 volume 都是不复权口径，故 amount/volume 是**不复权成交均价**。
+             它随时间连续（除权跳空至多数倍），只有单位在"股/手"之间切换才会出现
+             ~100 倍台阶。据此把帧切成若干"单位一致段"，得到段间的相对单位指数差。
+           - 绝对锚点用 amount/(close*volume)：该比值 ≈ qfq 复权因子 × 单位倍数，
+             而复权因子恒 >= 1（送转/分红只会摊薄），所以"比值小"是可靠证据、
+             "比值大"不是。比值 <= VOLUME_UNIT_SHARE_MAX_RATIO 的行可靠判为"股"，
+             再沿段间指数差把结论传播到全帧（qfq 基准日在帧尾，因子恒为 1，
+             全历史帧的帧尾必然提供这样的锚点）。
+        3. 判不出来时**记 WARNING 并保持原样**，绝不静默 ×100——
+           静默的百倍污染比拒绝转换危险得多。
+
+        已修缺陷：旧实现用"比值 >= 10 判手"且优先级高于源标注。因为 amount 不复权、
+        close 是 qfq，比值 ≈ 复权因子，凡复权因子 >= 10 的长历史高送转标的都会被
+        误判成"手"并 ×100，造成静默的百倍数据污染（直接毒化量比因子与成交量约束）。
+        """
+        if normalized.empty:
+            return normalized
+        for column in ("close", "volume", "amount"):
+            if column not in normalized.columns:
+                return normalized
+
+        close = pd.to_numeric(normalized["close"], errors="coerce")
+        volume = pd.to_numeric(normalized["volume"], errors="coerce")
+        amount = pd.to_numeric(normalized["amount"], errors="coerce")
+        ratio = (amount / (close * volume).replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        ratio_valid = ratio.notna() & (amount > 0) & (volume > 0) & (close > 0)
+
+        expected_scale = self._volume_unit_scale_from_source(source)
+        if expected_scale is not None:
+            self._warn_volume_unit_tag_conflict(symbol, source, expected_scale, ratio[ratio_valid])
+            if float(expected_scale) != 1.0:
+                normalized["volume"] = volume * float(expected_scale)
+            return normalized
+
+        return self._apply_volume_unit_fallback(
+            symbol, normalized, close, volume, amount, ratio, ratio_valid, group_column
+        )
+
+    def _warn_volume_unit_tag_conflict(self, symbol, source, expected_scale, observed_ratio):
+        """源标注仍然生效，但比值明显指向另一种单位时留下 WARNING（只告警，不覆盖）。"""
+        if observed_ratio.empty:
+            return
+        median_ratio = float(observed_ratio.median())
+        if median_ratio <= VOLUME_UNIT_SHARE_MAX_RATIO:
+            implied_scale = 1.0
+        elif median_ratio >= VOLUME_UNIT_LOT_MIN_RATIO:
+            implied_scale = VOLUME_LOT_SIZE
+        else:
+            implied_scale = None
+        if implied_scale is None or implied_scale == float(expected_scale):
+            return
+        logger.warning(
+            f"[{symbol}] 成交量单位校验与数据源 {source} 标注不一致："
+            f"标注单位={'手' if float(expected_scale) == VOLUME_LOT_SIZE else '股'}，"
+            f"amount/(close*volume) 中位数={median_ratio:.4g} 指向"
+            f"{'手' if implied_scale == VOLUME_LOT_SIZE else '股'}；"
+            f"以数据源标注为准（比值受 qfq 复权因子干扰，不能反过来覆盖标注），请核查上游数据"
+        )
+
+    def _apply_volume_unit_fallback(
+        self, symbol, normalized, close, volume, amount, ratio, ratio_valid, group_column
+    ):
+        """无源标注时的兜底判别（判据与复权无关，判不准就告警且不换算）。"""
+        path_valid = amount.notna() & volume.notna() & (amount > 0) & (volume > 0)
+        if not path_valid.any():
+            return normalized
+
+        # 快路径：全部可判别行的比值都落在"股"的可靠区间 -> 整帧本来就是股，无需换算。
+        # 数据湖里绝大多数文件走这条路径，避免为它们付出分段传播的开销。
+        if bool((path_valid & ~ratio_valid).sum() == 0) and bool(
+            (ratio[ratio_valid] <= VOLUME_UNIT_SHARE_MAX_RATIO).all()
+        ):
+            return normalized
+
+        if group_column and group_column in normalized.columns:
+            groups = normalized[group_column].astype(str)
+        else:
+            groups = pd.Series("_", index=normalized.index, dtype=object)
+
+        index = normalized.index[path_valid]
+        grp = groups.loc[index]
+        # 不复权成交均价：amount 与 volume 同为不复权口径，该价格路径完全不受复权影响
+        log_price = np.log10((amount.loc[index] / volume.loc[index]).astype(float))
+        delta = log_price.diff()
+        is_step = grp.eq(grp.shift()) & (
+            (delta.abs() - VOLUME_UNIT_STEP_LOG10).abs() <= VOLUME_UNIT_STEP_TOLERANCE
+        )
+        step = pd.Series(np.where(is_step, np.sign(delta.fillna(0.0)), 0.0), index=index)
+        offset = step.groupby(grp, sort=False).cumsum()
+
+        row_ratio = ratio.loc[index]
+        judgeable = ratio_valid.loc[index]
+        share_like = judgeable & (row_ratio <= VOLUME_UNIT_SHARE_MAX_RATIO)
+        lot_like = judgeable & (row_ratio >= VOLUME_UNIT_LOT_MIN_RATIO)
+
+        # base = 让"可靠锚点行"的绝对单位指数落到 0(股)/1(手) 所需的整体平移量
+        base = (-offset).where(share_like).groupby(grp, sort=False).median().round()
+        # 没有可靠"股"锚点时的低置信度兜底：只有整段中位比值落在"手且复权因子 1~5"的
+        # 窄区间才敢猜"手"。深度复权的"股"数据中位比值是 10~40，落不进来 -> 不会被 ×100。
+        group_median_ratio = row_ratio.where(judgeable).groupby(grp, sort=False).median()
+        guessable = (group_median_ratio >= VOLUME_UNIT_LOT_MIN_RATIO) & (
+            group_median_ratio <= VOLUME_UNIT_LOT_MAX_RATIO
+        )
+        guessed = (1.0 - offset).where(lot_like).groupby(grp, sort=False).median().round()
+        guessed = guessed.where(guessable.reindex(guessed.index, fill_value=False))
+        low_confidence = base.isna() & guessed.notna()
+        base = base.fillna(guessed)
+
+        exponent = offset + grp.map(base)
+        resolved = exponent.isin([0.0, 1.0])
+        # 单位指数只可能是 0(股) 或 1(手)；出现其它值说明分段传播自相矛盾，按"判不准"处理
+        row_scale = pd.Series(1.0, index=index, dtype=float)
+        row_scale[resolved & (exponent == 1.0)] = VOLUME_LOT_SIZE
+
+        # 无法判别的行（amount/volume 缺失）随本组已判定行的多数走
+        scale = pd.Series(np.nan, index=normalized.index, dtype=float)
+        scale.loc[index] = row_scale.where(resolved)
+        dominant = exponent.where(resolved).groupby(grp, sort=False).median().round()
+        dominant = dominant.where(dominant.isin([0.0, 1.0]))
+        fill = groups.map(dominant).map({0.0: 1.0, 1.0: VOLUME_LOT_SIZE})
+        scale = scale.fillna(pd.to_numeric(fill, errors="coerce")).fillna(1.0)
+
+        self._log_volume_unit_fallback(
+            symbol, grp, ratio, ratio_valid, base, low_confidence, resolved
+        )
+
+        if (scale != 1.0).any():
+            normalized["volume"] = volume * scale
+        return normalized
+
+    def _log_volume_unit_fallback(self, symbol, grp, ratio, ratio_valid, base, low_confidence, resolved):
+        """兜底判别的可观测性：判不准 / 低置信度 / 段间矛盾都必须留痕，不允许静默。"""
+        def _describe(keys):
+            keys = [str(key) for key in keys]
+            head = "、".join(keys[:5])
+            return head if len(keys) <= 5 else f"{head} 等 {len(keys)} 个"
+
+        median_ratio = float(ratio[ratio_valid].median()) if ratio_valid.any() else float("nan")
+        unresolved_groups = base.index[base.isna()].tolist()
+        if unresolved_groups:
+            logger.warning(
+                f"[{symbol}] 成交量单位无法判定（无数据源标注，且帧内找不到 "
+                f"amount/(close*volume) <= {VOLUME_UNIT_SHARE_MAX_RATIO:g} 的可靠'股'锚点，"
+                f"中位比值={median_ratio:.4g}）：{_describe(unresolved_groups)} 保持原样不换算。"
+                f"注意该比值 ≈ qfq 复权因子 × 单位倍数，深度复权标的会把比值抬高，"
+                f"此时按比值 ×100 会造成百倍数据污染，故拒绝换算"
+            )
+        guess_groups = low_confidence.index[low_confidence].tolist()
+        if guess_groups:
+            logger.warning(
+                f"[{symbol}] 成交量单位低置信度判为'手'（无数据源标注，帧内没有可靠'股'锚点，"
+                f"仅凭比值 >= {VOLUME_UNIT_LOT_MIN_RATIO:g} 推断，中位比值={median_ratio:.4g}）："
+                f"{_describe(guess_groups)} 已按 ×{VOLUME_LOT_SIZE:g} 换算，请补齐数据源标注以消除歧义"
+            )
+        conflict = int((~resolved).sum())
+        if conflict:
+            conflict_groups = pd.unique(grp[~resolved]).tolist()
+            logger.warning(
+                f"[{symbol}] 成交量单位分段传播出现矛盾：{conflict} 行的单位指数不在 0/1 内"
+                f"（{_describe(conflict_groups)}），这些行保持原样不换算"
+            )
+
+    def _stamp_frame_attrs(self, normalized):
+        normalized.attrs["adjust"] = "qfq"
+        normalized.attrs["adjust_note"] = ADJUST_NOTE
+        normalized.attrs["volume_unit"] = "share"
+        return normalized
+
+    def _normalize_market_frame(self, symbol, df, source=None):
         if df is None or df.empty:
             return pd.DataFrame()
 
@@ -280,6 +625,9 @@ class DataManager:
                 normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
 
         is_etf = self.is_etf_symbol(symbol)
+        # ST 来源标记：仅 Baostock 提供按日 isST；缺失补 0 时必须让引擎知道 is_st==0 可能是数据缺失
+        had_is_st_column = "is_st" in normalized.columns
+        had_st_source_column = "st_source" in normalized.columns
         defaults = {
             "open": np.nan,
             "high": np.nan,
@@ -318,7 +666,17 @@ class DataManager:
         normalized.loc[normalized["stock_name"] == "", "stock_name"] = PRETTY_NAMES.get(symbol, symbol)
         normalized["tradestatus"] = normalized["tradestatus"].fillna("1").astype(str)
         normalized["is_st"] = pd.to_numeric(normalized["is_st"], errors="coerce").fillna(0).astype(int)
+        if had_st_source_column:
+            normalized["st_source"] = (
+                normalized["st_source"].fillna("unknown").astype(str).replace({"": "unknown", "nan": "unknown"})
+            )
+        elif had_is_st_column:
+            # 仅 Baostock 提供真实按日 ST 状态；存量缓存里的 is_st 无法回溯来源，标 unknown
+            normalized["st_source"] = "baostock_daily" if source == "BAOSTOCK" else "unknown"
+        else:
+            normalized["st_source"] = "missing"
         normalized = normalized.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+        normalized = self._apply_volume_unit_normalization(symbol, normalized, source)
 
         inferred_prev_close = normalized["close"] / (1.0 + normalized["pct_chg"] / 100.0)
         normalized["prev_close"] = normalized["prev_close"].fillna(normalized["close"].shift(1)).fillna(inferred_prev_close)
@@ -362,12 +720,13 @@ class DataManager:
             "intraday_ret",
             "open_gap",
             "is_st",
+            "st_source",
             "stock_code",
             "stock_name",
         ]
         extra_columns = [column for column in normalized.columns if column not in base_columns]
         normalized = normalized[base_columns + extra_columns]
-        return normalized
+        return self._stamp_frame_attrs(normalized)
 
     def _read_remote_cached_frame(self, symbol):
         import urllib.request
@@ -379,29 +738,35 @@ class DataManager:
             with self._frame_cache_lock:
                 cached = self._frame_cache.get(cache_key)
                 if cached is not None and time.monotonic() - cached[0] < 300:
-                    return cached[1].copy()
+                    self._frame_cache_touch_locked(cache_key)
+                    return cached[1]
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=10) as response:
                 if response.status != 200:
                     return pd.DataFrame()
                 data = response.read()
                 frame = pd.read_parquet(io.BytesIO(data))
-                frame = self._normalize_market_frame(symbol, frame)
-                
+                # 缓存自带单位/来源标注时必须传下去：源标注优先于比值启发式
+                frame = self._normalize_market_frame(
+                    symbol, frame, source=self._volume_unit_hint_from_frame(frame)
+                )
+
             with self._frame_cache_lock:
-                if len(self._frame_cache) >= self._frame_cache_max_entries:
-                    oldest_key = next(iter(self._frame_cache))
-                    self._frame_cache.pop(oldest_key, None)
-                self._frame_cache[cache_key] = (time.monotonic(), frame)
+                self._frame_cache_store_locked(cache_key, (time.monotonic(), frame))
                 start = str(frame["date"].min()) if not frame.empty and "date" in frame.columns else None
                 end = str(frame["date"].max()) if not frame.empty and "date" in frame.columns else None
                 self._cache_window_cache[cache_key] = (time.monotonic(), start, end)
-            return frame.copy()
+            return frame
         except Exception as e:
             logger.warning(f"[{symbol}] Remote cache read failed: {e}")
             return pd.DataFrame()
 
     def _read_cached_frame(self, symbol):
+        """读取单标的缓存帧。
+
+        返回的是缓存中的共享帧（不复制）：调用方只允许读取，需要修改时必须自行 copy。
+        模块内所有对外出口（get_stock_data 等）均经 _filter_by_range 复制后再返回。
+        """
         if self.api_url:
             return self._read_remote_cached_frame(symbol)
         cache_path = self.get_cache_path(symbol)
@@ -415,23 +780,26 @@ class DataManager:
         with self._frame_cache_lock:
             cached = self._frame_cache.get(cache_key)
             if cached is not None and cached[0] == cache_mtime:
-                return cached[1].copy()
+                self._frame_cache_touch_locked(cache_key)
+                return cached[1]
         try:
-            frame = self._normalize_market_frame(symbol, pd.read_parquet(cache_path))
+            raw_frame = pd.read_parquet(cache_path)
+            # 回测主路径：缓存文件若自带单位/来源标注就传下去（源标注优先于比值启发式）。
+            # 当前数据湖的存量 parquet 两者皆无，此时走的是与复权无关的兜底判别。
+            frame = self._normalize_market_frame(
+                symbol, raw_frame, source=self._volume_unit_hint_from_frame(raw_frame)
+            )
         except Exception as e:
             logger.warning(f"[{symbol}] Cache read failed: {e}")
             return pd.DataFrame()
         with self._frame_cache_lock:
-            if len(self._frame_cache) >= self._frame_cache_max_entries:
-                oldest_key = next(iter(self._frame_cache))
-                self._frame_cache.pop(oldest_key, None)
-            self._frame_cache[cache_key] = (cache_mtime, frame)
+            self._frame_cache_store_locked(cache_key, (cache_mtime, frame))
             self._cache_window_cache[cache_key] = (
                 cache_mtime,
                 frame["date"].min() if not frame.empty and "date" in frame.columns else None,
                 frame["date"].max() if not frame.empty and "date" in frame.columns else None,
             )
-        return frame.copy()
+        return frame
 
     def warm_cached_frames(self, symbols, limit=None):
         warmed = 0
@@ -658,6 +1026,8 @@ class DataManager:
             if column in normalized.columns:
                 normalized[column] = pd.to_numeric(normalized[column], errors="coerce")
 
+        had_is_st_column = "is_st" in normalized.columns
+        had_st_source_column = "st_source" in normalized.columns
         defaults = {
             "stock_name": "",
             "open": np.nan,
@@ -702,6 +1072,19 @@ class DataManager:
             )
         normalized["tradestatus"] = normalized["tradestatus"].fillna("1").astype(str)
         normalized["is_st"] = pd.to_numeric(normalized["is_st"], errors="coerce").fillna(0).astype(int)
+        if had_st_source_column:
+            normalized["st_source"] = (
+                normalized["st_source"].fillna("unknown").astype(str).replace({"": "unknown", "nan": "unknown"})
+            )
+        elif had_is_st_column:
+            # 合并年度文件来源不可回溯，is_st 可能是真实状态也可能是历史补 0
+            normalized["st_source"] = "unknown"
+        else:
+            normalized["st_source"] = "missing"
+        # 池帧是多标的堆叠：单位判别依赖"单标的不复权价路径"，必须按 stock_code 分组
+        normalized = self._apply_volume_unit_normalization(
+            "POOL", normalized, self._volume_unit_hint_from_frame(normalized), group_column="stock_code"
+        )
 
         grouped = normalized.groupby("stock_code", group_keys=False)
         inferred_prev_close = normalized["close"] / (1.0 + normalized["pct_chg"] / 100.0)
@@ -720,7 +1103,7 @@ class DataManager:
         )
         normalized["turnover_rate"] = normalized["turnover_rate"].fillna(normalized["turn"])
         normalized["turn"] = normalized["turn"].fillna(normalized["turnover_rate"])
-        return normalized
+        return self._stamp_frame_attrs(normalized)
 
     def _dedupe_normalized_symbols(self, symbols) -> List[str]:
         seen = set()
@@ -802,7 +1185,7 @@ class DataManager:
             if getattr(self, "api_url", None):
                 cache_key = f"remote_api_{symbol}"
                 with self._frame_cache_lock:
-                    self._frame_cache[cache_key] = (time.monotonic(), merged)
+                    self._frame_cache_store_locked(cache_key, (time.monotonic(), merged))
                     self._cache_window_cache.pop(cache_key, None)
                 return merged
 
@@ -854,8 +1237,9 @@ class DataManager:
         last_error = None
         for source, fetcher in fetchers:
             try:
-                raw_df = fetcher()
-                normalized = self._normalize_market_frame(symbol, raw_df)
+                with _no_proxy_environment():
+                    raw_df = fetcher()
+                normalized = self._normalize_market_frame(symbol, raw_df, source=source)
                 filtered = self._filter_by_range(normalized, start_date, end_date)
                 if not filtered.empty:
                     return filtered, source
@@ -872,7 +1256,7 @@ class DataManager:
 
         bs = _get_baostock()
         symbol = self._normalize_symbol(symbol)
-        with self._baostock_lock:
+        with self._baostock_lock, _no_proxy_environment():
             login_result = bs.login()
             if login_result.error_code != "0":
                 logger.warning(f"[{symbol}] Baostock login failed: {login_result.error_msg}")
@@ -903,7 +1287,7 @@ class DataManager:
                     stock_name = PRETTY_NAMES.get(symbol, symbol)
                 new_df["stock_code"] = symbol
                 new_df["stock_name"] = stock_name
-                normalized = self._normalize_market_frame(symbol, new_df)
+                normalized = self._normalize_market_frame(symbol, new_df, source="BAOSTOCK")
                 return self._filter_by_range(normalized, start_date, end_date), "BAOSTOCK"
             except Exception as e:
                 logger.warning(f"[{symbol}] Baostock Error: {e}")
@@ -1406,8 +1790,8 @@ class DataManager:
         df['pb'] = 2.0 if not is_etf else 0
         df['stock_code'] = symbol
         df['stock_name'] = PRETTY_NAMES.get(symbol, f"模拟_{symbol}")
-        
-        return self._normalize_market_frame(symbol, df.drop(columns=['dt']))
+
+        return self._normalize_market_frame(symbol, df.drop(columns=['dt']), source="MOCK")
 
     def get_stock_data(self, symbol, start_date, end_date, auto_login=True, allow_mock=False, allow_late_start: bool = False):
         """
@@ -1618,7 +2002,8 @@ class DataManager:
         try:
             now = time.monotonic()
             ak = _get_akshare()
-            df = ak.stock_zh_a_spot_em()
+            with _no_proxy_environment():
+                df = ak.stock_zh_a_spot_em()
             result = df.nlargest(limit, '涨跌幅').to_dict(orient='records')
             self._latest_market_cache = result
             self._latest_market_cache_ts = now

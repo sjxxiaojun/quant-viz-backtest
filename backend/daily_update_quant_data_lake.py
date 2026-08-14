@@ -15,8 +15,8 @@ from pathlib import Path
 import pandas as pd
 
 
-BACKEND_DIR = Path("/Users/USER/quant-viz-backtest/backend")
-ROOT_DIR = Path("/Users/USER/quant_data_lake")
+BACKEND_DIR = Path("/Users/USER/projects/quant-viz-backtest/backend")
+ROOT_DIR = Path("/Users/USER/projects/quant_data_lake")
 DATA_CACHE_DIR = BACKEND_DIR / "data_cache"
 START_DATE = "2022-01-01"
 
@@ -70,6 +70,9 @@ def standardize_frame(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     for col in ("tradestatus", "is_st", "stock_code", "stock_name"):
         if col in frame.columns:
             frame[col] = frame[col].astype("string")
+    for col in ("open", "high", "low", "close", "volume", "amount", "pct_chg", "turn", "pe", "pb", "ps", "pcf"):
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
     return frame
 
 

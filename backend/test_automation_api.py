@@ -5,7 +5,8 @@ from ai_automation import AIAutomationService
 from automation_store import AutomationStore
 
 
-client = TestClient(main.app)
+# 自动化接口按对端地址做本机白名单（默认 127.0.0.1/::1），测试端模拟本机来源。
+client = TestClient(main.app, client=("127.0.0.1", 50000))
 
 
 def test_automation_status_endpoint_uses_orchestrator(monkeypatch):

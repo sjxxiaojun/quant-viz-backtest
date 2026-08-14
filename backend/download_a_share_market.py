@@ -14,8 +14,8 @@ import baostock as bs
 import pandas as pd
 
 
-CACHE_DIR = Path("/Users/USER/quant_data_lake")
-LOG_DIR = Path("/Users/USER/quant-viz-backtest/backend/data_cache")
+CACHE_DIR = Path("/Users/USER/projects/quant_data_lake")
+LOG_DIR = Path("/Users/USER/projects/quant-viz-backtest/backend/data_cache")
 STANDARD_COLUMNS = [
     "date",
     "open",

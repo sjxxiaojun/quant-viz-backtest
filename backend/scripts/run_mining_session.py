@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 import pandas as pd
@@ -5,6 +6,11 @@ import logging
 
 # Add project root to sys.path
 sys.path.append(str(Path(__file__).parent.parent))
+
+# 数据湖默认位于项目根目录的同级目录，可用 QUANT_DATA_LAKE_DIR 覆盖。
+DATA_LAKE_DIR = Path(
+    os.getenv("QUANT_DATA_LAKE_DIR", str(Path(__file__).resolve().parents[2].parent / "quant_data_lake"))
+)
 
 from data_manager import DataManager
 from alpha_factory import AlphaFactory, alpha_momentum_120, alpha_reversal_short, alpha_volume_std_20, alpha_price_volume_corr, alpha_range_pos
@@ -26,7 +32,7 @@ def run_mining_session():
     
     # 2. Load Consolidated Data (Sample: 2025)
     logger.info("Loading 2025 market data...")
-    data_path = Path("/Users/USER/quant_data_lake/consolidated/market_2025.parquet")
+    data_path = DATA_LAKE_DIR / "consolidated" / "market_2025.parquet"
     if not data_path.exists():
         logger.error("Consolidated data not found. Run consolidate_lake.py first.")
         return

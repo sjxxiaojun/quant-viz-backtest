@@ -1,6 +1,6 @@
+from bisect import bisect_right
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -27,11 +27,20 @@ class BaseHoldingPolicy:
         self.weight_mode = weight_mode
         self.max_hold_days = max_hold_days
         self.holdings: Dict[str, HoldingInfo] = {}
+        # 实际观察到的交易日序列（策略每个交易日调用一次，日期单调递增）。
+        self._observed_dates: List[str] = []
+
+    def _register_trading_date(self, date: str) -> None:
+        if not self._observed_dates or self._observed_dates[-1] < date:
+            self._observed_dates.append(date)
 
     def _days_between(self, d1_str: str, d2_str: str) -> int:
-        d1 = datetime.strptime(d1_str, "%Y-%m-%d")
-        d2 = datetime.strptime(d2_str, "%Y-%m-%d")
-        return len(pd.bdate_range(d1, d2)) - 1
+        # 持仓 bar 数按实际出现的交易日行数计（(d1, d2] 区间内观察到的日期数），
+        # 而非 bdate_range：后者会把春节/国庆等 A股节假日计入，导致
+        # max_hold_days 提前触发超时退出。
+        left = bisect_right(self._observed_dates, d1_str)
+        right = bisect_right(self._observed_dates, d2_str)
+        return max(0, right - left)
 
     def _is_expired(self, holding: HoldingInfo, date: str) -> bool:
         if self.max_hold_days is None:
@@ -39,6 +48,7 @@ class BaseHoldingPolicy:
         return holding.holding_bars >= self.max_hold_days
 
     def _advance_holding_bars(self, date: str) -> None:
+        self._register_trading_date(date)
         for holding in self.holdings.values():
             if holding.last_seen_date == date:
                 continue

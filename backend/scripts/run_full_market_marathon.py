@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 import pandas as pd
@@ -9,9 +10,14 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from data_manager import DataManager
 from alpha_factory import (
-    AlphaFactory, alpha_momentum_120, alpha_reversal_short, 
+    AlphaFactory, alpha_momentum_120, alpha_reversal_short,
     alpha_volume_std_20, alpha_price_volume_corr, alpha_range_pos,
     alpha_trend_macd_diff, alpha_trend_breakout_60, alpha_volatility_adj_mom_20
+)
+
+# 数据湖默认位于项目根目录的同级目录，可用 QUANT_DATA_LAKE_DIR 覆盖。
+DATA_LAKE_DIR = Path(
+    os.getenv("QUANT_DATA_LAKE_DIR", str(Path(__file__).resolve().parents[2].parent / "quant_data_lake"))
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -36,7 +42,7 @@ def run_full_market_marathon():
     
     # 2. Load Consolidated Data (2022 to 2026)
     logger.info("🚀 Starting Full Market Marathon (2022-2026)...")
-    consolidated_dir = Path("/Users/USER/quant_data_lake/consolidated")
+    consolidated_dir = DATA_LAKE_DIR / "consolidated"
     
     years = [2022, 2023, 2024, 2025, 2026]
     dfs = []

@@ -214,3 +214,62 @@ def test_range_coverage_uses_market_calendar_for_exchange_holidays(tmp_path):
     assert summary["ok"] is True
     assert summary["coverage_ratio"] == 1.0
     assert summary["max_consecutive_missing_business_days"] == 0
+
+
+def test_consolidated_lake_preserves_valuation_and_st_columns(tmp_path):
+    from scripts.consolidate_lake import consolidate_lake
+
+    symbols = _symbols(51)
+    lake_dir = tmp_path / "lake"
+    lake_dir.mkdir(parents=True)
+    cache_dir = tmp_path / "cache"
+
+    rows = []
+    for symbol in symbols:
+        for date in JAN_2024_BUSINESS_DATES:
+            rows.append(
+                {
+                    "date": date,
+                    "stock_code": symbol,
+                    "stock_name": f"Stock_{symbol}",
+                    "open": 10.0,
+                    "high": 11.0,
+                    "low": 9.0,
+                    "close": 10.5,
+                    "volume": 1000.0,
+                    "amount": 10500.0,
+                    "pct_chg": 0.5,
+                    "turnover_rate": 1.5,
+                    "turn": 1.5,
+                    "tradestatus": "1",
+                    "pe": 15.2,
+                    "pb": 2.1,
+                    "ps": 3.4,
+                    "pcf": 8.7,
+                    "is_st": 0,
+                }
+            )
+
+    df_lake = pd.DataFrame(rows)
+    for symbol in symbols:
+        sub_df = df_lake[df_lake["stock_code"] == symbol]
+        sub_df.to_parquet(lake_dir / f"{symbol}_full_history.parquet", index=False)
+
+    consolidated_dir = cache_dir / "consolidated"
+    consolidate_lake(lake_dir=str(lake_dir), output_dir=str(consolidated_dir))
+
+    market_file = consolidated_dir / "market_2024.parquet"
+    assert market_file.exists()
+    c_df = pd.read_parquet(market_file)
+    for col in ["pe", "pb", "ps", "pcf", "is_st", "tradestatus"]:
+        assert col in c_df.columns
+
+    manager = DataManager(cache_dir=str(cache_dir))
+    pool_df, sources = manager.get_stock_pool_data(symbols, "2024-01-01", "2024-01-31", allow_mock=False)
+
+    assert set(pool_df["stock_code"].unique()) == set(symbols)
+    assert pool_df["pe"].iloc[0] == 15.2
+    assert pool_df["pb"].iloc[0] == 2.1
+    assert pool_df["is_st"].iloc[0] == 0
+    assert pool_df["tradestatus"].iloc[0] == "1"
+

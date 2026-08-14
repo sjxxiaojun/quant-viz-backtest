@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import numpy as np
 import inspect
@@ -5,30 +6,133 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass
 
+logger = logging.getLogger(__name__)
+
+# A股印花税（仅卖出计征）：财政部、税务总局公告 2023 年第 39 号，
+# 自 2023-08-28 起证券交易印花税税率由 0.1% 减半至 0.05%。
+STAMP_TAX_CUT_DATE = "2023-08-28"
+STAMP_TAX_RATE_CURRENT = 0.0005   # 2023-08-28（含）之后
+STAMP_TAX_RATE_LEGACY = 0.001     # 2023-08-28 之前
+
+# 沪市过户费：按成交金额 0.001% 双向收取（中国结算 2022-04-29 起标准）；
+# 深市/北交所不单独收取过户费。
+SH_TRANSFER_FEE_RATE = 0.00001
+
+# 《中华人民共和国印花税法》（2022-07-01 施行）规定：证券交易印花税的征税范围是
+# 「转让在依法设立的证券交易所上市交易的股票和以股票为基础发行的存托凭证」，
+# 且对出让方单边计征。基金份额（ETF / LOF / 封闭式基金）与债券（含可转债、
+# 可交换债）不在征税范围内，卖出**免征**印花税。
+#
+# 本仓库的 stock_code 统一为不带交易所前后缀的 6 位数字码
+# （见 data_manager._normalize_symbol 与 data_manager.ETF_PREFIXES）。据此判别：
+#   "5" 开头 —— 沪市基金：51/56/58 为 ETF（510/511/512/513/515/516/517/518、
+#               560/561/562/563、588/589），50/52/53/55 为封基/LOF/跨境 ETF；
+#               沪市股票只有 60/68 开头（B 股 900），不存在 5 开头的股票。
+#   "1" 开头 —— 深市基金 15/16/18（159 为 ETF，16x 为 LOF，15x 含分级份额）
+#               与沪深债券 10/11/12/13/14（沪可转债 110/113、深可转债 12x）；
+#               沪深北三市都不存在 1 开头的股票。
+# 其余（沪 60/68、深 00/30、北交所 43/83/87/88/92、B 股 200/900）照章计征。
+STAMP_TAX_EXEMPT_CODE_PREFIXES = ("1", "5")
+
 @dataclass
 class CostModel:
     commission_rate: float = 0.0003
     commission_min: float = 5.0
-    stamp_tax_rate: float = 0.001
+    stamp_tax_rate: float = STAMP_TAX_RATE_CURRENT
     slippage_rate: float = 0.0003 # Reduced to 0.03% (Institutional Grade)
-    use_order_slicing: bool = True 
+    # 订单拆分（algo slicing）对冲击成本的折减是执行假设而非市场规则，
+    # 必须显式开启；折减系数同样显式参数化。
+    use_order_slicing: bool = False
+    order_slicing_slippage_factor: float = 0.5
+    # 尾盘（收盘价）成交滑点：尾盘竞价/扫货时收盘价与实际可得均价偏差
+    # 显著大于日内 VWAP 执行，独立参数化。
+    close_slippage_rate: float = 0.0015
+    # 沪市过户费（买卖双向，仅 6 开头沪市股票）。
+    transfer_fee_rate: float = SH_TRANSFER_FEE_RATE
+    # 显式指定 2023-08-28 之前的印花税率；为 None 时：
+    # - stamp_tax_rate 等于法定现行默认值 0.0005 -> 按法定分段自动取 0.001；
+    # - stamp_tax_rate 为自定义值（含 0）-> 全区间使用该自定义值（向后兼容）。
+    stamp_tax_rate_before_cut: Optional[float] = None
 
-    def calculate_cost_breakdown(self, amount: float, is_sell: bool) -> Dict[str, float]:
+    def _resolve_stamp_tax_rate(self, trade_date: Optional[str]) -> float:
+        if trade_date is not None and str(trade_date)[:10] < STAMP_TAX_CUT_DATE:
+            if self.stamp_tax_rate_before_cut is not None:
+                return self.stamp_tax_rate_before_cut
+            if self.stamp_tax_rate == STAMP_TAX_RATE_CURRENT:
+                return STAMP_TAX_RATE_LEGACY
+        return self.stamp_tax_rate
+
+    @staticmethod
+    def _normalized_code(stock_code: Optional[str]) -> str:
+        """归一化为 6 位纯数字代码；兼容 'sh.600519' / '600519.SH' 等带前后缀写法。
+
+        无法归一化为 6 位数字（如测试里的占位代码 'AAA'）时返回空串，
+        调用方按「非豁免品种」处理，即保持原有的按股票计税行为。
+        """
+        text = str(stock_code or "").strip()
+        if "." in text:
+            digits = [part for part in text.split(".") if part.isdigit()]
+            text = digits[0] if digits else ""
+        return text if len(text) == 6 and text.isdigit() else ""
+
+    @classmethod
+    def is_stamp_tax_exempt(cls, stock_code: Optional[str]) -> bool:
+        """ETF/LOF/基金份额与债券（含可转债）卖出免征证券交易印花税。"""
+        code = cls._normalized_code(stock_code)
+        return bool(code) and code.startswith(STAMP_TAX_EXEMPT_CODE_PREFIXES)
+
+    @classmethod
+    def _is_sh_stock(cls, stock_code: Optional[str]) -> bool:
+        """过户费只对沪市**股票**（60/68 开头，含科创板）双向收取。
+
+        沪市基金/债券（5/1 开头）以及深市、北交所标的都不收过户费，
+        因此这里保持"仅 6 开头"的判定。
+        """
+        return cls._normalized_code(stock_code).startswith("6")
+
+    def calculate_cost_breakdown(
+        self,
+        amount: float,
+        is_sell: bool,
+        trade_date: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        at_close: bool = False,
+    ) -> Dict[str, float]:
         commission = max(amount * self.commission_rate, self.commission_min)
-        stamp_tax = amount * self.stamp_tax_rate if is_sell else 0.0
-        # Sliced execution further reduces impact
-        effective_slippage = self.slippage_rate * 0.5 if self.use_order_slicing else self.slippage_rate
+        # 印花税：仅卖出计征，且 ETF/LOF/基金份额与债券（含可转债）免征。
+        stamp_tax = (
+            amount * self._resolve_stamp_tax_rate(trade_date)
+            if is_sell and not self.is_stamp_tax_exempt(stock_code)
+            else 0.0
+        )
+        transfer_fee = amount * self.transfer_fee_rate if self._is_sh_stock(stock_code) else 0.0
+        base_slippage_rate = self.close_slippage_rate if at_close else self.slippage_rate
+        effective_slippage = (
+            base_slippage_rate * self.order_slicing_slippage_factor
+            if self.use_order_slicing
+            else base_slippage_rate
+        )
         slippage = amount * effective_slippage
-        total = commission + stamp_tax + slippage
+        total = commission + stamp_tax + transfer_fee + slippage
         return {
             "commission": float(commission),
             "stamp_tax": float(stamp_tax),
+            "transfer_fee": float(transfer_fee),
             "slippage": float(slippage),
             "total": float(total),
         }
 
-    def calculate_total_cost(self, amount: float, is_sell: bool) -> float:
-        return self.calculate_cost_breakdown(amount, is_sell)["total"]
+    def calculate_total_cost(
+        self,
+        amount: float,
+        is_sell: bool,
+        trade_date: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        at_close: bool = False,
+    ) -> float:
+        return self.calculate_cost_breakdown(
+            amount, is_sell, trade_date=trade_date, stock_code=stock_code, at_close=at_close
+        )["total"]
 
 @dataclass
 class Position:
@@ -65,10 +169,29 @@ class Portfolio:
 
 class BacktestEngine:
     CLOSED_TRADE_SIDES = {'sell', 'stop_loss', 'take_profit'}
-    # Chinese A-shares have ±10% price limit (or ±20% for certain stocks).
-    # Using 9.5% as a safety buffer to avoid hitting the hard limit boundary
-    # while still allowing valid trades near the limit. Set via constructor for flexibility.
+    # 风险退出（止损/止盈）的两个执行时点：
+    # - OPEN：只用当日开盘价即可判定（跳空破位/跳空达标），与开盘调仓同一时点，
+    #   释放的现金当日开盘可用（与 _rebalance 内部"先卖后买"一致）。
+    # - INTRADAY：需要当日 low/high 才能判定的盘中触价，只有盘中才知道，
+    #   必须排在按开盘价执行的调仓之后，否则会用盘中信息为同日开盘买单融资。
+    RISK_EXIT_PHASE_OPEN = "open"
+    RISK_EXIT_PHASE_INTRADAY = "intraday"
+    # A股主板 ±10% 涨跌幅。9.5% 是"触板"近似阈值：开盘涨跌幅达到该阈值即视为
+    # 无法成交。语义说明：真实市场只有"封板"（一字板/大封单）才完全不可成交，
+    # "触板"（价格摸到涨跌停但盘中有开板）仍可能部分成交；本阈值把触板一律按
+    # 不可成交处理，属于保守近似，可通过构造参数 limit_move_threshold 调整。
     LIMIT_MOVE_THRESHOLD: float = 0.095
+    # 创业板(300/301)/科创板(688/689) ±20%，注册制下含 ST 股同为 ±20%。
+    GEM_STAR_LIMIT_MOVE: float = 0.195
+    # 北交所(43/83/87/88/92) ±30%，含 ST 股同为 ±30%。
+    BSE_LIMIT_MOVE: float = 0.295
+    # 仅主板 ST/*ST 股为 ±5%。
+    ST_MAIN_BOARD_LIMIT_MOVE: float = 0.045
+    # 创业板/科创板新股上市前 5 个交易日不设涨跌幅限制。
+    GEM_STAR_NO_LIMIT_DAYS: int = 5
+    # 主板新股首日按发行价 +44%/-36% 有效申报价范围（近似为不做常规涨跌停拦截）；
+    # 北交所新股首日无涨跌幅限制。
+    OTHER_BOARD_NO_LIMIT_DAYS: int = 1
 
     def __init__(
         self,
@@ -82,6 +205,9 @@ class BacktestEngine:
         max_volume_participation: Optional[float] = 0.10,
         enforce_tradability: bool = True,
         enforce_t1: bool = True,
+        limit_move_threshold: Optional[float] = None,  # 主板涨跌停"触板"近似阈值，None 用类默认 0.095
+        risk_free_rate: float = 0.025,        # 年化无风险利率（Sharpe 用）
+        annualization_factor: int = 252,      # 年化交易日天数
     ):
         self.initial_capital = initial_capital
         self.cost_model = cost_model or CostModel()
@@ -95,6 +221,16 @@ class BacktestEngine:
         self.max_volume_participation = max_volume_participation
         self.enforce_tradability = enforce_tradability
         self.enforce_t1 = enforce_t1
+        self.limit_move_threshold = (
+            limit_move_threshold if limit_move_threshold is not None else self.LIMIT_MOVE_THRESHOLD
+        )
+        self.risk_free_rate = risk_free_rate
+        self.annualization_factor = annualization_factor
+        self._st_name_fallback_warned: Set[str] = set()
+        # 新股无涨跌幅期近似：以数据面板中该代码首次出现日起算交易日序号。
+        self._code_first_date: Dict[str, str] = {}
+        self._global_date_index: Dict[str, int] = {}
+        self._panel_first_date: Optional[str] = None
 
     def _reset_diagnostics(self):
         self.execution_stats = {
@@ -115,20 +251,27 @@ class BacktestEngine:
             "partial_fill_count": 0,
             "t1_sell_block_count": 0,
             "volume_limited_share_count": 0,
+            # 新股无涨跌幅期内跳过涨跌停拦截的次数（单列，便于审计）。
+            "limit_check_skipped_new_stock_count": 0,
+            # 持仓期间无行情数据（停牌或数据缺行）的持仓·日累计数。
+            "stale_position_days": 0,
         }
         self.cost_stats = {
             "commission_total": 0.0,
             "stamp_tax_total": 0.0,
+            "transfer_fee_total": 0.0,
             "slippage_total": 0.0,
             "total_cost": 0.0,
         }
         self.turnover_amount = 0.0
         self.round_trips: List[Dict] = []
         self._open_round_trips: Dict[str, Dict] = {}
+        self._suspended_position_codes: Set[str] = set()
 
     def _record_cost_breakdown(self, breakdown: Dict[str, float]):
         self.cost_stats["commission_total"] += breakdown["commission"]
         self.cost_stats["stamp_tax_total"] += breakdown["stamp_tax"]
+        self.cost_stats["transfer_fee_total"] += breakdown.get("transfer_fee", 0.0)
         self.cost_stats["slippage_total"] += breakdown["slippage"]
         self.cost_stats["total_cost"] += breakdown["total"]
 
@@ -154,6 +297,11 @@ class BacktestEngine:
             stock_row = self._row_for_code(day_data, code)
             if stock_row is not None and pd.notna(stock_row.get(price_field)):
                 pos.market_value = pos.quantity * stock_row[price_field]
+            elif price_field == "close":
+                # 停牌/缺行按最后已知价估值（A股惯例），仅记录诊断计数，
+                # 供 summary 的 suspended_positions_count 使用。
+                self._suspended_position_codes.add(code)
+                self.execution_stats["stale_position_days"] += 1
 
     def _signal_day_data(self, day_data: pd.DataFrame) -> pd.DataFrame:
         if "stock_code" in day_data.index.names:
@@ -173,6 +321,12 @@ class BacktestEngine:
         }
         all_dates = sorted(data_by_date.keys())
         test_dates = [d for d in all_dates if d >= start_date and d <= end_date]
+
+        # 近似上市天数：以该代码在数据面板中的首个日期为"上市日"，交易日序号
+        # 用全局日期序列下标差近似（停牌日会轻微高估序号，可接受）。
+        self._global_date_index = {d: i for i, d in enumerate(all_dates)}
+        self._code_first_date = data.groupby("stock_code")["date"].min().to_dict()
+        self._panel_first_date = all_dates[0] if all_dates else None
         
         if self.execution_mode == "signal_close_to_next_open":
             return self._run_signal_close_to_next_open(data_by_date, signal_func, test_dates)
@@ -188,19 +342,31 @@ class BacktestEngine:
             # close to decide trades that execute at today's open.
             self._mark_positions_to_price(day_data, "open")
 
-            # 2. Individual stop-loss check before rebalance
-            blocked_reentry_codes = self._check_price_risk_exits(date, day_data)
-            
+            # 2. Gap-open risk exits: decidable from today's open price alone,
+            #    so they settle at the open together with the rebalance.
+            blocked_reentry_codes = self._check_price_risk_exits(
+                date, day_data, phase=self.RISK_EXIT_PHASE_OPEN
+            )
+
             # 3. Execute pending signals at today's open.
             if pending_signals is not None:
                 self._rebalance(date, day_data, pending_signals, blocked_reentry_codes)
+
+            # 4. Intraday touch-triggered risk exits run AFTER the open rebalance.
+            #    low/high 只有盘中才知道，若排在前面，止损释放的现金会被拿去支付
+            #    同一天开盘价的买单——现实中不可能（前视偏差）。放在这里之后，
+            #    这笔现金最早只能给次日开盘的买单用。
+            self._check_price_risk_exits(
+                date, day_data, phase=self.RISK_EXIT_PHASE_INTRADAY
+            )
+
             today_trades = self.trades[prev_trade_count:]
 
-            # 4. Mark to close and record the end-of-day portfolio state.
+            # 5. Mark to close and record the end-of-day portfolio state.
             self._mark_positions_to_price(day_data, "close")
             self.portfolio.record_state(date, today_trades)
 
-            # 5. Generate NEW signals for tomorrow.
+            # 6. Generate NEW signals for tomorrow.
             pending_signals = self._invoke_signal_func(signal_func, date, day_data) or {}
             
         return self._generate_report()
@@ -295,24 +461,66 @@ class BacktestEngine:
             if text in {"0", "0.0", "false", "no", "n", ""}:
                 return False
 
+        # 兜底：仅在数据源无 is_st 字段时用股票名判断。股票名是"当前名称"，
+        # 回溯全历史会把非 ST 时段误判为 ST，因此必须显式告警。
         name = str(stock_row.get("stock_name", "") or "").upper()
-        return "ST" in name or "退" in name
+        if "ST" in name or "退" in name:
+            code = str(stock_row.get("stock_code", "") or "")
+            if code not in self._st_name_fallback_warned:
+                self._st_name_fallback_warned.add(code)
+                logger.warning(
+                    "is_st field missing for %s; falling back to current stock name '%s' "
+                    "to infer ST status — this may mislabel historical non-ST periods.",
+                    code,
+                    name,
+                )
+            return True
+        return False
 
     def _limit_move_threshold(self, stock_row: pd.Series) -> float:
-        if self._is_st_stock(stock_row):
-            return 0.045
-
+        # 先判板块再判 ST：注册制下创业板/科创板（含 ST）±20%、北交所（含 ST）±30%，
+        # 仅主板 ST 为 ±5%。
         code = str(stock_row.get("stock_code", "") or "")
         if code.startswith(("300", "301", "688", "689")):
-            return 0.195
+            return self.GEM_STAR_LIMIT_MOVE
         if code.startswith(("43", "83", "87", "88", "92")):
-            return 0.295
-        return self.LIMIT_MOVE_THRESHOLD
+            return self.BSE_LIMIT_MOVE
+        if self._is_st_stock(stock_row):
+            return self.ST_MAIN_BOARD_LIMIT_MOVE
+        return self.limit_move_threshold
+
+    def _in_no_limit_window(self, stock_row: pd.Series) -> bool:
+        """新股上市初期无涨跌幅限制：创业板/科创板前 5 个交易日；主板首日
+        （+44%/-36% 有效申报范围近似为不拦截）；北交所首日无限制。
+
+        上市天数用"数据面板中该代码首次出现日"起算的交易日序号近似；
+        与面板同日起始的代码视为存量老股，不适用。"""
+        if not self._global_date_index or self._panel_first_date is None:
+            return False
+        code = str(stock_row.get("stock_code", "") or "")
+        date = stock_row.get("date")
+        first_date = self._code_first_date.get(code)
+        if first_date is None or date is None:
+            return False
+        if first_date == self._panel_first_date:
+            return False
+        first_idx = self._global_date_index.get(first_date)
+        cur_idx = self._global_date_index.get(date)
+        if first_idx is None or cur_idx is None:
+            return False
+        listing_day_ordinal = cur_idx - first_idx  # 0 = 上市首日（近似）
+        if code.startswith(("300", "301", "688", "689")):
+            return listing_day_ordinal < self.GEM_STAR_NO_LIMIT_DAYS
+        return listing_day_ordinal < self.OTHER_BOARD_NO_LIMIT_DAYS
 
     def _hits_limit(self, stock_row: pd.Series, price_field: str, direction: str) -> bool:
         prev_close = self._get_prev_close(stock_row)
         price = stock_row.get(price_field)
         if prev_close is None or pd.isna(price):
+            return False
+
+        if self._in_no_limit_window(stock_row):
+            self.execution_stats["limit_check_skipped_new_stock_count"] += 1
             return False
 
         move_pct = (float(price) - prev_close) / prev_close
@@ -395,13 +603,16 @@ class BacktestEngine:
         qty: int,
         requested_qty: Optional[int] = None,
         fill_status: str = "filled",
+        at_close: bool = False,
     ) -> bool:
         if qty <= 0:
             self.execution_stats["zero_qty_buy_count"] += 1
             return False
 
         exec_amt = qty * price
-        cost_breakdown = self.cost_model.calculate_cost_breakdown(exec_amt, False)
+        cost_breakdown = self.cost_model.calculate_cost_breakdown(
+            exec_amt, False, trade_date=date, stock_code=code, at_close=at_close
+        )
         total_cost = cost_breakdown["total"]
         if self.portfolio.cash < (exec_amt + total_cost):
             self.execution_stats["insufficient_cash_buy_count"] += 1
@@ -425,6 +636,7 @@ class BacktestEngine:
             "cost": float(total_cost),
             "commission": cost_breakdown["commission"],
             "stamp_tax": cost_breakdown["stamp_tax"],
+            "transfer_fee": cost_breakdown.get("transfer_fee", 0.0),
             "slippage": cost_breakdown["slippage"],
         })
         self._open_round_trips[code] = {
@@ -446,6 +658,7 @@ class BacktestEngine:
         qty: Optional[int] = None,
         requested_qty: Optional[int] = None,
         fill_status: str = "filled",
+        at_close: bool = False,
     ) -> bool:
         pos = self.portfolio.positions.get(code)
         if pos is None:
@@ -456,7 +669,9 @@ class BacktestEngine:
             return False
 
         amount = close_qty * price
-        cost_breakdown = self.cost_model.calculate_cost_breakdown(amount, True)
+        cost_breakdown = self.cost_model.calculate_cost_breakdown(
+            amount, True, trade_date=date, stock_code=code, at_close=at_close
+        )
         total_cost = cost_breakdown["total"]
         self.portfolio.cash += (amount - total_cost)
         remaining_qty = pos.quantity - close_qty
@@ -481,6 +696,7 @@ class BacktestEngine:
             'cost': float(total_cost),
             'commission': cost_breakdown["commission"],
             'stamp_tax': cost_breakdown["stamp_tax"],
+            'transfer_fee': cost_breakdown.get("transfer_fee", 0.0),
             'slippage': cost_breakdown["slippage"],
         })
         entry_info = self._open_round_trips.get(code)
@@ -525,23 +741,73 @@ class BacktestEngine:
                 self._open_round_trips.pop(code, None)
         return True
 
-    def _check_price_risk_exits(self, date: str, day_data: pd.DataFrame) -> Set[str]:
-        """个股风险退出：统一处理止损/止盈，并返回当日禁止回补的代码。"""
+    def _intraday_limit_down_blocked(self, stock_row: pd.Series, fill_price: float) -> bool:
+        """止损触价成交价若已达跌停价位则视为无法卖出（顺延到后续交易日）。"""
+        if self._in_no_limit_window(stock_row):
+            return False
+        prev_close = self._get_prev_close(stock_row)
+        if prev_close is None:
+            return False
+        threshold = self._limit_move_threshold(stock_row)
+        return (fill_price - prev_close) / prev_close <= -threshold
+
+    def _check_price_risk_exits(self, date: str, day_data: pd.DataFrame, phase: str) -> Set[str]:
+        """个股风险退出：统一处理止损/止盈，并返回当日禁止回补的代码。
+
+        成交价假设（日频近似止损单语义）：
+        - 开盘已破位：按开盘价成交（跳空劣于触发价）；
+        - 盘中触价（low <= 止损价）：按 min(open, 止损价) 成交；
+          若成交价已达跌停价位则本日无法卖出，顺延；
+        - 止盈对称：开盘已达标按开盘价，盘中 high >= 止盈价按 max(open, 止盈价)。
+
+        执行时点假设（phase，防前视）：
+        - RISK_EXIT_PHASE_OPEN：只处理"用当日开盘价即可判定"的跳空触发，在按开盘价
+          调仓之前执行，其现金当日开盘可用；
+        - RISK_EXIT_PHASE_INTRADAY：只处理"需要当日 low/high 才知道"的盘中触价，在
+          调仓之后执行，其现金当日不再可用于开盘买单。
+        同一次触发只会落在其中一个阶段，不会被重复评估或重复计入诊断计数。
+        """
+        if phase not in (self.RISK_EXIT_PHASE_OPEN, self.RISK_EXIT_PHASE_INTRADAY):
+            raise ValueError(f"Unsupported risk exit phase: {phase}")
+
         blocked_reentry_codes: Set[str] = set()
         for code, pos in list(self.portfolio.positions.items()):
             stock_row = self._row_for_code(day_data, code)
             if stock_row is None:
                 continue
 
-            current_price = stock_row['open']  # 用开盘价执行止损/止盈
-            pnl_pct = (current_price - pos.avg_price) / pos.avg_price
+            open_price = self._safe_float(stock_row.get('open'))
+            if open_price is None or open_price <= 0 or pos.avg_price <= 0:
+                continue
+            low_price = self._safe_float(stock_row.get('low'))
+            high_price = self._safe_float(stock_row.get('high'))
+            stop_price = pos.avg_price * (1.0 + self.stock_stop_loss)
+            take_price = (
+                pos.avg_price * (1.0 + self.take_profit)
+                if self.take_profit is not None
+                else None
+            )
+
             exit_side = None
-            if pnl_pct <= self.stock_stop_loss:
-                exit_side = 'stop_loss'
-            elif self.take_profit is not None and pnl_pct >= self.take_profit:
-                exit_side = 'take_profit'
+            exec_price = None
+            intraday_touch = False
+            if open_price <= stop_price:
+                exit_side, exec_price = 'stop_loss', open_price
+            elif take_price is not None and open_price >= take_price:
+                exit_side, exec_price = 'take_profit', open_price
+            elif low_price is not None and low_price <= stop_price:
+                exit_side, exec_price = 'stop_loss', min(open_price, stop_price)
+                intraday_touch = True
+            elif take_price is not None and high_price is not None and high_price >= take_price:
+                exit_side, exec_price = 'take_profit', max(open_price, take_price)
+                intraday_touch = True
 
             if exit_side is None:
+                continue
+
+            # 触发类型与执行时点必须匹配：开盘价触发只在开盘阶段成交，日内触价只在
+            # 调仓之后成交。保证一次触发在一天内只被评估一次（诊断计数不重复）。
+            if intraday_touch != (phase == self.RISK_EXIT_PHASE_INTRADAY):
                 continue
 
             self.execution_stats["sell_attempts"] += 1
@@ -554,12 +820,16 @@ class BacktestEngine:
                 self._record_trade_block(block_reason, "sell")
                 continue
 
+            if intraday_touch and exit_side == 'stop_loss' and self._intraday_limit_down_blocked(stock_row, exec_price):
+                self._record_trade_block("limit_down", "sell")
+                continue
+
             requested_qty = pos.quantity
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 continue
             fill_status = "partial" if partial else "filled"
-            if self._close_position(date, code, float(current_price), exit_side, pos.stock_name, qty=qty, requested_qty=requested_qty, fill_status=fill_status):
+            if self._close_position(date, code, float(exec_price), exit_side, pos.stock_name, qty=qty, requested_qty=requested_qty, fill_status=fill_status):
                 blocked_reentry_codes.add(code)
 
         return blocked_reentry_codes
@@ -689,7 +959,8 @@ class BacktestEngine:
                 self.execution_stats["delayed_exit_count"] += 1
                 continue
             fill_status = "partial" if partial else "filled"
-            self._close_position(date, code, float(stock_row['close']), 'sell', pos.stock_name, qty=qty, requested_qty=requested_qty, fill_status=fill_status)
+            # 收盘成交使用尾盘滑点参数（close_slippage_rate）。
+            self._close_position(date, code, float(stock_row['close']), 'sell', pos.stock_name, qty=qty, requested_qty=requested_qty, fill_status=fill_status, at_close=True)
 
         total_val = self.portfolio.total_value
         for code, weight in signals.items():
@@ -713,7 +984,8 @@ class BacktestEngine:
             qty = int(buy_amt / price / 100) * 100
             capped_qty, partial = self._cap_order_quantity(stock_row, qty)
             fill_status = "partial" if partial else "filled"
-            self._open_position(date, code, name, price, capped_qty, requested_qty=qty, fill_status=fill_status)
+            # 收盘成交使用尾盘滑点参数（close_slippage_rate）。
+            self._open_position(date, code, name, price, capped_qty, requested_qty=qty, fill_status=fill_status, at_close=True)
 
     def _generate_report(self):
         history = pd.DataFrame(self.portfolio.history)
@@ -726,7 +998,7 @@ class BacktestEngine:
         
         # New Metrics
         days = len(history)
-        annual_return = ((1 + total_return) ** (252 / days)) - 1 if days > 0 else 0
+        annual_return = ((1 + total_return) ** (self.annualization_factor / days)) - 1 if days > 0 else 0
         max_dd = self._calc_max_drawdown(history['total_value'])
         calmar = annual_return / abs(max_dd) if max_dd != 0 else 0
 
@@ -792,6 +1064,24 @@ class BacktestEngine:
                 benchmark_return = float(benchmark_history[-1]["value"] - 1) if benchmark_history else 0.0
         excess_return = float(total_return - benchmark_return)
 
+        # 逐日执行时序（显式声明，供使用者判断结果是否含前视）。
+        if self.execution_mode == "signal_close_to_next_open":
+            daily_sequence = [
+                "1_exit_overnight_positions_at_today_open",
+                "2_generate_signals_from_today_close",
+                "3_enter_new_positions_at_today_close",
+                "4_mark_to_close_and_record_state",
+            ]
+        else:
+            daily_sequence = [
+                "1_mark_positions_to_today_open",
+                "2_gap_open_risk_exits_at_today_open",
+                "3_rebalance_yesterday_signals_at_today_open",
+                "4_intraday_touch_risk_exits_after_open_rebalance",
+                "5_mark_to_close_and_record_state",
+                "6_generate_signals_from_today_close_for_next_open",
+            ]
+
         return {
             'total_return': float(total_return),
             'history': history.drop(columns=['positions']).to_dict(orient='records'),
@@ -848,10 +1138,39 @@ class BacktestEngine:
                 },
                 'execution_model': {
                     'name': 'a_share_tradability_capacity_t1_v1',
+                    'execution_mode': str(self.execution_mode),
                     'enforce_tradability': bool(self.enforce_tradability),
                     'enforce_t1': bool(self.enforce_t1),
                     'max_volume_participation': self.max_volume_participation,
+                    # "触板即拒单"近似阈值（主板）；真实规则中仅封板不可成交。
+                    'limit_move_threshold': float(self.limit_move_threshold),
+                    # 止损/止盈成交价假设（日内触价近似）。
+                    'risk_exit_fill_assumption': (
+                        'stop=min(open,stop_price) on low touch, deferred at limit-down; '
+                        'take=max(open,take_price) on high touch; gap fills at open'
+                    ),
+                    # 止损/止盈的执行时序假设（防前视）。
+                    'risk_exit_timing_assumption': (
+                        'gap-open exits (open<=stop / open>=take) settle at the open, before the '
+                        'open-price rebalance; intraday touch exits (low<=stop / high>=take) settle '
+                        'AFTER the open-price rebalance, so information only knowable intraday never '
+                        'finances same-day open orders'
+                    ),
+                    # 盘中止损释放的现金能否用于同日开盘买单：否（最早次日开盘可用）。
+                    'intraday_risk_exit_cash_available_same_day': False,
+                    'daily_sequence': daily_sequence,
+                    # 印花税豁免品种（A股仅股票卖出计征）。
+                    'stamp_tax_exempt_instruments': (
+                        'funds/ETF/LOF (5xxxxx, 15xxxx, 16xxxx) and bonds incl. convertibles '
+                        '(1xxxxx) are exempt from A-share stamp tax'
+                    ),
+                    'close_fill_slippage_rate': float(self.cost_model.close_slippage_rate)
+                        if hasattr(self.cost_model, 'close_slippage_rate') else None,
+                    'risk_free_rate': float(self.risk_free_rate),
+                    'annualization_factor': int(self.annualization_factor),
                 },
+                # 曾在持仓期间出现无行情行（停牌或数据缺行，按最后价估值）的标的数。
+                'suspended_positions_count': int(len(self._suspended_position_codes)),
                 'exposure_stats': {
                     'invested_days': invested_days,
                     'invested_ratio': invested_ratio,
@@ -868,5 +1187,5 @@ class BacktestEngine:
 
     def _calc_sharpe(self, returns):
         if returns.std() == 0: return 0.0
-        # Assuming 2.5% risk-free rate
-        return float((returns.mean() - 0.025/252) / (returns.std() + 1e-9) * np.sqrt(252))
+        ann = self.annualization_factor
+        return float((returns.mean() - self.risk_free_rate / ann) / (returns.std() + 1e-9) * np.sqrt(ann))

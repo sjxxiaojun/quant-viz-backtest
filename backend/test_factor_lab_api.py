@@ -192,7 +192,7 @@ def test_factor_lab_backtest_api_delegates_to_execute_backtest(monkeypatch):
     monkeypatch.setattr(main, "validate_factor_lab_backtest_artifacts", lambda req: None)
     monkeypatch.setattr(main, "load_factor_lab_artifact_symbols", lambda: ["600519", "000001"])
 
-    def fake_execute(req, override_cost_model=None, allow_mock=True):
+    def fake_execute(req, override_cost_model=None, allow_mock=True, semaphore=None):
         captured["stocks"] = req.stocks
         captured["max_symbols"] = req.max_symbols
         return expected
@@ -386,7 +386,7 @@ def test_factor_lab_run_api_builds_result_and_cost_comparison(monkeypatch):
     monkeypatch.setattr(main, "restore_factor_lab_artifacts", lambda snapshot: None)
     monkeypatch.setattr(main, "clear_factor_lab_artifact_snapshot", lambda snapshot: None)
 
-    def fake_execute(req, override_cost_model=None, allow_mock=True):
+    def fake_execute(req, override_cost_model=None, allow_mock=True, semaphore=None):
         call_counter["count"] += 1
         backtest_requests.append(req)
         return {
@@ -470,7 +470,7 @@ def test_factor_lab_readiness_reports_full_cache_hit(monkeypatch):
 def test_factor_lab_strategy_comparison_scopes_backtests_to_research_symbols(monkeypatch):
     calls = []
 
-    def fake_execute(req, override_cost_model=None, allow_mock=True):
+    def fake_execute(req, override_cost_model=None, allow_mock=True, semaphore=None):
         calls.append(req)
         return {
             "total_return": 0.1 if override_cost_model is None else 0.12,
@@ -572,7 +572,7 @@ def test_factor_lab_results_persist_and_read_back_run_readiness_and_user_view(mo
     monkeypatch.setattr(
         main,
         "execute_backtest",
-        lambda req, override_cost_model=None, allow_mock=True: {
+        lambda req, override_cost_model=None, allow_mock=True, semaphore=None: {
             "total_return": 0.08 if override_cost_model is None else 0.1,
             "summary": {
                 "annual_return": 0.11,

@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 import pandas as pd
@@ -6,6 +7,11 @@ import time
 
 # Add project root to sys.path
 sys.path.append(str(Path(__file__).parent.parent))
+
+# 数据湖默认位于项目根目录的同级目录，可用 QUANT_DATA_LAKE_DIR 覆盖。
+DATA_LAKE_DIR = Path(
+    os.getenv("QUANT_DATA_LAKE_DIR", str(Path(__file__).resolve().parents[2].parent / "quant_data_lake"))
+)
 
 from data_manager import DataManager
 from alpha_factory import (
@@ -31,7 +37,7 @@ def run_tech_evaluation():
     factory.register_factor("vol_std_20", alpha_volume_std_20)
     
     logger.info("Loading 2024-2026 data for Tech evaluation...")
-    consolidated_dir = Path("/Users/USER/quant_data_lake/consolidated")
+    consolidated_dir = DATA_LAKE_DIR / "consolidated"
     
     dfs = []
     for year in [2024, 2025, 2026]:

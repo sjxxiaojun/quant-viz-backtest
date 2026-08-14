@@ -1,21 +1,25 @@
 import copy
+import dataclasses
 import inspect
 import json
 import os
+import secrets
 import shutil
+import sys
 import tempfile
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import logging
 
 import pandas as pd
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -33,10 +37,29 @@ from strategy_versioning import StrategyVersionStore, artifact_fingerprint
 from virtual_trading_manager import VirtualTradingManager
 from strategies.sector_strategy import run_power_energy_strategy
 
-DB_PATH = Path(__file__).with_name("virtual_trading.db")
+BACKEND_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BACKEND_DIR.parent
+DB_PATH = BACKEND_DIR / "virtual_trading.db"
 
 
-app = FastAPI()
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    global MARKET_WARMUP_THREAD
+    _configure_ai_handlers()
+    # 启动即打印当前鉴权口径（回环豁免开/关、API Key 有没有配），避免"以为自己没暴露"。
+    log_api_auth_state()
+    if MARKET_WARMUP_THREAD is None or not MARKET_WARMUP_THREAD.is_alive():
+        MARKET_WARMUP_THREAD = threading.Thread(target=_warm_latest_market_cache, daemon=True)
+        MARKET_WARMUP_THREAD.start()
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        automation_scheduler.start()
+    try:
+        yield
+    finally:
+        automation_scheduler.stop()
+
+
+app = FastAPI(lifespan=_app_lifespan)
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -55,7 +78,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO)
+BACKEND_LOG_PATH = Path(os.getenv("QUANT_BACKEND_LOG", str(BACKEND_DIR / "backend.log")))
+BACKEND_LOG_MAX_BYTES = 10 * 1024 * 1024
+BACKEND_LOG_BACKUP_COUNT = 3
+
+
+def _configure_logging() -> None:
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # 其他模块可能在导入期调用过 basicConfig；仅在缺失时补齐控制台输出，避免重复 handler。
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root.handlers):
+        console = logging.StreamHandler()
+        console.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        root.addHandler(console)
+    already_rotating = any(
+        isinstance(h, RotatingFileHandler) and Path(getattr(h, "baseFilename", "")) == BACKEND_LOG_PATH
+        for h in root.handlers
+    )
+    if not already_rotating:
+        try:
+            file_handler = RotatingFileHandler(
+                BACKEND_LOG_PATH,
+                maxBytes=BACKEND_LOG_MAX_BYTES,
+                backupCount=BACKEND_LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+            root.addHandler(file_handler)
+        except OSError as exc:
+            logging.getLogger("GeminiQuantAPI").warning(f"backend.log 轮转文件句柄初始化失败: {exc}")
+
+
+_configure_logging()
 logger = logging.getLogger("GeminiQuantAPI")
 
 data_manager = DataManager()
@@ -87,9 +141,11 @@ FACTOR_LAB_DEFAULT_ALL_SAMPLE = BACKTEST_MAX_SYMBOLS
 FACTOR_LAB_KEEP_RECENT_RUNS = 5
 BACKTEST_SEMAPHORE = threading.BoundedSemaphore(BACKTEST_MAX_CONCURRENT)
 FACTOR_LAB_SEMAPHORE = threading.BoundedSemaphore(1)
+# Factor Lab 编排内部的回测使用独立预算，避免与用户直接提交的普通回测互相抢占并发槽位。
+FACTOR_LAB_BACKTEST_SEMAPHORE = threading.BoundedSemaphore(BACKTEST_MAX_CONCURRENT)
 FACTOR_LAB_ARTIFACT_LOCK = threading.RLock()
 VIRTUAL_TRADE_EXECUTE_LOCK = threading.Lock()
-FACTOR_LAB_REPORT_DIR = Path(__file__).resolve().parent.parent / "results" / "quant-factor-mining" / "reports" / "factor_lab"
+FACTOR_LAB_REPORT_DIR = PROJECT_ROOT / "results" / "quant-factor-mining" / "reports" / "factor_lab"
 FACTOR_LAB_TRACKED_ARTIFACTS = ("latest_scores.csv", "latest_model.joblib", "latest_manifest.json")
 MARKET_WARMUP_THREAD = None
 BACKTEST_JOBS_LOCK = threading.Lock()
@@ -393,22 +449,24 @@ def _warm_latest_market_cache():
         logger.warning(f"Latest market cache warmup failed: {exc}")
 
 
-@app.on_event("startup")
-def start_latest_market_warmup():
-    global MARKET_WARMUP_THREAD
-    _configure_ai_handlers()
-    if MARKET_WARMUP_THREAD is not None and MARKET_WARMUP_THREAD.is_alive():
-        pass
-    else:
-        MARKET_WARMUP_THREAD = threading.Thread(target=_warm_latest_market_cache, daemon=True)
-        MARKET_WARMUP_THREAD.start()
-    if not os.getenv("PYTEST_CURRENT_TEST"):
-        automation_scheduler.start()
+# 收盘（尾盘）成交滑点的默认值以 engine.CostModel 为单一真源，避免两处各写一份。
+DEFAULT_CLOSE_SLIPPAGE_RATE: float = float(CostModel.close_slippage_rate)
 
 
-@app.on_event("shutdown")
-def stop_automation_scheduler():
-    automation_scheduler.stop()
+def resolve_close_slippage_rate(req: Any) -> float:
+    """解析请求要用的收盘滑点，兼顾"可配置"与"不改变既有回测结果"。
+
+    - 显式传了 close_slippage_rate：直接照用（传 0 就是 0，传 0.003 就是 0.003）。
+    - 没传、且 slippage_rate 被显式设为 0（无摩擦基准）：收盘滑点同步归零，
+      否则"滑点设为 0 却仍收 0.15%"自相矛盾——这正是零成本对照组被污染的根因。
+    - 其余情况：沿用引擎默认 0.0015，历史回测结果逐字节不变。
+    """
+    explicit = getattr(req, "close_slippage_rate", None)
+    if explicit is not None:
+        return float(explicit)
+    if float(getattr(req, "slippage_rate", DEFAULT_CLOSE_SLIPPAGE_RATE) or 0.0) == 0.0:
+        return 0.0
+    return DEFAULT_CLOSE_SLIPPAGE_RATE
 
 
 class BacktestRequest(BaseModel):
@@ -428,8 +486,12 @@ class BacktestRequest(BaseModel):
     take_profit: Optional[float] = Field(default=None, gt=0.0, le=10.0)
     circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
     commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    stamp_tax_rate: float = Field(default=0.001, ge=0.0, le=0.1)
+    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
+    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
     slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
+    # 收盘（尾盘）成交滑点。None = 不指定，沿用引擎默认 0.0015（既有回测结果不变）；
+    # 显式传值时直接生效，解析规则见 resolve_close_slippage_rate()。
+    close_slippage_rate: Optional[float] = Field(default=None, ge=0.0, le=0.1)
     commission_min: float = Field(default=5.0, ge=0.0, le=1000.0)
     allow_mock: bool = False
 
@@ -577,8 +639,11 @@ class CompareRequest(BaseModel):
     take_profit: Optional[float] = Field(default=None, gt=0.0, le=10.0)
     circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
     commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    stamp_tax_rate: float = Field(default=0.001, ge=0.0, le=0.1)
+    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
+    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
     slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
+    # 与 BacktestRequest 同义：None = 沿用引擎默认收盘滑点。
+    close_slippage_rate: Optional[float] = Field(default=None, ge=0.0, le=0.1)
     commission_min: float = Field(default=5.0, ge=0.0, le=1000.0)
     allow_mock: bool = False
 
@@ -594,8 +659,11 @@ class FactorLabRunRequest(BaseModel):
     stop_loss: float = Field(default=-0.08, gt=-1.0, lt=0.0)
     circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
     commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    stamp_tax_rate: float = Field(default=0.001, ge=0.0, le=0.1)
+    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
+    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
     slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
+    # 与 BacktestRequest 同义：None = 沿用引擎默认收盘滑点。
+    close_slippage_rate: Optional[float] = Field(default=None, ge=0.0, le=0.1)
     commission_min: float = Field(default=5.0, ge=0.0, le=1000.0)
 
 
@@ -618,7 +686,8 @@ class FactorLabStressTestRequest(BaseModel):
     anchor_date: Optional[str] = None
     lookback_days: int = Field(default=260, ge=90, le=520)
     commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    stamp_tax_rate: float = Field(default=0.001, ge=0.0, le=0.1)
+    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
+    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
     slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
     stop_loss: float = Field(default=-0.08, gt=-1.0, lt=0.0)
     circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
@@ -1878,10 +1947,10 @@ def _scores_preview_needs_rebuild(preview: object) -> bool:
             continue
         try:
             rank = float(item.get("daily_rank"))
-            if pd.notna(rank):
-                ranks.append(rank)
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            rank = None
+        if rank is not None and pd.notna(rank):
+            ranks.append(rank)
         stock_code = str(item.get("stock_code") or "")
         stock_name = str(item.get("stock_name") or "")
         if stock_code and stock_name and stock_code == stock_name:
@@ -1982,23 +2051,81 @@ def upgrade_factor_lab_result_payload(result: Dict[str, object]) -> tuple[Dict[s
     return upgraded, changed
 
 
+# ---------------------------------------------------------------------------
+# 零成本基准模型
+# Factor Lab 用它跑"无摩擦"对照组，任何残留费用都会直接污染 with_cost /
+# without_cost 的差值（cost_drag.total_return_diff）。历史教训：这里曾手写字段
+# 清单，CostModel 后来新增 close_slippage_rate(0.15%) 与 transfer_fee_rate 时
+# 漏配，"零成本"每笔仍在收 0.15% 收盘滑点 + 沪市过户费。
+# 现在改为按 dataclass 字段自动归零，并在返回前做一次出厂自检：
+# CostModel 以后再新增任何成本字段，要么被自动归零，要么在自检里立刻炸出来，
+# 不会再出现"静默漏一个字段 -> 对照组悄悄带成本"的情况。
+# ---------------------------------------------------------------------------
+
+# 自检用的探针交易：覆盖 沪市/深市 × 买入/卖出 × 收盘/盘中 × 印花税分段前后 × 大小额。
+_ZERO_COST_PROBE_TRADES = tuple(
+    {
+        "amount": amount,
+        "is_sell": is_sell,
+        "trade_date": trade_date,
+        "stock_code": stock_code,
+        "at_close": at_close,
+    }
+    for amount in (100_000.0, 1.0)
+    for is_sell in (False, True)
+    for trade_date in ("2020-01-02", "2026-07-24")
+    for stock_code in ("600000", "000001")
+    for at_close in (False, True)
+)
+
+
+def _zero_cost_value_for_field(field: "dataclasses.Field") -> Any:
+    """按字段类型推导"零成本"取值：开关 -> False，数值 -> 0.0，未知类型 -> 保持默认。"""
+    annotation = str(field.type)
+    if "bool" in annotation:
+        return False
+    if "float" in annotation or "int" in annotation:
+        return 0.0
+    return dataclasses.MISSING
+
+
 def make_zero_cost_model() -> CostModel:
-    return CostModel(
-        commission_rate=0.0,
-        commission_min=0.0,
-        stamp_tax_rate=0.0,
-        slippage_rate=0.0,
-        use_order_slicing=False,
-    )
+    """构造真正的零成本模型：CostModel 的所有成本字段一律归零（不手写字段清单）。"""
+    zero_kwargs: Dict[str, Any] = {}
+    for field in dataclasses.fields(CostModel):
+        if not field.init:
+            continue
+        value = _zero_cost_value_for_field(field)
+        if value is not dataclasses.MISSING:
+            zero_kwargs[field.name] = value
+
+    model = CostModel(**zero_kwargs)
+
+    residual = []
+    for trade in _ZERO_COST_PROBE_TRADES:
+        breakdown = model.calculate_cost_breakdown(**trade)
+        if breakdown["total"] != 0.0:
+            residual.append((trade, breakdown))
+    if residual:
+        raise RuntimeError(
+            "零成本模型自检失败：CostModel 新增了无法自动归零的成本字段，"
+            f"残留费用样例={residual[0]!r}（共 {len(residual)} 条）。"
+            "请在 _zero_cost_value_for_field 中补上该字段的归零规则，"
+            "否则 Factor Lab 的 with_cost/without_cost 对比会失真。"
+        )
+    return model
 
 
 def execute_backtest(
     req: BacktestRequest,
     override_cost_model: Optional[CostModel] = None,
     allow_mock: bool = False,
+    semaphore: Optional[threading.BoundedSemaphore] = None,
 ) -> Dict:
     current_pool, pool_ctx, warmup_start = prepare_backtest_universe(req)
-    if not BACKTEST_SEMAPHORE.acquire(blocking=False):
+    # 默认使用普通回测并发预算；Factor Lab 等内部编排传入自己的信号量，与用户回测互不抢占。
+    slot = semaphore if semaphore is not None else BACKTEST_SEMAPHORE
+    if not slot.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="当前已有回测任务运行中，请稍后再试。")
 
     try:
@@ -2010,10 +2137,10 @@ def execute_backtest(
             allow_late_start=bool(pool_ctx.get("allow_late_start")),
         )
     except (DataFetchError, PoolDataFetchError) as exc:
-        BACKTEST_SEMAPHORE.release()
+        slot.release()
         raise HTTPException(status_code=502, detail=str(exc))
     except Exception:
-        BACKTEST_SEMAPHORE.release()
+        slot.release()
         raise
 
     try:
@@ -2093,6 +2220,7 @@ def execute_backtest(
             commission_min=0.0 if req.commission_rate == 0 else req.commission_min,
             stamp_tax_rate=req.stamp_tax_rate,
             slippage_rate=req.slippage_rate,
+            close_slippage_rate=resolve_close_slippage_rate(req),
         )
         engine_kwargs = {
             "initial_capital": req.initial_capital,
@@ -2126,6 +2254,9 @@ def execute_backtest(
             "portfolio_circuit_breaker_active": False,
             "deprecated_circuit_breaker_requested": req.circuit_breaker,
             "risk_control_note": "组合熔断已停用；组合回撤仅作为风险指标展示。",
+            # 本次实际生效的成本口径（含零成本对照组），让"我设的滑点到底有没有生效"
+            # 可以直接从回测结果里核对，而不是靠猜。字段随 CostModel 自动同步。
+            "effective_cost_model": dataclasses.asdict(cost_model),
         }
         if benchmark_warning:
             result.setdefault("warnings", []).append(
@@ -2147,7 +2278,7 @@ def execute_backtest(
                 result["trades_truncated"] = False
         return result
     finally:
-        BACKTEST_SEMAPHORE.release()
+        slot.release()
 
 
 def build_factor_lab_backtest_request(
@@ -2170,6 +2301,7 @@ def build_factor_lab_backtest_request(
         commission_rate=req.commission_rate,
         stamp_tax_rate=req.stamp_tax_rate,
         slippage_rate=req.slippage_rate,
+        close_slippage_rate=req.close_slippage_rate,
         commission_min=req.commission_min,
     )
 
@@ -2208,11 +2340,16 @@ def run_factor_lab_strategy_comparison(
     comparisons = {}
     for factor in factors:
         backtest_req = build_factor_lab_backtest_request(req, factor, symbols=symbols)
-        with_cost = execute_backtest(backtest_req, allow_mock=allow_mock)
+        with_cost = execute_backtest(
+            backtest_req,
+            allow_mock=allow_mock,
+            semaphore=FACTOR_LAB_BACKTEST_SEMAPHORE,
+        )
         zero_cost = execute_backtest(
             backtest_req,
             override_cost_model=make_zero_cost_model(),
             allow_mock=allow_mock,
+            semaphore=FACTOR_LAB_BACKTEST_SEMAPHORE,
         )
         comparisons[factor] = summarize_strategy_backtest(with_cost, zero_cost, factor)
         comparisons[factor]["with_cost_result"] = with_cost
@@ -2302,9 +2439,61 @@ def readyz():
     return payload
 
 
-def _require_local_request(request: Request) -> None:
+# 可信本机来源白名单：按 TCP 对端地址判断，并额外识别反向代理特征。
+# 背景：部署在 nginx / frp / cloudflare tunnel 之后时，所有外部请求的对端地址
+# 都是回环地址，纯粹按对端地址做豁免等于把状态变更接口（含自动化下单相关）
+# 对公网敞开。这里不粗暴删掉本机豁免（会破坏本机日常使用），而是：
+# 只要请求带任何代理转发特征头，就一律不给回环豁免，只能走 X-Quant-Api-Key。
+# 想彻底关闭本机豁免仍可把 QUANT_API_TRUSTED_HOSTS 设为空串。
+def _trusted_local_hosts() -> set:
+    raw = os.getenv("QUANT_API_TRUSTED_HOSTS", "127.0.0.1,::1")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+# 常见反向代理 / 隧道 / CDN 的转发特征头。出现其中任意一个，
+# 都说明 request.client.host 是代理自己的地址而非真实调用方。
+PROXY_FORWARDING_HEADERS = (
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "x-original-forwarded-for",
+    "forwarded",
+    "x-real-ip",
+    "x-client-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+    "fastly-client-ip",
+    "fly-client-ip",
+    "x-cluster-client-ip",
+)
+
+
+def _detected_proxy_headers(request: Request) -> List[str]:
+    headers = request.headers
+    return [name for name in PROXY_FORWARDING_HEADERS if headers.get(name)]
+
+
+def _is_trusted_local_request(request: Request) -> bool:
     host = request.client.host if request.client else ""
-    if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+    if host not in _trusted_local_hosts():
+        return False
+    proxy_headers = _detected_proxy_headers(request)
+    if proxy_headers:
+        # 回环地址 + 转发头 = 反向代理后的外部请求，取消豁免。
+        logger.warning(
+            "拒绝对回环来源 %s 授予本机豁免：请求带有反向代理转发头 %s，"
+            "请改用 X-Quant-Api-Key 鉴权（并确认 QUANT_AI_API_KEY 已配置）。",
+            host or "unknown",
+            ",".join(proxy_headers),
+        )
+        return False
+    return True
+
+
+def _require_local_request(request: Request) -> None:
+    if not _is_trusted_local_request(request):
         raise HTTPException(status_code=403, detail="状态变更接口仅允许本机访问。")
 
 
@@ -2316,16 +2505,55 @@ def _has_valid_quant_api_key(request: Request) -> bool:
     auth = request.headers.get("Authorization", "").strip()
     if auth.lower().startswith("bearer "):
         provided = provided or auth.split(" ", 1)[1].strip()
-    return bool(provided and provided == expected)
+    return bool(provided) and secrets.compare_digest(provided, expected)
 
 
 def _require_automation_request(request: Request) -> None:
-    host = request.client.host if request.client else ""
-    if host in {"127.0.0.1", "::1", "localhost", "testclient"}:
+    if _is_trusted_local_request(request):
         return
     if _has_valid_quant_api_key(request):
         return
     raise HTTPException(status_code=403, detail="自动化/AI 接口仅允许本机或有效 X-Quant-Api-Key 访问。")
+
+
+def describe_api_auth_state() -> Dict[str, Any]:
+    """当前鉴权口径快照，供启动日志与后续鉴权回归测试使用。"""
+    hosts = sorted(_trusted_local_hosts())
+    return {
+        "loopback_exemption_enabled": bool(hosts),
+        "trusted_hosts": hosts,
+        "api_key_configured": bool(os.getenv("QUANT_AI_API_KEY", "").strip()),
+        # 带反向代理转发头的请求永远拿不到本机豁免，见 _is_trusted_local_request()。
+        "proxy_headers_revoke_exemption": True,
+        "proxy_headers_watched": list(PROXY_FORWARDING_HEADERS),
+    }
+
+
+def log_api_auth_state() -> None:
+    """启动时把鉴权状态打到日志，一眼看清自己有没有暴露。"""
+    state = describe_api_auth_state()
+    summary = (
+        "鉴权状态 | 本机(回环)豁免=%s [%s] | API Key(QUANT_AI_API_KEY)=%s | 带反向代理转发头的请求一律不豁免"
+        % (
+            "开启" if state["loopback_exemption_enabled"] else "关闭",
+            ",".join(state["trusted_hosts"]) or "空",
+            "已配置" if state["api_key_configured"] else "未配置",
+        )
+    )
+    if state["loopback_exemption_enabled"] and not state["api_key_configured"]:
+        logger.warning(
+            "%s —— 状态变更接口（含自动化下单相关）目前只靠【本机来源】保护。"
+            "若本服务要暴露到 nginx/frp/cloudflare tunnel 之后，请先配置 QUANT_AI_API_KEY，"
+            "并把 QUANT_API_TRUSTED_HOSTS 设为空串以彻底关闭回环豁免。",
+            summary,
+        )
+    elif not state["loopback_exemption_enabled"] and not state["api_key_configured"]:
+        logger.error(
+            "%s —— 回环豁免已关闭且未配置 API Key，所有状态变更接口将一律返回 403（含本机调用）。",
+            summary,
+        )
+    else:
+        logger.info("%s", summary)
 
 
 @app.get("/api/market/latest")
@@ -2502,8 +2730,16 @@ def get_strategies():
     return res
 
 
-@app.post("/api/backtest")
-def run_backtest(req: BacktestRequest):
+def _apply_sync_deprecation_headers(response: Response, alternative: str) -> None:
+    # 同步长任务端点会占用请求线程数分钟，保留仅为兼容旧客户端；新客户端应使用异步 jobs 端点。
+    response.headers["Deprecation"] = "true"
+    response.headers["X-Deprecated-Use"] = alternative
+
+
+@app.post("/api/backtest", deprecated=True)
+def run_backtest(req: BacktestRequest, response: Response):
+    """[Deprecated] 同步回测端点，请改用 POST /api/backtest/jobs + GET /api/backtest/jobs/{job_id}。"""
+    _apply_sync_deprecation_headers(response, "POST /api/backtest/jobs")
     return execute_backtest(req, allow_mock=req.allow_mock)
 
 
@@ -2578,6 +2814,7 @@ def execute_compare_request(req: CompareRequest) -> Dict[str, Dict]:
             commission_rate=req.commission_rate,
             stamp_tax_rate=req.stamp_tax_rate,
             slippage_rate=req.slippage_rate,
+            close_slippage_rate=req.close_slippage_rate,
             commission_min=req.commission_min,
             allow_mock=req.allow_mock,
         )
@@ -2602,8 +2839,10 @@ def execute_compare_request(req: CompareRequest) -> Dict[str, Dict]:
     return results
 
 
-@app.post("/api/backtest/compare")
-def compare_strategies(req: CompareRequest):
+@app.post("/api/backtest/compare", deprecated=True)
+def compare_strategies(req: CompareRequest, response: Response):
+    """[Deprecated] 同步策略对比端点，请改用 POST /api/backtest/compare/jobs。"""
+    _apply_sync_deprecation_headers(response, "POST /api/backtest/compare/jobs")
     return execute_compare_request(req)
 
 
@@ -2686,10 +2925,24 @@ def get_factor_lab_factors():
     }
 
 
-@app.post("/api/factor-lab/run")
-def run_factor_lab_api(req: FactorLabRunRequest):
+@app.post("/api/factor-lab/run", deprecated=True)
+def run_factor_lab_api(req: FactorLabRunRequest, response: Response):
+    """[Deprecated] 同步 Factor Lab 全流程端点（训练+多次回测，分钟级），请优先使用异步 jobs 模式编排。"""
+    _apply_sync_deprecation_headers(response, "POST /api/backtest/jobs")
     if not FACTOR_LAB_SEMAPHORE.acquire(blocking=False):
-        return factor_lab_error_response(429, "当前已有 Factor Lab 任务运行中，请稍后再试。", "FACTOR_LAB_BUSY")
+        result = factor_lab_error_response(429, "当前已有 Factor Lab 任务运行中，请稍后再试。", "FACTOR_LAB_BUSY")
+    else:
+        # 信号量的获取与释放只出现在这一处 try/finally，内部实现不得再触碰 FACTOR_LAB_SEMAPHORE。
+        try:
+            result = _execute_factor_lab_run(req)
+        finally:
+            FACTOR_LAB_SEMAPHORE.release()
+    if isinstance(result, Response):
+        _apply_sync_deprecation_headers(result, "POST /api/backtest/jobs")
+    return result
+
+
+def _execute_factor_lab_run(req: FactorLabRunRequest):
     run_readiness = None
     artifact_snapshot = None
     try:
@@ -2708,7 +2961,6 @@ def run_factor_lab_api(req: FactorLabRunRequest):
         if df.empty:
             with FACTOR_LAB_ARTIFACT_LOCK:
                 restore_factor_lab_artifacts(artifact_snapshot)
-            FACTOR_LAB_SEMAPHORE.release()
             return factor_lab_error_response(
                 400,
                 "未获取到 Factor Lab 研究所需的真实行情数据。",
@@ -2716,14 +2968,12 @@ def run_factor_lab_api(req: FactorLabRunRequest):
                 run_readiness=run_readiness,
             )
     except HTTPException as exc:
-        FACTOR_LAB_SEMAPHORE.release()
         return factor_lab_error_response(
             exc.status_code,
             str(exc.detail),
             "FACTOR_LAB_INVALID_REQUEST",
         )
     except ValueError as exc:
-        FACTOR_LAB_SEMAPHORE.release()
         return factor_lab_error_response(
             400,
             f"日期格式错误: {exc}",
@@ -2732,7 +2982,6 @@ def run_factor_lab_api(req: FactorLabRunRequest):
     except (DataFetchError, PoolDataFetchError) as exc:
         with FACTOR_LAB_ARTIFACT_LOCK:
             restore_factor_lab_artifacts(artifact_snapshot)
-        FACTOR_LAB_SEMAPHORE.release()
         return factor_lab_error_response(
             502,
             str(exc),
@@ -2742,7 +2991,6 @@ def run_factor_lab_api(req: FactorLabRunRequest):
     except Exception as exc:
         with FACTOR_LAB_ARTIFACT_LOCK:
             restore_factor_lab_artifacts(artifact_snapshot)
-        FACTOR_LAB_SEMAPHORE.release()
         return factor_lab_error_response(
             500,
             f"Factor Lab 准备阶段失败: {exc}",
@@ -2853,8 +3101,6 @@ def run_factor_lab_api(req: FactorLabRunRequest):
             "FACTOR_LAB_RUN_FAILED",
             run_readiness=run_readiness,
         )
-    finally:
-        FACTOR_LAB_SEMAPHORE.release()
 
 
 @app.post("/api/factor-lab/backtest")
@@ -3146,43 +3392,75 @@ def get_vt_stats(strategy_id: str):
 # Daily Morning Report API Endpoints
 # ============================================================
 
+DAILY_REPORT_GENERATE_LOCK = threading.Lock()
+
+
+def _daily_report_staleness(data: Dict[str, object]) -> List[str]:
+    reasons: List[str] = []
+    recs = data.get("recommendations", [])
+    if isinstance(recs, list) and recs and isinstance(recs[0], dict):
+        first = recs[0]
+        if "current_price" not in first or first.get("current_price") is None:
+            reasons.append("missing_current_price")
+        if "stock_name" not in first or not first.get("stock_name"):
+            reasons.append("missing_stock_name")
+    report_date = data.get("report_date")
+    if report_date and str(report_date) < (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"):
+        reasons.append("report_date_outdated")
+    return reasons
+
+
+def _generate_daily_report_locked() -> Dict[str, object]:
+    # 晨报生成涉及行情读取与文件写入，串行化避免多个客户端并发重生成。
+    from daily_morning_report import generate_and_save
+
+    with DAILY_REPORT_GENERATE_LOCK:
+        return generate_and_save()
+
+
 @app.get("/api/daily-report/latest")
-def get_latest_daily_report():
-    """获取最新晨报（自动修复格式过期的缓存）"""
-    from daily_morning_report import REPORT_DIR, generate_and_save
-    
+def get_latest_daily_report(request: Request, regenerate: bool = False):
+    """获取最新晨报（只读缓存）。
+
+    响应中的 stale / stale_reasons 字段标记缓存是否过期；
+    过期时请调用 POST /api/daily-report/generate 重新生成。
+    regenerate=true 为兼容旧客户端保留的同步重生成参数（deprecated，需自动化鉴权）。
+    """
+    from daily_morning_report import REPORT_DIR
+
     latest_json = REPORT_DIR / "latest.json"
     if not latest_json.exists():
         raise HTTPException(status_code=404, detail="暂无晨报数据，请先运行晨报生成")
-    
+
     try:
         with open(latest_json, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
-        # 检查报告是否过期（缺少必需字段）
-        needs_regenerate = False
-        recs = data.get("recommendations", [])
-        if recs:
-            first = recs[0]
-            if "current_price" not in first or first.get("current_price") is None:
-                needs_regenerate = True
-            if "stock_name" not in first or not first.get("stock_name"):
-                needs_regenerate = True
-        if data.get("report_date") and data["report_date"] < (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"):
-            needs_regenerate = True
-        
-        if needs_regenerate:
-            logger.info("检测到晨报缓存过期，自动重新生成")
-            result = generate_and_save()
-            data = result.get("report", data)
-        
-        return JSONResponse(content=data, headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        })
-    except Exception as e:
+    except (OSError, json.JSONDecodeError) as e:
         raise HTTPException(status_code=500, detail=f"读取晨报失败: {e}")
+
+    stale_reasons = _daily_report_staleness(data)
+    if regenerate and stale_reasons:
+        # deprecated 兼容路径：GET 触发重生成属于重副作用，仅限本机/持有 API key 的调用方。
+        _require_automation_request(request)
+        logger.info("检测到晨报缓存过期，按 regenerate=true 兼容参数同步重新生成（deprecated）")
+        try:
+            result = _generate_daily_report_locked()
+            data = result.get("report", data)
+            stale_reasons = _daily_report_staleness(data)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"晨报重新生成失败: {e}")
+
+    data["stale"] = bool(stale_reasons)
+    data["stale_reasons"] = stale_reasons
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    if regenerate:
+        headers["Deprecation"] = "true"
+        headers["X-Deprecated-Use"] = "POST /api/daily-report/generate"
+    return JSONResponse(content=data, headers=headers)
 
 
 @app.get("/api/daily-report/{date_str}")
@@ -3205,10 +3483,9 @@ def get_daily_report_by_date(date_str: str):
 def generate_daily_report(request: Request):
     """手动触发晨报生成"""
     _require_automation_request(request)
-    
+
     try:
-        from daily_morning_report import generate_and_save
-        result = generate_and_save()
+        result = _generate_daily_report_locked()
         return {
             "status": "success",
             "message": "晨报已生成",
@@ -3224,10 +3501,15 @@ def generate_daily_report(request: Request):
 # Overnight Holding API Endpoints
 # ============================================================
 
-OVERNIGHT_DIR = "/Users/USER/.gemini/antigravity/scratch/overnight_holding"
-OVERNIGHT_STATE_FILE = OVERNIGHT_DIR + "/state.json"
-OVERNIGHT_PYTHON = "/Users/USER/quant-viz-backtest/backend/venv/bin/python"
-OVERNIGHT_ENGINE = OVERNIGHT_DIR + "/overnight_engine.py"
+# 隔夜扫描引擎独立部署在扫描工作目录中；路径均可通过环境变量覆盖。
+# 解释器默认复用当前服务进程的解释器（项目 venv），避免绑定到某台机器的绝对路径。
+OVERNIGHT_DIR = os.getenv(
+    "QUANT_OVERNIGHT_DIR",
+    str(Path.home() / ".gemini" / "antigravity" / "scratch" / "overnight_holding"),
+)
+OVERNIGHT_STATE_FILE = str(Path(OVERNIGHT_DIR) / "state.json")
+OVERNIGHT_PYTHON = os.getenv("QUANT_OVERNIGHT_PYTHON", sys.executable)
+OVERNIGHT_ENGINE = str(Path(OVERNIGHT_DIR) / "overnight_engine.py")
 
 @app.get("/api/overnight/history")
 def get_overnight_history():
@@ -3263,10 +3545,15 @@ def run_overnight_scan(date: Optional[str] = None):
                     "data": history[date],
                     "params": state_data.get("params", {})
                 }
-        except Exception as e:
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"隔夜扫描 state.json 读取失败，回退到实时扫描: {e}")
 
     # 2. 实地运行 Python 脚本进行扫描
+    if not os.path.exists(OVERNIGHT_ENGINE):
+        raise HTTPException(
+            status_code=503,
+            detail=f"隔夜扫描引擎未部署（缺少 {OVERNIGHT_ENGINE}），请配置 QUANT_OVERNIGHT_DIR。",
+        )
     cmd = [OVERNIGHT_PYTHON, OVERNIGHT_ENGINE]
     if date:
         cmd.extend(["--date", date])
@@ -3323,9 +3610,14 @@ def run_overnight_scan(date: Optional[str] = None):
         }
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="扫描超时")
+    except HTTPException:
+        raise
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=f"隔夜扫描引擎不可用: {e}")
     except Exception as e:
+        logger.exception("隔夜扫描执行失败")
         raise HTTPException(status_code=500, detail=f"扫描执行失败: {e}")
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("MOMO_PORT", "8080")))

@@ -12,14 +12,26 @@ def read_file(f):
     try:
         df = pd.read_parquet(f)
         # Only keep essential columns for alpha mining to save memory
-        cols = ['date', 'stock_code', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate']
+        cols = [
+            'date', 'stock_code', 'stock_name',
+            'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg', 'turnover_rate', 'turn',
+            'tradestatus', 'pe', 'pb', 'ps', 'pcf', 'is_st'
+        ]
         available = [c for c in cols if c in df.columns]
         return df[available]
     except Exception as e:
         logger.error(f"Error reading {f.name}: {e}")
         return None
 
-def consolidate_lake(lake_dir="/Users/USER/quant_data_lake", output_dir="/Users/USER/quant_data_lake/consolidated"):
+# 数据湖默认位于项目根目录的同级目录，可用 QUANT_DATA_LAKE_DIR 覆盖。
+DEFAULT_LAKE_DIR = os.getenv(
+    "QUANT_DATA_LAKE_DIR", str(Path(__file__).resolve().parents[2].parent / "quant_data_lake")
+)
+
+
+def consolidate_lake(lake_dir=DEFAULT_LAKE_DIR, output_dir=None):
+    if output_dir is None:
+        output_dir = str(Path(lake_dir) / "consolidated")
     lake_path = Path(lake_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
