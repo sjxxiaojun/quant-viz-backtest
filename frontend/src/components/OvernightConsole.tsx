@@ -1,22 +1,16 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  Zap, 
-  Search, 
-  ShieldAlert, 
-  TrendingUp, 
-  TrendingDown, 
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Zap,
+  ShieldAlert,
+  TrendingUp,
+  TrendingDown,
   Calendar,
-  AlertTriangle,
-  RotateCcw,
   Sliders,
-  DollarSign,
-  PieChart as PieIcon,
   CheckCircle,
-  HelpCircle,
-  XCircle,
   Flame,
   Activity
 } from 'lucide-react';
+import { getApiErrorMessage } from '../api/client';
 import { EChart } from './EChart';
 
 interface PickItem {
@@ -63,20 +57,26 @@ export function OvernightConsole() {
   
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [targetDateInput, setTargetDateInput] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(false);
+  // 组件挂载后立即拉历史, 初始值直接给 true:
+  // 若在挂载 effect 里同步 setLoading(true) 会多触发一轮渲染(react-hooks/set-state-in-effect)。
+  const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  // 与 VirtualTrading / DailyReport 一致: 异步回来先确认组件还挂载着, 避免卸载后 setState;
+  // 卸载时 abort 掉在途请求。
+  const mountedRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Fetch initial history
-  const loadHistory = async () => {
+  const loadHistory = useCallback(async () => {
     try {
-      setLoading(true);
-      const res = await fetch('/api/overnight/history');
+      const res = await fetch('/api/overnight/history', { signal: abortRef.current?.signal });
       if (!res.ok) throw new Error('无法拉取历史记录数据');
       const data = await res.json();
-      
+      if (!mountedRef.current) return;
+
       setHistory(data.history || {});
       if (data.params) setParams(data.params);
-      
+
       // Default to the latest date in history
       const dates = Object.keys(data.history || {}).sort();
       if (dates.length > 0) {
@@ -90,16 +90,25 @@ export function OvernightConsole() {
         setTargetDateInput(todayStr);
       }
       setError(null);
-    } catch (err: any) {
-      setError(err.message || '初始化数据失败');
+    } catch (err: unknown) {
+      if (!mountedRef.current) return;
+      setError(getApiErrorMessage(err, '初始化数据失败'));
     } finally {
-      setLoading(false);
+      if (mountedRef.current) {
+        setLoading(false);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadHistory();
-  }, []);
+    mountedRef.current = true;
+    abortRef.current = new AbortController();
+    void loadHistory();
+    return () => {
+      mountedRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, [loadHistory]);
 
   const handleScan = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -110,7 +119,8 @@ export function OvernightConsole() {
       setError(null);
       
       const res = await fetch(`/api/overnight/scan?date=${targetDateInput}`, {
-        method: 'POST'
+        method: 'POST',
+        signal: abortRef.current?.signal
       });
       
       if (!res.ok) {
@@ -122,14 +132,18 @@ export function OvernightConsole() {
       
       // Reload history and set selected date
       await loadHistory();
+      if (!mountedRef.current) return;
       if (result.date) {
         setSelectedDate(result.date);
         setTargetDateInput(result.date);
       }
-    } catch (err: any) {
-      setError(err.message || '运行扫描出错');
+    } catch (err: unknown) {
+      if (!mountedRef.current) return;
+      setError(getApiErrorMessage(err, '运行扫描出错'));
     } finally {
-      setLoading(false);
+      if (mountedRef.current) {
+        setLoading(false);
+      }
     }
   };
 

@@ -1,55 +1,109 @@
 @import "tailwindcss";
 
-:root {
-  --bg-deep: #0a1628;
-  --bg-mid: #0f1d32;
-  --bg-surface: #132240;
-  --accent-blue: #3b82f6;
+/* ============================================================
+   momo quant pro — terminal design tokens (Tailwind v4 @theme)
+   分层底色: bg0(页面) / bg1(面板) / bg2(嵌套面板) / bg3(控件、hover)
+   A股语义: 红涨(up) / 绿跌(down) 全站唯一真理
+   动作色: buy / sell 用于按钮等交互动作, 与涨跌展示色区分
+   半径两档: panel 8px / ctl 6px; 阴影一档: shadow-panel
+   ============================================================ */
+@theme {
+  /* 分层底色 (石墨-深海军蓝) */
+  --color-bg0: #0b0e14;
+  --color-bg1: #10141d;
+  --color-bg2: #161c29;
+  --color-bg3: #1d2434;
+
+  /* 边框 */
+  --color-line: rgb(148 163 184 / 0.1);
+  --color-line-strong: rgb(148 163 184 / 0.2);
+
+  /* A股涨跌语义 (展示) */
+  --color-up: #f5483d;
+  --color-up-soft: #ff8078;
+  --color-down: #16a34a;
+  --color-down-soft: #4ade80;
+
+  /* 买卖动作语义 (按钮/操作, 与涨跌展示色区分) */
+  --color-buy: #d93a31;
+  --color-sell: #0e9150;
+
+  /* 品牌与状态 */
+  --color-accent: #4c8dff;
+  --color-warn: #f59e0b;
+  --color-ok: #34d399;
+
+  /* 半径两档 */
+  --radius-panel: 8px;
+  --radius-ctl: 6px;
+
+  /* 阴影一档 */
+  --shadow-panel: 0 1px 2px rgb(0 0 0 / 0.35), 0 8px 24px rgb(0 0 0 / 0.25);
+
+  /* 等宽数字字体栈 */
+  --font-num: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
 }
 
 body {
-  @apply min-h-screen font-sans antialiased;
-  background: linear-gradient(135deg, #0a1628 0%, #0d1f3c 40%, #101b33 70%, #0b1726 100%);
-  color: #e2e8f0;
+  min-height: 100vh;
+  background-color: var(--color-bg0);
+  color: #cbd5e1;
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Glass panels with navy tint */
-.glass {
-  background: rgba(15, 30, 56, 0.55);
-  backdrop-filter: blur(16px);
-  border: 1px solid rgba(59, 130, 246, 0.08);
-  border-radius: 1rem;
-  padding: 1.5rem;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+@layer components {
+  /* 等宽数字: 金额/价格/百分比统一使用 */
+  .num {
+    font-family: var(--font-num);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  /* 终端面板 */
+  .panel {
+    background-color: var(--color-bg1);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-panel);
+  }
+
+  .panel-nested {
+    background-color: var(--color-bg2);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-ctl);
+  }
+
+  /* 小号大写标签 (面板标题/表头) */
+  .label-caps {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: #64748b;
+  }
 }
 
-.input-field {
-  @apply border rounded px-4 py-2 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all;
-  background: rgba(10, 22, 40, 0.6);
-  border-color: rgba(59, 130, 246, 0.15);
-}
-
-.btn-primary {
-  @apply bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-6 rounded-lg transition-all shadow-lg active:scale-95;
-}
-
-/* Custom scrollbars */
+/* Custom scrollbars (紧凑、中性灰) */
 .custom-scrollbar::-webkit-scrollbar {
-  width: 4px;
+  width: 5px;
+  height: 5px;
 }
 .custom-scrollbar::-webkit-scrollbar-track {
-  background: rgba(10, 22, 40, 0.5);
+  background: transparent;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  @apply rounded-full;
-  background: rgba(59, 130, 246, 0.3);
+  border-radius: 9999px;
+  background: rgb(148 163 184 / 0.25);
 }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(59, 130, 246, 0.6);
+  background: rgb(148 163 184 / 0.45);
 }
 
 /* Date input styling for webkit */
 input[type="date"]::-webkit-calendar-picker-indicator {
-  filter: invert(0.6) sepia(1) saturate(3) hue-rotate(190deg);
+  filter: invert(0.6);
   cursor: pointer;
 }

@@ -1,63 +1,104 @@
-import React from 'react';
-import { ChevronRight } from 'lucide-react';
-import { cn } from '../utils';
-import { strategyInfo, colorMap } from '../config/strategies';
+import { AlertTriangle, ChevronRight } from 'lucide-react';
+import { EmptyState, Panel, SectionTitle, Skeleton, Tag } from './ui';
+import { useStrategyCatalog } from '../hooks/useStrategyCatalog';
+import {
+  getExecutionModeLabel,
+  getHoldingPolicyLabel,
+  getPoolShortLabel,
+  groupByCategory,
+  type StrategyCatalogEntry,
+} from '../api/strategyCatalog';
 
 interface StrategyMallProps {
   onRun: (factor: string) => void;
 }
 
-export function StrategyMall({ onRun }: StrategyMallProps) {
+function StrategyRow({ entry, onRun }: { entry: StrategyCatalogEntry; onRun: (id: string) => void }) {
   return (
-    <div className="space-y-12 animate-in fade-in duration-500">
-      
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-        {Object.entries(strategyInfo).map(([key, info]) => (
-          <div 
-            key={key} 
-            className="group relative rounded-[2.5rem] p-8 hover:border-blue-500/30 transition-all duration-500 shadow-2xl overflow-hidden"
-            style={{ background: 'rgba(13, 27, 50, 0.4)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
-          >
-            <div className={cn(
-              "absolute -right-12 -top-12 w-48 h-48 rounded-full blur-3xl opacity-10 group-hover:opacity-30 transition-opacity duration-500 transform-gpu",
-              colorMap[info.color]?.bgBlur || 'bg-blue-500'
-            )} />
-            
-            <div className="relative z-10 space-y-6">
-              <div className="flex justify-between items-start">
-                <div className={cn("p-4 rounded-2xl", colorMap[info.color]?.textBg || 'bg-blue-500/10', colorMap[info.color]?.text || 'text-blue-400')}>
-                  {React.createElement(info.icon, { className: "w-8 h-8" })}
-                </div>
-                <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest px-3 py-1 rounded-full" style={{ background: 'rgba(10, 22, 40, 0.6)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.1)' }}>
-                  {info.category}
-                </span>
-              </div>
-              
-              <div className="space-y-2">
-                <h3 className="text-xl font-black text-slate-100 group-hover:text-blue-400 transition-colors">{info.name}</h3>
-                <p className="text-sm text-slate-400 leading-relaxed min-h-[4.5rem]">
-                  {info.desc}
-                </p>
-              </div>
+    <button
+      type="button"
+      onClick={() => onRun(entry.id)}
+      className="group flex w-full flex-col gap-1.5 rounded-ctl border border-line bg-bg2 px-3 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-bg3"
+      title={entry.desc}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate text-[13px] font-semibold text-slate-200 group-hover:text-accent">
+          {entry.name}
+        </span>
+        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-600 transition-transform group-hover:translate-x-0.5 group-hover:text-accent" />
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Tag tone={entry.assetClass === 'etf' ? 'warn' : 'accent'}>
+          {getPoolShortLabel(entry.pool)}
+        </Tag>
+        <Tag>{getExecutionModeLabel(entry.executionMode)}</Tag>
+        <Tag>{getHoldingPolicyLabel(entry.holdingPolicy)}</Tag>
+        {entry.requiresArtifact && <Tag tone="warn">依赖模型工件</Tag>}
+      </div>
+      {entry.desc && (
+        <p className="line-clamp-2 text-[11px] leading-relaxed text-slate-500">{entry.desc}</p>
+      )}
+    </button>
+  );
+}
 
-              <div className="flex flex-wrap gap-2">
-                {info.tags.map(tag => (
-                  <span key={tag} className="text-[9px] font-bold text-slate-500 border border-slate-700/50 px-2 py-1 rounded-md uppercase tracking-wider">
-                    #{tag}
-                  </span>
-                ))}
-              </div>
+export function StrategyMall({ onRun }: StrategyMallProps) {
+  const { catalog, loading, fallbackReason } = useStrategyCatalog();
 
-              <button 
-                onClick={() => onRun(key)}
-                className="w-full hover:bg-blue-600 text-white font-bold py-4 rounded-2xl hover:border-blue-500 transition-all flex items-center justify-center gap-2 group/btn"
-                style={{ background: 'rgba(10, 22, 40, 0.7)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.1)' }}
-              >
-                <span>运行仿真</span>
-                <ChevronRight className="w-4 h-4 group-hover/btn:translate-x-1 transition-transform" />
-              </button>
-            </div>
+  if (loading) {
+    return (
+      <div className="space-y-4">
+        <Panel>
+          <SectionTitle>策略目录</SectionTitle>
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+            {Array.from({ length: 9 }, (_, i) => (
+              <Skeleton key={i} className="h-[76px]" />
+            ))}
           </div>
+        </Panel>
+      </div>
+    );
+  }
+
+  if (catalog.length === 0) {
+    return (
+      <EmptyState
+        title="策略目录为空"
+        description="后端未返回任何策略，请确认服务已启动。"
+      />
+    );
+  }
+
+  const groups = groupByCategory(catalog);
+
+  return (
+    <div className="space-y-4">
+      {fallbackReason && (
+        <div className="flex items-start gap-2 rounded-panel border border-warn/30 bg-warn/10 px-3 py-2 text-[11px] text-warn">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>策略目录接口不可用，当前展示本地内置策略（{fallbackReason}）。</span>
+        </div>
+      )}
+      <div className="flex items-baseline justify-between">
+        <h2 className="text-sm font-semibold text-slate-200">策略目录</h2>
+        <span className="label-caps">
+          共 <span className="num text-slate-300">{catalog.length}</span> 套 · 点击进入仿真控制台
+        </span>
+      </div>
+      <div className="space-y-4">
+        {groups.map(([category, entries]) => (
+          <Panel key={category} padded={false} className="p-3">
+            <SectionTitle
+              right={<span className="num text-[10px] text-slate-600">{entries.length}</span>}
+            >
+              {category}
+            </SectionTitle>
+            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+              {entries.map((entry) => (
+                <StrategyRow key={entry.id} entry={entry} onRun={onRun} />
+              ))}
+            </div>
+          </Panel>
         ))}
       </div>
     </div>

@@ -1,82 +1,127 @@
-import React from 'react';
-import { cn } from '../utils';
+import { useMemo, useState } from 'react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { cn, formatAmountCN, formatNumber } from '../utils';
+import { EmptyState, Panel, SectionTitle } from './ui';
 import type { BacktestResult } from '../types';
 
 interface TradeTableProps {
   result: BacktestResult;
 }
 
+const PAGE_SIZE = 50;
+
+const SIDE_META: Record<string, { label: string; className: string }> = {
+  // A股动作色: 买入红 / 卖出绿; 止损止盈本质是卖出, 保持绿色, 熔断标警示色
+  buy: { label: '买入', className: 'border-buy/30 bg-buy/10 text-up-soft' },
+  sell: { label: '卖出', className: 'border-sell/30 bg-sell/10 text-down-soft' },
+  stop_loss: { label: '止损', className: 'border-sell/30 bg-sell/10 text-down-soft' },
+  take_profit: { label: '止盈', className: 'border-sell/30 bg-sell/10 text-down-soft' },
+  circuit_break: { label: '熔断', className: 'border-warn/30 bg-warn/10 text-warn' },
+};
+
+function sideMeta(side: string) {
+  return SIDE_META[side] ?? { label: '卖出', className: SIDE_META.sell.className };
+}
+
 export function TradeTable({ result }: TradeTableProps) {
-  const visibleTrades = result.trades.slice(-500).reverse();
-  const hiddenCount = Math.max(0, result.trades.length - visibleTrades.length);
+  const [page, setPage] = useState(0);
+
+  const trades = useMemo(() => [...result.trades].reverse(), [result.trades]);
+  const totalPages = Math.max(1, Math.ceil(trades.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages - 1);
+  const pageTrades = trades.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+
+  const pager = (
+    <div className="flex items-center gap-1.5">
+      <span className="num text-[10px] text-slate-500">
+        {trades.length === 0 ? '0' : `${currentPage * PAGE_SIZE + 1}-${currentPage * PAGE_SIZE + pageTrades.length}`} / {trades.length}
+      </span>
+      <button
+        type="button"
+        aria-label="上一页"
+        disabled={currentPage === 0}
+        onClick={() => setPage(currentPage - 1)}
+        className="rounded-ctl border border-line p-1 text-slate-400 transition-colors hover:bg-bg3 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-30"
+      >
+        <ChevronLeft className="h-3.5 w-3.5" />
+      </button>
+      <button
+        type="button"
+        aria-label="下一页"
+        disabled={currentPage >= totalPages - 1}
+        onClick={() => setPage(currentPage + 1)}
+        className="rounded-ctl border border-line p-1 text-slate-400 transition-colors hover:bg-bg3 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-30"
+      >
+        <ChevronRight className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+
   return (
-    <div className="rounded-[2.5rem] p-8 backdrop-blur-xl animate-in fade-in duration-700" style={{ background: 'rgba(13, 27, 50, 0.4)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}>
-      <h3 className="text-lg font-bold mb-6 flex items-center gap-3">
-        <div className="w-2 h-6 bg-blue-500 rounded-full" />
-        历史成交记录
-      </h3>
-      {hiddenCount > 0 && (
-        <div className="mb-4 rounded-xl border border-blue-500/10 bg-blue-500/5 px-4 py-2 text-xs text-slate-400">
-          当前仅展示最近 500 条成交，已折叠较早的 {hiddenCount} 条。
+    <Panel padded={false} className="p-3">
+      <SectionTitle right={pager}>历史成交记录</SectionTitle>
+      {trades.length === 0 ? (
+        <EmptyState title="回测期间没有产生任何成交" className="border-0 py-6" />
+      ) : (
+        <div className="custom-scrollbar max-h-[420px] overflow-auto">
+          <table className="w-full border-collapse text-xs">
+            <thead className="sticky top-0 z-10 bg-bg1">
+              <tr className="border-b border-line-strong text-left">
+                <th className="label-caps py-1.5 pr-3 font-semibold">日期</th>
+                <th className="label-caps py-1.5 pr-3 font-semibold">标的</th>
+                <th className="label-caps py-1.5 pr-3 font-semibold">方向</th>
+                <th className="label-caps py-1.5 pr-3 text-right font-semibold">价格</th>
+                <th className="label-caps py-1.5 pr-3 text-right font-semibold">股数</th>
+                <th className="label-caps py-1.5 text-right font-semibold">成交额</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pageTrades.map((trade, i) => {
+                const meta = sideMeta(trade.side);
+                return (
+                  <tr
+                    key={`${trade.date}-${trade.stock_code}-${trade.side}-${i}`}
+                    className="h-8 border-b border-line transition-colors last:border-0 hover:bg-bg2"
+                  >
+                    <td className="num whitespace-nowrap py-1 pr-3 text-slate-500">{trade.date}</td>
+                    <td className="whitespace-nowrap py-1 pr-3">
+                      <span className="font-medium text-slate-200">{trade.stock_name}</span>
+                      <span className="num ml-1.5 text-[10px] text-slate-600">{trade.stock_code}</span>
+                    </td>
+                    <td className="whitespace-nowrap py-1 pr-3">
+                      <span
+                        className={cn(
+                          'inline-flex items-center rounded-ctl border px-1.5 py-0.5 text-[10px] font-medium leading-none',
+                          meta.className,
+                        )}
+                      >
+                        {meta.label}
+                      </span>
+                    </td>
+                    <td className="num whitespace-nowrap py-1 pr-3 text-right text-slate-300">
+                      {formatNumber(trade.price)}
+                    </td>
+                    <td className="num whitespace-nowrap py-1 pr-3 text-right text-slate-300">
+                      {trade.fill_status === 'partial' && trade.requested_qty ? (
+                        <span title={`委托 ${trade.requested_qty} 股，部分成交`}>
+                          {formatNumber(trade.qty, 0)}
+                          <span className="text-slate-600">/{formatNumber(trade.requested_qty, 0)}</span>
+                          <span className="ml-1 text-[9px] font-semibold text-warn">部分</span>
+                        </span>
+                      ) : (
+                        formatNumber(trade.qty, 0)
+                      )}
+                    </td>
+                    <td className="num whitespace-nowrap py-1 text-right text-slate-400">
+                      {formatAmountCN(trade.price * trade.qty)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
-      <div className="overflow-x-auto max-h-[400px] custom-scrollbar">
-        <table className="w-full text-left border-separate border-spacing-y-2">
-          <thead className="sticky top-0 z-10" style={{ background: '#0d1f3c' }}>
-            <tr className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-black">
-              <th className="pb-4 px-4">成交日期</th>
-              <th className="pb-4 px-4">标的代码/名称</th>
-              <th className="pb-4 px-4">类型</th>
-              <th className="pb-4 px-4 text-right">价格</th>
-              <th className="pb-4 px-4 text-right">成交/委托股数</th>
-            </tr>
-          </thead>
-          <tbody className="text-sm">
-            {visibleTrades.map((trade, i) => (
-              <tr key={i} className="hover:bg-blue-500/5 transition-colors" style={{ background: 'rgba(13, 27, 50, 0.5)' }}>
-                <td className="py-4 px-4 rounded-l-2xl text-slate-400 font-mono">{trade.date}</td>
-                <td className="py-4 px-4">
-                  <div className="flex flex-col">
-                    <span className="font-bold text-blue-400">{trade.stock_name}</span>
-                    <span className="text-[10px] text-slate-500 font-mono">{trade.stock_code}</span>
-                  </div>
-                </td>
-                <td className="py-4 px-4">
-                  <span className={cn(
-                    "px-3 py-1 rounded-full text-[10px] font-black uppercase",
-                    trade.side === 'buy'
-                      ? "bg-rose-500/10 text-rose-500 border border-rose-500/20"
-                      : trade.side === 'stop_loss'
-                      ? "bg-yellow-500/10 text-yellow-400 border border-yellow-500/20"
-                      : trade.side === 'take_profit'
-                      ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                      : trade.side === 'circuit_break'
-                      ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
-                      : "bg-emerald-500/10 text-emerald-500 border border-emerald-500/20"
-                  )}>
-                    {trade.side === 'buy' ? '建仓买入'
-                      : trade.side === 'stop_loss' ? '个股止损'
-                      : trade.side === 'take_profit' ? '个股止盈'
-                      : trade.side === 'circuit_break' ? '旧版熔断'
-                      : '减仓卖出'}
-                  </span>
-                </td>
-                <td className="py-4 px-4 font-mono text-slate-300 text-right">¥{trade.price.toFixed(2)}</td>
-                <td className="py-4 px-4 rounded-r-2xl text-right">
-                  <div className="font-mono text-slate-300">
-                    {trade.fill_status === 'partial' && trade.requested_qty
-                      ? `${trade.qty}/${trade.requested_qty}`
-                      : trade.qty}
-                  </div>
-                  {trade.fill_status === 'partial' && (
-                    <div className="mt-1 text-[10px] font-bold text-amber-300">部分</div>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
+    </Panel>
   );
 }

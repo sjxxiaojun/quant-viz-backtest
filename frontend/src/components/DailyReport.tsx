@@ -1,6 +1,8 @@
-import React, { useState, useEffect } from 'react';
-import { Newspaper, RefreshCw, TrendingUp, TrendingDown, AlertTriangle, Star, Clock, BarChart3, Target, Shield } from 'lucide-react';
-import { apiGet } from '../api/client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AlertTriangle, Newspaper, RefreshCw, Star, TrendingDown, TrendingUp } from 'lucide-react';
+import { apiGet, apiPost, getApiErrorMessage, isRequestCanceled } from '../api/client';
+import { changeToneClass, cn, formatNumber, formatPercent } from '../utils';
+import { EmptyState, Panel, SectionTitle, Skeleton, Stat, Tag } from './ui';
 
 interface Recommendation {
   rank: number;
@@ -44,6 +46,24 @@ interface DailyReportData {
   factor_status: FactorStatus;
   recommendations: Recommendation[];
   risk_warnings: string[];
+  /** 后端 GET /api/daily-report/latest 只读返回缓存, 用该字段标记缓存是否过期 */
+  stale?: boolean;
+  /** 过期原因代码, 与 backend/main.py:_daily_report_staleness 一一对应 */
+  stale_reasons?: string[];
+}
+
+const HEADER_CELL = 'label-caps px-3 py-2 whitespace-nowrap';
+const CELL = 'px-3 py-1.5 whitespace-nowrap';
+
+/** 过期原因代码 -> 人话。代码来源: backend/main.py `_daily_report_staleness()` */
+const STALE_REASON_LABELS: Record<string, string> = {
+  missing_current_price: '推荐标的缺少最新价，行情数据尚未回填',
+  missing_stock_name: '推荐标的缺少股票名称，标的元数据不完整',
+  report_date_outdated: '报告日期已落后于当前日期，不是最新一期晨报',
+};
+
+function staleReasonLabel(code: string): string {
+  return STALE_REASON_LABELS[code] ?? `未知过期原因（${code}）`;
 }
 
 export function DailyReport() {
@@ -51,69 +71,108 @@ export function DailyReport() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
+  const mountedRef = useRef(false);
+  const requestRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const fetchReport = async () => {
+  // 只负责取数; 加载态/错误态的"进入"由调用方决定:
+  // 首屏靠 loading 的初始值 true(挂载 effect 内同步 setState 会多触发一轮渲染),
+  // 手动刷新走下面的 refreshReport。
+  const fetchReport = useCallback(async () => {
+    const requestId = ++requestRef.current;
+    try {
+      const data = await apiGet<DailyReportData>('/api/daily-report/latest', {
+        signal: abortRef.current?.signal,
+      });
+      if (!mountedRef.current || requestId !== requestRef.current) return;
+      setReport(data);
+      setError(null);
+    } catch (err: unknown) {
+      if (isRequestCanceled(err)) return;
+      if (!mountedRef.current || requestId !== requestRef.current) return;
+      setError(getApiErrorMessage(err, '获取晨报失败'));
+    } finally {
+      if (mountedRef.current && requestId === requestRef.current) {
+        setLoading(false);
+      }
+    }
+  }, []);
+
+  const refreshReport = useCallback(async () => {
     setLoading(true);
     setError(null);
-    try {
-      const data = await apiGet<DailyReportData>('/api/daily-report/latest');
-      setReport(data);
-    } catch (err: any) {
-      setError(err.message || '获取晨报失败');
-    } finally {
-      setLoading(false);
-    }
-  };
+    await fetchReport();
+  }, [fetchReport]);
 
+  // 重新生成一律走 POST /api/daily-report/generate。
+  // GET /api/daily-report/latest 已改为只读缓存(regenerate=true 属 deprecated 兼容路径),
+  // 不会再自动重生成, 所以过期只能由用户在这里显式触发。
   const generateReport = async () => {
     setGenerating(true);
     try {
-      const response = await fetch('http://127.0.0.1:8080/api/daily-report/generate', {
-        method: 'POST',
+      await apiPost('/api/daily-report/generate', undefined, {
+        timeout: 300000,
+        signal: abortRef.current?.signal,
       });
-      if (!response.ok) {
-        throw new Error('生成失败');
-      }
-      await fetchReport();
-    } catch (err: any) {
-      setError(err.message || '生成晨报失败');
+      if (!mountedRef.current) return;
+      await refreshReport();
+    } catch (err: unknown) {
+      if (isRequestCanceled(err)) return;
+      if (!mountedRef.current) return;
+      setError(getApiErrorMessage(err, '生成晨报失败'));
     } finally {
-      setGenerating(false);
+      if (mountedRef.current) {
+        setGenerating(false);
+      }
     }
   };
 
   useEffect(() => {
-    fetchReport();
-  }, []);
+    mountedRef.current = true;
+    abortRef.current = new AbortController();
+    void fetchReport();
+    return () => {
+      mountedRef.current = false;
+      requestRef.current += 1;
+      abortRef.current?.abort();
+    };
+  }, [fetchReport]);
 
   if (loading) {
     return (
-      <div className="min-h-[400px] flex items-center justify-center">
-        <div className="text-center space-y-4">
-          <div className="w-12 h-12 border-4 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin mx-auto" />
-          <p className="text-slate-400 text-sm">正在加载晨报...</p>
+      <div className="space-y-3">
+        <Skeleton className="h-9 w-64" />
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          {Array.from({ length: 4 }, (_, i) => (
+            <Skeleton key={i} className="h-20 w-full" />
+          ))}
         </div>
+        <Skeleton className="h-64 w-full" />
       </div>
     );
   }
 
-  if (error) {
+  // 已经有报告内容时不整屏顶掉(否则重新生成失败会把过期提示一起弄丢),
+  // 错误改为在报告上方以横条展示。
+  if (error && !report) {
     return (
-      <div className="space-y-6">
-        <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 px-5 py-4 text-sm text-rose-100">
+      <div className="space-y-3">
+        <div className="rounded-panel border border-up/30 bg-up/10 px-4 py-3 text-xs text-up-soft">
           {error}
         </div>
-        <div className="flex gap-3">
+        <div className="flex gap-2">
           <button
-            onClick={fetchReport}
-            className="px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-500 transition-colors"
+            type="button"
+            onClick={() => void refreshReport()}
+            className="rounded-ctl bg-accent px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-accent/85"
           >
             重试
           </button>
           <button
-            onClick={generateReport}
+            type="button"
+            onClick={() => void generateReport()}
             disabled={generating}
-            className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-bold hover:bg-emerald-500 transition-colors disabled:opacity-50"
+            className="rounded-ctl border border-line bg-bg2 px-3 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:bg-bg3 disabled:opacity-50"
           >
             {generating ? '生成中...' : '生成新晨报'}
           </button>
@@ -124,228 +183,275 @@ export function DailyReport() {
 
   if (!report) {
     return (
-      <div className="space-y-6">
-        <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 px-5 py-8 text-center">
-          <Newspaper className="w-12 h-12 text-slate-500 mx-auto mb-4" />
-          <p className="text-slate-400 mb-4">暂无晨报数据</p>
+      <EmptyState
+        icon={<Newspaper className="h-6 w-6" />}
+        title="暂无晨报数据"
+        description="生成后展示市场概览、因子状态与 Top 10 推荐。"
+        action={
           <button
-            onClick={generateReport}
+            type="button"
+            onClick={() => void generateReport()}
             disabled={generating}
-            className="px-6 py-3 bg-emerald-600 text-white rounded-xl text-sm font-bold hover:bg-emerald-500 transition-colors disabled:opacity-50"
+            className="rounded-ctl bg-accent px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-accent/85 disabled:opacity-50"
           >
             {generating ? '生成中...' : '生成今日晨报'}
           </button>
-        </div>
-      </div>
+        }
+      />
     );
   }
 
+  const staleReasons = report.stale_reasons ?? [];
+  const isStale = report.stale === true || staleReasons.length > 0;
+
   return (
-    <div className="space-y-8 animate-in slide-in-from-bottom-4 duration-500">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="space-y-1">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-900/20">
-              <Newspaper className="text-white w-6 h-6" />
+    <div className="space-y-3">
+      {error && (
+        <div className="rounded-panel border border-up/30 bg-up/10 px-4 py-2.5 text-xs text-up-soft">
+          {error}
+        </div>
+      )}
+
+      {/* 缓存过期提示: 后端 GET 只读返回缓存, 不再自动重生成, 必须显式告知用户 */}
+      {isStale && (
+        <Panel className="border-warn/40 bg-warn/5">
+          <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-warn">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span className="text-sm font-semibold">当前晨报已过期</span>
+              </div>
+              <p className="mt-1 text-xs text-slate-300">
+                下方内容来自缓存文件，接口不会自动重新生成；请点击右侧按钮手动重新生成后再据此决策。
+              </p>
+              {staleReasons.length > 0 ? (
+                <ul className="mt-2 space-y-1">
+                  {staleReasons.map((reason) => (
+                    <li key={reason} className="flex items-start gap-2 text-xs text-slate-300">
+                      <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-warn" />
+                      <span>
+                        {staleReasonLabel(reason)}
+                        <span className="num ml-1.5 text-[10px] text-slate-500">({reason})</span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-xs text-slate-400">后端未给出具体过期原因。</p>
+              )}
             </div>
-            <h2 className="text-2xl font-black tracking-tighter text-emerald-500">
-              量化晨报
-            </h2>
+            <button
+              type="button"
+              onClick={() => void generateReport()}
+              disabled={generating}
+              className="inline-flex shrink-0 items-center gap-1.5 self-start rounded-ctl border border-warn/50 bg-warn/15 px-3 py-1.5 text-xs font-semibold text-warn transition-colors hover:bg-warn/25 disabled:opacity-50"
+            >
+              {generating ? (
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-warn/30 border-t-warn" />
+              ) : (
+                <RefreshCw className="h-3 w-3" />
+              )}
+              {generating ? '重新生成中...' : '立即重新生成'}
+            </button>
           </div>
-          <p className="text-slate-500 text-xs ml-13">
-            {report.report_date} | 生成时间: {new Date(report.generated_at).toLocaleString('zh-CN')}
+        </Panel>
+      )}
+
+      {/* 头部 */}
+      <Panel className="flex flex-col justify-between gap-3 md:flex-row md:items-center">
+        <div>
+          <div className="flex items-center gap-2">
+            <Newspaper className="h-4 w-4 text-accent" />
+            <h2 className="text-base font-semibold text-slate-100">量化晨报</h2>
+            {isStale ? (
+              <Tag tone="warn" title={staleReasons.map(staleReasonLabel).join('；')}>
+                <AlertTriangle className="h-2.5 w-2.5" />
+                已过期
+              </Tag>
+            ) : (
+              <Tag tone="ok">最新</Tag>
+            )}
+          </div>
+          <p className="num mt-1 text-[11px] text-slate-500">
+            {report.report_date} · 生成时间 {new Date(report.generated_at).toLocaleString('zh-CN')}
           </p>
         </div>
-        <div className="flex gap-3">
+        <div className="flex shrink-0 gap-2">
           <button
-            onClick={fetchReport}
-            className="px-4 py-2 bg-slate-700/50 text-slate-300 rounded-xl text-sm font-bold hover:bg-slate-600/50 transition-colors flex items-center gap-2"
+            type="button"
+            onClick={() => void refreshReport()}
+            className="inline-flex items-center gap-1.5 rounded-ctl border border-line bg-bg2 px-3 py-1.5 text-xs font-semibold text-slate-300 transition-colors hover:bg-bg3 hover:text-slate-100"
           >
-            <RefreshCw className="w-4 h-4" /> 刷新
+            <RefreshCw className="h-3 w-3" /> 刷新
           </button>
           <button
-            onClick={generateReport}
+            type="button"
+            onClick={() => void generateReport()}
             disabled={generating}
-            className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-bold hover:bg-emerald-500 transition-colors disabled:opacity-50 flex items-center gap-2"
+            className="inline-flex items-center gap-1.5 rounded-ctl bg-accent px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-accent/85 disabled:opacity-50"
           >
-            {generating ? <Clock className="w-4 h-4 animate-spin" /> : <Newspaper className="w-4 h-4" />}
+            {generating ? (
+              <span className="h-3 w-3 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+            ) : (
+              <Newspaper className="h-3 w-3" />
+            )}
             {generating ? '生成中...' : '生成新晨报'}
           </button>
         </div>
-      </div>
+      </Panel>
 
-      {/* Market Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 p-5">
-          <div className="flex items-center gap-3 mb-3">
-            <BarChart3 className="w-5 h-5 text-blue-400" />
-            <span className="text-slate-400 text-xs font-bold uppercase tracking-wider">股票总数</span>
-          </div>
-          <p className="text-3xl font-black text-white">{report.market_overview.total_stocks}</p>
-        </div>
-        <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 p-5">
-          <div className="flex items-center gap-3 mb-3">
-            <Target className="w-5 h-5 text-emerald-400" />
-            <span className="text-slate-400 text-xs font-bold uppercase tracking-wider">信号股票</span>
-          </div>
-          <p className="text-3xl font-black text-emerald-400">{report.market_overview.signal_count}</p>
-        </div>
-        <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 p-5">
-          <div className="flex items-center gap-3 mb-3">
-            <TrendingUp className="w-5 h-5 text-cyan-400" />
-            <span className="text-slate-400 text-xs font-bold uppercase tracking-wider">平均分数</span>
-          </div>
-          <p className="text-3xl font-black text-cyan-400">{report.market_overview.avg_score.toFixed(4)}</p>
-        </div>
-        <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 p-5">
-          <div className="flex items-center gap-3 mb-3">
-            <Shield className="w-5 h-5 text-amber-400" />
-            <span className="text-slate-400 text-xs font-bold uppercase tracking-wider">Test RankIC</span>
-          </div>
-          <p className="text-3xl font-black text-amber-400">{report.factor_status.test_rank_ic.toFixed(4)}</p>
-        </div>
-      </div>
+      {/* 市场概览 */}
+      <Panel className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <Stat label="股票总数" value={formatNumber(report.market_overview.total_stocks, 0)} />
+        <Stat label="信号股票" value={formatNumber(report.market_overview.signal_count, 0)} />
+        <Stat label="平均分数" value={report.market_overview.avg_score.toFixed(4)} />
+        <Stat label="Test RankIC" value={report.factor_status.test_rank_ic.toFixed(4)} />
+      </Panel>
 
-      {/* Factor Status */}
-      <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 p-6">
-        <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
-          <Star className="w-5 h-5 text-amber-400" /> 因子状态
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      {/* 因子状态 */}
+      <Panel>
+        <SectionTitle>因子状态</SectionTitle>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           <div>
-            <p className="text-slate-500 text-xs mb-1">最佳因子</p>
-            <p className="text-white font-bold">{report.factor_status.best_factor}</p>
+            <div className="label-caps">最佳因子</div>
+            <div className="mt-0.5 text-sm font-semibold text-slate-100">
+              {report.factor_status.best_factor}
+            </div>
           </div>
           <div>
-            <p className="text-slate-500 text-xs mb-1">Test Top20收益</p>
-            <p className="text-emerald-400 font-bold">{(report.factor_status.test_top20_ret * 100).toFixed(2)}%</p>
+            <div className="label-caps">Test Top20 收益</div>
+            <div
+              className={cn(
+                'num mt-0.5 text-sm font-semibold',
+                changeToneClass(report.factor_status.test_top20_ret),
+              )}
+            >
+              {formatPercent(report.factor_status.test_top20_ret, { signed: true })}
+            </div>
           </div>
           <div>
-            <p className="text-slate-500 text-xs mb-1">模型融合</p>
-            <p className="text-white font-bold">
-              {report.factor_status.model_recipe.baseline_model} {Math.round(report.factor_status.model_recipe.baseline_weight * 100)}% + {report.factor_status.model_recipe.nonlinear_model} {Math.round(report.factor_status.model_recipe.nonlinear_weight * 100)}%
-            </p>
+            <div className="label-caps">模型融合</div>
+            <div className="num mt-0.5 text-sm font-semibold text-slate-100">
+              {report.factor_status.model_recipe.baseline_model}{' '}
+              {Math.round(report.factor_status.model_recipe.baseline_weight * 100)}% +{' '}
+              {report.factor_status.model_recipe.nonlinear_model}{' '}
+              {Math.round(report.factor_status.model_recipe.nonlinear_weight * 100)}%
+            </div>
           </div>
         </div>
-      </div>
+      </Panel>
 
-      {/* Recommendations Table */}
-      <div className="rounded-2xl border border-slate-700/50 bg-slate-800/50 overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-700/50">
-          <h3 className="text-lg font-bold text-white flex items-center gap-2">
-            <TrendingUp className="w-5 h-5 text-emerald-400" /> 今日Top 10推荐
-          </h3>
+      {/* Top 10 推荐 */}
+      <Panel padded={false} className="overflow-hidden">
+        <div className="border-b border-line px-3 py-2">
+          <span className="label-caps">今日 Top 10 推荐</span>
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              <tr className="border-b border-slate-700/50">
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">排名</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">代码</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">名称</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">最新价</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">涨跌幅</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">分数</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">信号</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">持仓</th>
-                <th className="px-6 py-3 text-left text-xs font-bold text-slate-400 uppercase tracking-wider">建议</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-700/50">
-              {report.recommendations.map((rec) => (
-                <tr key={rec.rank} className="hover:bg-slate-700/30 transition-colors">
-                  <td className="px-6 py-4">
-                    <span className={`inline-flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold ${
-                      rec.rank <= 3 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-700/50 text-slate-400'
-                    }`}>
-                      {rec.rank}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 text-sm text-slate-300 font-mono">{rec.stock_code}</td>
-                  <td className="px-6 py-4 text-sm text-white font-bold">{rec.stock_name}</td>
-                  <td className="px-6 py-4">
-                    {rec.current_price ? (
-                      <span className="text-sm text-white font-mono">
-                        ¥{rec.current_price.toFixed(2)}
-                      </span>
-                    ) : (
-                      <span className="text-slate-500 text-xs">--</span>
-                    )}
-                  </td>
-                  <td className="px-6 py-4">
-                    {rec.pct_chg !== null && rec.pct_chg !== undefined ? (
-                      <span className={`inline-flex items-center gap-1 text-sm font-bold ${
-                        rec.pct_chg > 0 ? 'text-rose-400' : rec.pct_chg < 0 ? 'text-emerald-400' : 'text-slate-400'
-                      }`}>
-                        {rec.pct_chg > 0 ? <TrendingUp className="w-3 h-3" /> : rec.pct_chg < 0 ? <TrendingDown className="w-3 h-3" /> : null}
-                        {rec.pct_chg > 0 ? '+' : ''}{rec.pct_chg.toFixed(2)}%
-                      </span>
-                    ) : (
-                      <span className="text-slate-500 text-xs">--</span>
-                    )}
-                  </td>
-                  <td className="px-6 py-4">
-                    <span className={`text-sm font-bold ${
-                      rec.score >= 0.9 ? 'text-emerald-400' : rec.score >= 0.7 ? 'text-cyan-400' : 'text-slate-400'
-                    }`}>
-                      {rec.score.toFixed(4)}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4">
-                    {rec.signal === 1 ? (
-                      <span className="inline-flex items-center gap-1 text-emerald-400 text-xs font-bold">
-                        <TrendingUp className="w-3 h-3" /> 买入
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 text-slate-500 text-xs">
-                        <TrendingDown className="w-3 h-3" /> 观察
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-6 py-4">
-                    {rec.held ? (
-                      <span className="inline-flex items-center gap-1 text-amber-400 text-xs font-bold">
-                        <Star className="w-3 h-3" /> {rec.holding_strategies.join(', ')}
-                      </span>
-                    ) : (
-                      <span className="text-slate-500 text-xs">未持仓</span>
-                    )}
-                  </td>
-                  <td className="px-6 py-4">
-                    <span className={`inline-flex px-3 py-1 rounded-full text-xs font-bold ${
-                      rec.recommendation === '持有' ? 'bg-amber-500/20 text-amber-400' : 'bg-emerald-500/20 text-emerald-400'
-                    }`}>
-                      {rec.recommendation}
-                    </span>
-                  </td>
+        {report.recommendations.length ? (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-left text-xs">
+              <thead>
+                <tr className="border-b border-line bg-bg2">
+                  <th className={HEADER_CELL}>排名</th>
+                  <th className={HEADER_CELL}>代码</th>
+                  <th className={HEADER_CELL}>名称</th>
+                  <th className={cn(HEADER_CELL, 'text-right')}>最新价</th>
+                  <th className={cn(HEADER_CELL, 'text-right')}>涨跌幅</th>
+                  <th className={cn(HEADER_CELL, 'text-right')}>分数</th>
+                  <th className={HEADER_CELL}>信号</th>
+                  <th className={HEADER_CELL}>持仓</th>
+                  <th className={HEADER_CELL}>建议</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {report.recommendations.map((rec) => (
+                  <tr key={rec.rank} className="transition-colors hover:bg-bg2">
+                    <td className={cn(CELL, 'num', rec.rank <= 3 ? 'font-semibold text-accent' : 'text-slate-400')}>
+                      {rec.rank}
+                    </td>
+                    <td className={cn(CELL, 'num text-slate-300')}>{rec.stock_code}</td>
+                    <td className={cn(CELL, 'font-medium text-slate-100')}>{rec.stock_name}</td>
+                    <td className={cn(CELL, 'num text-right text-slate-200')}>
+                      {rec.current_price != null ? `¥${formatNumber(rec.current_price)}` : '--'}
+                    </td>
+                    <td className={cn(CELL, 'text-right')}>
+                      {rec.pct_chg != null ? (
+                        // A股语义: 红涨绿跌 (pct_chg 为百分数口径)
+                        <span
+                          className={cn(
+                            'num inline-flex items-center justify-end gap-1 font-medium',
+                            changeToneClass(rec.pct_chg),
+                          )}
+                        >
+                          {rec.pct_chg > 0 ? (
+                            <TrendingUp className="h-3 w-3" />
+                          ) : rec.pct_chg < 0 ? (
+                            <TrendingDown className="h-3 w-3" />
+                          ) : null}
+                          {formatPercent(rec.pct_chg, { from: 'percent', signed: true })}
+                        </span>
+                      ) : (
+                        <span className="text-slate-500">--</span>
+                      )}
+                    </td>
+                    <td
+                      className={cn(
+                        CELL,
+                        'num text-right font-medium',
+                        rec.score >= 0.9 ? 'text-ok' : rec.score >= 0.7 ? 'text-accent' : 'text-slate-400',
+                      )}
+                    >
+                      {rec.score.toFixed(4)}
+                    </td>
+                    <td className={CELL}>
+                      {/* 买入信号按 A股动作语义标红 */}
+                      {rec.signal === 1 ? <Tag tone="up">买入</Tag> : <Tag>观察</Tag>}
+                    </td>
+                    <td className={CELL}>
+                      {rec.held ? (
+                        <Tag tone="warn" title={rec.holding_strategies.join(', ')}>
+                          <Star className="h-2.5 w-2.5" />
+                          {rec.holding_strategies.join(', ')}
+                        </Tag>
+                      ) : (
+                        <span className="text-[10px] text-slate-500">未持仓</span>
+                      )}
+                    </td>
+                    <td className={CELL}>
+                      <Tag tone={rec.recommendation === '持有' ? 'warn' : 'up'}>{rec.recommendation}</Tag>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="px-3 py-6 text-center text-xs text-slate-500">
+            本期晨报未产出推荐标的。
+          </div>
+        )}
+      </Panel>
 
-      {/* Risk Warnings */}
+      {/* 风险提示 */}
       {report.risk_warnings.length > 0 && (
-        <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-6">
-          <h3 className="text-lg font-bold text-amber-400 mb-4 flex items-center gap-2">
-            <AlertTriangle className="w-5 h-5" /> 风险提示
-          </h3>
-          <ul className="space-y-2">
+        <Panel className="border-warn/30 bg-warn/5">
+          <SectionTitle>
+            <span className="inline-flex items-center gap-1.5 text-warn">
+              <AlertTriangle className="h-3 w-3" /> 风险提示
+            </span>
+          </SectionTitle>
+          <ul className="space-y-1.5">
             {report.risk_warnings.map((warning, idx) => (
-              <li key={idx} className="text-amber-200/80 text-sm flex items-start gap-2">
-                <span className="w-1.5 h-1.5 bg-amber-400 rounded-full mt-2 flex-shrink-0" />
+              <li key={idx} className="flex items-start gap-2 text-xs text-slate-300">
+                <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-warn" />
                 {warning}
               </li>
             ))}
           </ul>
-        </div>
+        </Panel>
       )}
 
-      {/* Footer */}
-      <div className="text-center text-slate-600 text-xs py-4">
-        * 本报告由量化系统自动生成，仅供参考，不构成投资建议 *
+      <div className="py-2 text-center text-[10px] text-slate-600">
+        本报告由量化系统自动生成，仅供参考，不构成投资建议
       </div>
     </div>
   );
