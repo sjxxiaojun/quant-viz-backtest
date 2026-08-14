@@ -1,7 +1,109 @@
-fastapi==0.110.0
-uvicorn==0.27.1
-pandas==2.2.0
-numpy==1.26.4
-akshare==1.13.12
-baostock==0.8.8
-pydantic==2.6.2
+# 运行时依赖锁定文件 —— 与 backend/venv 实际安装版本逐条一致（venv Python 3.9.6）。
+# 开发/测试工具见 requirements-dev.txt。重新生成：
+#   ./venv/bin/python3 -m pip freeze   （再手工拆回 runtime / dev 两份，见文末"有意不纳入"）
+#
+# ═══ 核实结论（核实日期 2026-07-26）══════════════════════════════════════════
+# 本文件相对旧版差异极大，但**这不是一次把运行时升到 numpy 2 的升级**。
+# venv 里本来就是 numpy 2.0.2 / fastapi 0.128.8 / pandas 2.3.3，241 个测试一直
+# 跑在 numpy 2 上；旧清单（7 行：fastapi==0.110.0 / uvicorn==0.27.1 /
+# pandas==2.2.0 / numpy==1.26.4 / akshare==1.13.12 / baostock==0.8.8 /
+# pydantic==2.6.2）描述的是一个早已不存在、而且**已经装不上**的环境：
+#   * 实测：用旧清单新建 venv 直接失败 —— akshare==1.13.12 已从 PyPI 下架
+#     （现存最低 1.16.72），pip 在解析阶段整体中止，一个包都装不上。
+#   * 即便能装：sklearn / pyarrow / joblib 都是代码里的直接 import，而
+#     scikit-learn 不是任何已声明包的传递依赖，旧清单缺它 -> ImportError。
+# 结论：本次改动是把一份"装不上且对环境说谎"的清单修成可复现的锁定文件。
+#
+# ─── numpy 2.x 破坏性变更排查：全仓 grep + 运行时验证，全部阴性 ──────────────
+#   * 已移除别名 np.float_/np.int_/np.NaN/np.Inf/np.object_/np.bool8/np.unicode_
+#     等：backend/ 内 0 处。实际用到的 np.* 仅 nan inf where random sqrt linspace
+#     full clip mean isnan isinf asarray allclose abs sign log log10 isfinite
+#     integer floating concatenate ceil ndarray —— 全部为 numpy 2 保留 API。
+#   * np.array(..., copy=False)（numpy 2 改为抛 ValueError）：0 处。
+#   * numpy.core / np.core 私有路径：0 处。
+#   * np.ptp / trapz / in1d / row_stack / alltrue / product 等已删函数：0 处。
+#   * NEP 50 标量提升：全仓无显式 float32/int32/np.dtype/astype(np.*)，无暴露面。
+#   * numpy 2 标量 repr 变化（np.float64(3.0)）：唯一的 !r 格式化用于模块名；
+#     numpy 标量进 JSON 前统一走 .item()（factor_lab/pipeline.py、stress_test.py）。
+#   * 依赖侧实测：pandas 2.3.3 / scipy 1.13.1 / scikit-learn 1.6.1 /
+#     pyarrow 21.0.0 / akshare 1.18.56 / baostock 0.9.1 在 numpy 2.0.2 下导入与
+#     计算均正常；pip check 报 "No broken requirements found"。
+#
+# ─── 核实方法 ────────────────────────────────────────────────────────────────
+#   1. pip freeze 与本文件 + requirements-dev.txt 逐条比对：55 项声明全部命中，
+#      0 项版本不一致、0 项声明未安装。
+#   2. 从零新建 venv 只装 requirements-dev.txt（内含 -r requirements.txt）：
+#      exit 0，55 包版本与声明完全一致；在该全新环境跑 pytest -> 241 passed。
+#   3. 上述 numpy 2 危险用法全仓 grep + 真实数据湖（4964 个 parquet）读写冒烟。
+#
+# ─── 已知的两个坑（明确标注，未擅自改动）────────────────────────────────────
+#   [坑 1] Python 版本窗口是 3.9~3.12，本文件无法用 python_requires 自我保护。
+#          numpy==2.0.2 与 scipy==1.13.1 都没有 cp313 wheel（numpy 自 2.1.0、
+#          scipy 自 1.14.1 才支持 3.13）；已实测 pip --python-version 313 解析
+#          直接失败。CI 若跑 Python 3.13+ 必然装不上，必须显式钉在 3.9~3.12。
+#          反向也是天花板：numpy 2.1+ / scipy 1.14+ / scikit-learn 1.7+ 均要求
+#          >=3.10，所以在 venv 的 3.9.6 上，这三个 pin 已是可用的最高版本。
+#   [坑 2] backend/realtime_hunter.py 顶层 `import pywencai`，但 pywencai 既未
+#          安装也未在此声明（该脚本无任何其他模块引用，属既有失效状态）。此处
+#          **故意不加**，以免破坏"与 venv 逐条一致"的不变量；需要时单独安装。
+#
+# ─── 有意不纳入的包（重新 freeze 时请勿加回）────────────────────────────────
+#   venv 里另有 matplotlib 3.9.4 / seaborn 0.13.2 及其独占依赖 contourpy、
+#   cycler、fonttools、kiwisolver、pillow、pyparsing、importlib_resources、
+#   zipp 共 10 项。已确认 backend/ 下没有任何 .py import 它们，故不列为运行时依赖。
+# ═════════════════════════════════════════════════════════════════════════════
+
+# --- Web framework / server ---
+fastapi==0.128.8
+starlette==0.49.3
+uvicorn==0.39.0
+pydantic==2.13.3
+pydantic_core==2.46.3
+annotated-doc==0.0.4
+annotated-types==0.7.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+anyio==4.12.1
+exceptiongroup==1.3.1
+h11==0.16.0
+click==8.1.8
+idna==3.11
+
+# --- Data / compute ---
+pandas==2.3.3
+numpy==2.0.2
+pyarrow==21.0.0
+scikit-learn==1.6.1
+scipy==1.13.1
+joblib==1.5.3
+threadpoolctl==3.6.0
+python-dateutil==2.9.0.post0
+pytz==2026.1.post1
+tzdata==2026.1
+six==1.17.0
+
+# --- Market data providers ---
+akshare==1.18.56
+baostock==0.9.1
+requests==2.32.5
+urllib3==2.6.3
+certifi==2026.2.25
+charset-normalizer==3.4.7
+curl_cffi==0.13.0
+cffi==2.0.0
+pycparser==2.23
+
+# --- akshare transitive dependencies ---
+beautifulsoup4==4.14.3
+soupsieve==2.8.3
+html5lib==1.1
+webencodings==0.5.1
+lxml==6.1.0
+jsonpath==0.82.2
+mini-racer==0.12.4
+openpyxl==3.1.5
+et_xmlfile==2.0.0
+xlrd==2.0.2
+tabulate==0.9.0
+tqdm==4.67.3
+decorator==5.2.1

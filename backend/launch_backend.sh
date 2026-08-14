@@ -1,5 +1,7 @@
 #!/bin/bash
-cd /Users/USER/quant-viz-backtest/backend
+# 所有路径基于脚本自身位置推导，避免绑定到某台机器的绝对路径。
+BACKEND_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BACKEND_DIR"
 
 LOCK_DIR="/tmp/quant-viz-backend-8080.lock"
 HEALTH_URL="http://127.0.0.1:8080/healthz"
@@ -37,11 +39,12 @@ if lsof -nP -iTCP:8080 -sTCP:LISTEN >/dev/null 2>&1; then
   exit 1
 fi
 
-ENV_FILE="/Users/USER/quant-viz-backtest/backend/.env.local"
+ENV_FILE="$BACKEND_DIR/.env.local"
 if [ -f "$ENV_FILE" ]; then
   set -a
   . "$ENV_FILE"
   set +a
 fi
 
-exec env PYTHONUNBUFFERED=1 ./venv/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 8080 >> /Users/USER/quant-viz-backtest/backend/backend.log 2>&1
+# backend.log 由应用内 RotatingFileHandler 负责轮转写入；stdout/stderr 单独落盘避免双写同一文件。
+exec env PYTHONUNBUFFERED=1 "$BACKEND_DIR/venv/bin/python3" -m uvicorn main:app --host 127.0.0.1 --port 8080 >> "$BACKEND_DIR/backend_stdout.log" 2>> "$BACKEND_DIR/backend_stderr.log"
