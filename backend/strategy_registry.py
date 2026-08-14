@@ -42,6 +42,7 @@ from strategies.multi_factor_engine import (
     factor_volatility_clustering,
     factor_short_term_reversal,
     RegimeAdaptiveFactorStrategy,
+    DEFENSE_ORIGINAL_STRATEGY,
 )
 from factor_lab.strategy import (
     calculate_ml_factor_filter_signals,
@@ -134,17 +135,12 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         signal_type="ranking",
         holding_policy="hold_while_selected",
     ),
+    # ai_ml 与 ai_ml_pro_plus 为同一因子配置（低波0.42/价值0.22/活跃度0.08），
+    # 共同指向 DEFENSE_ORIGINAL_STRATEGY 唯一实例，保留两个 id 仅为兼容历史引用。
     "ai_ml": StrategySpec(
         key="ai_ml",
         name="防御多因子模型 (Defense)",
-        func=MultiFactorStrategy(
-            factors=[
-                FactorConfig("low_vol", factor_low_volatility, weight=0.42),
-                FactorConfig("value", factor_value, weight=0.22),
-                FactorConfig("turnover", factor_turnover, weight=0.08),
-            ],
-            top_n=2,
-        ).calculate_signals,
+        func=DEFENSE_ORIGINAL_STRATEGY.calculate_signals,
         pool="core",
         category="多因子类",
         signal_type="ranking",
@@ -212,6 +208,9 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         default_max_hold_days=1,
         execution_mode="signal_close_to_next_open",
     ),
+    # weak_to_strong 设计语义：D 日低开收复放量收红（弱转强确认），赌的是 D+1 的
+    # 惯性接力，故按默认 next_open_rebalance 于 D+1 开盘买入，属于次日接力型而非
+    # 隔夜溢价型，不使用 signal_close_to_next_open。
     "weak_to_strong": StrategySpec(
         key="weak_to_strong",
         name="弱转强 (Signal Factory)",
@@ -222,6 +221,8 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         holding_policy="timeout_exit",
         default_max_hold_days=1,
     ),
+    # limit_up_doji 设计语义：昨日涨停 + 当日缩量十字星（洗盘充分），预期次日
+    # 第二波启动，于 D+1 开盘买入，同样为次日接力型，保留默认 next_open_rebalance。
     "limit_up_doji": StrategySpec(
         key="limit_up_doji",
         name="涨停后十字星",
@@ -286,6 +287,10 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         signal_type="ranking",
         holding_policy="hold_while_selected",
     ),
+    # aph_pro 设计语义：D 日尾盘放量突破昨日高点、历史隔夜溢价为正时于 D 日收盘买入，
+    # D+1 开盘卖出吃隔夜溢价。收益来源是 close->next open 的 gap，因此必须用
+    # signal_close_to_next_open 执行模式；若走默认 next_open_rebalance，买入发生在
+    # 隔夜溢价兑现之后，回测衡量的将是另一个策略。
     "aph_pro": StrategySpec(
         key="aph_pro",
         name="APH Pro (T+1 Down-frequency)",
@@ -295,18 +300,13 @@ STRATEGY_REGISTRY: Dict[str, StrategySpec] = {
         signal_type="event",
         holding_policy="timeout_exit",
         default_max_hold_days=1,
+        execution_mode="signal_close_to_next_open",
     ),
+    # 见 ai_ml 条目注释：与 ai_ml 指向同一 DEFENSE_ORIGINAL_STRATEGY 实例
     "ai_ml_pro_plus": StrategySpec(
         key="ai_ml_pro_plus",
         name="防御多因子原味版",
-        func=MultiFactorStrategy(
-            factors=[
-                FactorConfig("low_vol", factor_low_volatility, weight=0.42),
-                FactorConfig("value", factor_value, weight=0.22),
-                FactorConfig("turnover", factor_turnover, weight=0.08),
-            ],
-            top_n=2,
-        ).calculate_signals,
+        func=DEFENSE_ORIGINAL_STRATEGY.calculate_signals,
         pool="core",
         category="多因子类 (Original)",
         signal_type="ranking",

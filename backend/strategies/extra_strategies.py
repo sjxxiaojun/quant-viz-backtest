@@ -146,10 +146,7 @@ def calculate_sector_alpha_signals(df: pd.DataFrame) -> pd.DataFrame:
         g['f_boll'] = (g['close'] - ma20) / (2 * std20 + 1e-9)
         g['f_rev'] = -g['close'].pct_change(5).shift(1)
         return g
-    try:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
-    except Exception:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
+    df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
     for f in ['f_val', 'f_vol', 'f_boll', 'f_rev']:
         df[f'{f}_z'] = df.groupby('date')[f].transform(lambda x: (x - x.mean()) / (x.std() + 1e-9))
     df['score'] = df['f_val_z'] + df['f_vol_z'] - df['f_boll_z'] + df['f_rev_z']
@@ -165,34 +162,13 @@ def calculate_sector_alpha_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_ai_ml_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
-    低波价值因子模型 (Multi-Factor):
-    多因子加权评分，权重来自因子有效性分析：低波(42%) + 价值(22%) + 活跃度(8%)。
-    注：不依赖 PE/PB 为0 的标的（ETF 自动降权该因子）。
+    [Deprecated] 低波价值因子模型 (Multi-Factor)。
+    仅为兼容旧脚本 (full_benchmark.py / verify_all_strategies.py) 的 import 而保留；
+    实现统一委托给 multi_factor_engine.DEFENSE_ORIGINAL_STRATEGY（与注册表 ai_ml /
+    ai_ml_pro_plus 使用同一实例），不再维护重复的手写实现。
     """
-    df = df.sort_values(['stock_code', 'date']).copy()
-    def _calc_ml_proxies(g):
-        g = g.copy()
-        g['f_vol'] = -g['close'].pct_change().rolling(20).std()
-        # 价值因子：PE/PB 均为0（如ETF）时该项贡献为0
-        g['f_val'] = np.where(g['pe'] > 0.01, 1.0 / g['pe'], 0.0) + \
-                     np.where(g['pb'] > 0.01, 1.0 / g['pb'], 0.0)
-        g['f_turn'] = g['volume'].rolling(5).mean()
-        return g
-    try:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_ml_proxies)
-    except Exception:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_ml_proxies)
-    for f in ['f_vol', 'f_val', 'f_turn']:
-        df[f'{f}_z'] = df.groupby('date')[f].transform(lambda x: (x - x.mean()) / (x.std() + 1e-9))
-    df['score'] = df['f_vol_z'] * 0.42 + df['f_val_z'] * 0.22 + df['f_turn_z'] * 0.08
-    def _apply_ranking(day_g):
-        day_g = day_g.copy()
-        day_g['signal'] = 0
-        if len(day_g) < 2: return day_g
-        day_g.loc[day_g.nlargest(2, 'score').index, 'signal'] = 1
-        day_g.loc[day_g.nsmallest(2, 'score').index, 'signal'] = -1
-        return day_g
-    return df.groupby('date', group_keys=False).apply(_apply_ranking)
+    from strategies.multi_factor_engine import DEFENSE_ORIGINAL_STRATEGY
+    return DEFENSE_ORIGINAL_STRATEGY.calculate_signals(df)
 
 
 def calculate_etf_bottom_signals(df: pd.DataFrame, mode="aggressive") -> pd.DataFrame:

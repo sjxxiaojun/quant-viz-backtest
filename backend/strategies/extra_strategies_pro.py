@@ -1,6 +1,11 @@
 import pandas as pd
 import numpy as np
 
+# 哨兵分数约定：score <= SENTINEL_FLOOR 表示该标的当日被强制排除（如熊市空仓、流动性剔除），
+# 排名买入时必须跳过，不得因“矮子里拔将军”而入选。
+SCORE_SENTINEL = -999.0
+SENTINEL_FLOOR = -100.0
+
 
 def calculate_ai_ml_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -20,10 +25,7 @@ def calculate_ai_ml_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
         # 流动性
         g['f_liquidity'] = g['amount'].rolling(5).mean() if 'amount' in g.columns else g['volume'].rolling(5).mean()
         return g
-    try:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_pro_plus_features)
-    except Exception:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_pro_plus_features)
+    df = df.groupby('stock_code', group_keys=False).apply(_calc_pro_plus_features)
     for f in ['f_low_vol', 'f_value', 'f_quality']:
         df[f'{f}_z'] = df.groupby('date')[f].transform(lambda x: (x - x.mean()) / (x.std() + 1e-9))
     df['score'] = df['f_low_vol_z'] * 0.4 + df['f_value_z'] * 0.3 + df['f_quality_z'] * 0.3
@@ -31,7 +33,7 @@ def calculate_ai_ml_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[
         df['f_liquidity'] < df.groupby('date')['f_liquidity'].transform(lambda x: x.quantile(0.2)),
         'score'
-    ] = -999
+    ] = SCORE_SENTINEL
     def _apply_pro_ranking(day_g):
         day_g = day_g.copy()
         day_g['signal'] = 0
@@ -40,10 +42,7 @@ def calculate_ai_ml_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
         day_g.loc[top_idx, 'signal'] = 1
         day_g.loc[day_g.nsmallest(2, 'score').index, 'signal'] = -1
         return day_g
-    try:
-        return df.groupby('date', group_keys=False).apply(_apply_pro_ranking)
-    except Exception:
-        return df.groupby('date', group_keys=False).apply(_apply_pro_ranking)
+    return df.groupby('date', group_keys=False).apply(_apply_pro_ranking)
 
 
 def calculate_ai_adaptive_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
@@ -76,26 +75,23 @@ def calculate_ai_adaptive_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
         # shift(1) 确保反转因子不包含当日数据
         g['f_swing'] = -g['close'].pct_change(5).shift(1)
         return g
-    try:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_dual_factors)
-    except Exception:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_dual_factors)
+    df = df.groupby('stock_code', group_keys=False).apply(_calc_dual_factors)
 
-    # 下行周期强制空仓 (score = -999)
+    # 下行周期 (regime==2) 强制空仓：打上哨兵分数，排名阶段不得买入
     df['score'] = np.where(df['regime'] == 0, df['f_trend'],
-                           np.where(df['regime'] == 1, df['f_swing'], -999))
+                           np.where(df['regime'] == 1, df['f_swing'], SCORE_SENTINEL))
 
     def _apply_ranking(day_g):
         day_g = day_g.copy()
         day_g['signal'] = 0
         if len(day_g) < 2: return day_g
-        day_g.loc[day_g.nlargest(2, 'score').index, 'signal'] = 1
+        # 仅在非哨兵分数中选买入，熊市全体哨兵时当日空仓
+        valid = day_g[day_g['score'] > SENTINEL_FLOOR]
+        if not valid.empty:
+            day_g.loc[valid.nlargest(2, 'score').index, 'signal'] = 1
         day_g.loc[day_g.nsmallest(2, 'score').index, 'signal'] = -1
         return day_g
-    try:
-        return df.groupby('date', group_keys=False).apply(_apply_ranking)
-    except Exception:
-        return df.groupby('date', group_keys=False).apply(_apply_ranking)
+    return df.groupby('date', group_keys=False).apply(_apply_ranking)
 
 
 def calculate_blackhorse_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
@@ -113,10 +109,7 @@ def calculate_blackhorse_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
         # 聪明钱：涨幅方向 × 成交量相对强度
         g['f_smart'] = np.sign(g['pct_chg']) * (g['volume'] / (g['volume'].rolling(20).mean() + 1e-9))
         return g
-    try:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_smart_features)
-    except Exception:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_smart_features)
+    df = df.groupby('stock_code', group_keys=False).apply(_calc_smart_features)
     for f in ['f_accel', 'f_smart']:
         df[f'{f}_z'] = df.groupby('date')[f].transform(lambda x: (x - x.mean()) / (x.std() + 1e-9))
     df['score'] = df['f_accel_z'] * 0.4 + df['f_smart_z'] * 0.4 + df['f_pit'].fillna(False).astype(int) * 0.2
@@ -128,10 +121,7 @@ def calculate_blackhorse_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
         day_g.loc[top_idx, 'signal'] = 1
         day_g.loc[day_g['score'] < 0, 'signal'] = -1
         return day_g
-    try:
-        return df.groupby('date', group_keys=False).apply(_apply_ranking)
-    except Exception:
-        return df.groupby('date', group_keys=False).apply(_apply_ranking)
+    return df.groupby('date', group_keys=False).apply(_apply_ranking)
 
 
 def calculate_aph_pro_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -150,10 +140,7 @@ def calculate_aph_pro_signals(df: pd.DataFrame) -> pd.DataFrame:
         # 3. 日内振幅过滤（振幅过大说明分歧剧烈，风险高）
         g['f_stable'] = (g['high'] - g['low']) / (g['close'] + 1e-9) < 0.05
         return g
-    try:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_hf_plus)
-    except Exception:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_hf_plus)
+    df = df.groupby('stock_code', group_keys=False).apply(_calc_hf_plus)
     df['signal'] = 0
     buy_mask = (df['f_break'] == True) & (df['f_stable'] == True) & (df['f_gap_hist'] > 0)
     df.loc[buy_mask, 'signal'] = 1

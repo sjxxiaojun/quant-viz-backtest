@@ -3,6 +3,10 @@ import numpy as np
 from typing import List, Callable, Optional, Dict
 from dataclasses import dataclass
 
+# 哨兵分数约定：score <= SENTINEL_FLOOR 表示当日强制排除（熊市空仓等），排名买入必须跳过
+SCORE_SENTINEL = -999.0
+SENTINEL_FLOOR = -100.0
+
 @dataclass
 class FactorConfig:
     name: str
@@ -85,10 +89,7 @@ class MultiFactorStrategy:
                 g[f'f_{factor.name}'] = factor.func(g)
             return g
         
-        try:
-            df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
-        except Exception:
-            df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
+        df = df.groupby('stock_code', group_keys=False).apply(_calc_raw_factors)
         
         # 2. Cross-sectional Z-Score standardization (Vectorized)
         factor_names = [f"f_{factor.name}" for factor in self.factors]
@@ -131,6 +132,19 @@ class MultiFactorStrategy:
             df.loc[in_pool, 'signal'] = pool_df['signal']
             
         return df
+
+# 防御多因子（原味）标准配置：低波 0.42 / 价值 0.22 / 活跃度 0.08。
+# 注册表中 ai_ml 与 ai_ml_pro_plus 两个 id 以及 legacy 的
+# extra_strategies.calculate_ai_ml_signals 均指向该唯一实例，避免同构实现漂移。
+DEFENSE_ORIGINAL_STRATEGY = MultiFactorStrategy(
+    factors=[
+        FactorConfig("low_vol", factor_low_volatility, weight=0.42),
+        FactorConfig("value", factor_value, weight=0.22),
+        FactorConfig("turnover", factor_turnover, weight=0.08),
+    ],
+    top_n=2,
+)
+
 
 class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
     """
@@ -202,9 +216,9 @@ class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
             df.loc[mask1, 'f_vol_stab_z'] * 0.3 + 
             df.loc[mask1, 'f_lowvol_z'] * 0.3
         )
-        # Bear (2)
+        # Bear (2) -> Cash：哨兵分数，排名阶段整体排除，当日不持有任何标的
         mask2 = df['regime'] == 2
-        df.loc[mask2, 'score'] = df.loc[mask2, 'f_lowvol_z'] * 1.0 - 5.0
+        df.loc[mask2, 'score'] = SCORE_SENTINEL
         
         # 5. Ranking
         return self._generate_signals(df)
@@ -220,7 +234,8 @@ class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
         rank_desc = df.groupby('date')['score'].rank(ascending=False, method='first')
         rank_asc = df.groupby('date')['score'].rank(ascending=True, method='first')
         
-        buy_cond = (rank_desc <= self.top_n) & (day_counts >= self.top_n)
+        # 哨兵分数（熊市空仓等强制排除）不允许进入买入候选
+        buy_cond = (rank_desc <= self.top_n) & (day_counts >= self.top_n) & (df['score'] > SENTINEL_FLOOR)
         sell_cond = (rank_asc <= self.top_n) & (day_counts >= self.top_n)
         
         df.loc[buy_cond, 'signal'] = 1

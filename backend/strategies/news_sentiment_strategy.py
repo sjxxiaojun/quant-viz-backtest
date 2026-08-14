@@ -1,6 +1,29 @@
+import logging
 import os
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# 大盘择时代理（沪深300ETF）数据文件的定位规则：
+# 优先读环境变量 QUANT_DATA_LAKE_DIR，其次按已知数据湖目录依次探测，禁止硬编码单一机器路径
+_MARKET_ETF_RELATIVE_PATH = os.path.join("etf", "510300_full_history.parquet")
+_LAKE_DIR_CANDIDATES = (
+    os.environ.get("QUANT_DATA_LAKE_DIR"),
+    os.path.expanduser("~/quant_data_lake"),
+    os.path.expanduser("~/projects/quant_data_lake"),
+)
+
+
+def _resolve_market_etf_path():
+    for lake_dir in _LAKE_DIR_CANDIDATES:
+        if not lake_dir:
+            continue
+        candidate = os.path.join(lake_dir, _MARKET_ETF_RELATIVE_PATH)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
 
 def calculate_news_sentiment_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -26,27 +49,37 @@ def calculate_news_sentiment_signals(df: pd.DataFrame) -> pd.DataFrame:
     mkt_buy_status = {}
     mkt_exit_status = {}
     mkt_ret20_status = {}
-    try:
-        etf_path = "/Users/USER/quant_data_lake/etf/510300_full_history.parquet"
-        if os.path.exists(etf_path):
+    market_filter_active = False
+    etf_path = _resolve_market_etf_path()
+    if etf_path is None:
+        logger.warning(
+            "news_sentiment: 未找到大盘择时数据 (510300 ETF parquet)，"
+            "'大盘站上60日线才买'过滤已停用 (market_filter_active=False)"
+        )
+    else:
+        try:
             mkt_df = pd.read_parquet(etf_path).sort_values('date')
             mkt_df['date_str'] = mkt_df['date'].astype(str)
             mkt_df['mkt_ma60'] = mkt_df['close'].rolling(60).mean()
-            
+
             # 大盘必须连续两天站上60日均线才允许买入
             mkt_df['mkt_ok_buy'] = (mkt_df['close'] > mkt_df['mkt_ma60']) & (mkt_df['close'].shift(1) > mkt_df['mkt_ma60'].shift(1))
             # 连续两天跌破60日均线才执行强平出局
             mkt_df['mkt_ok_exit'] = ~((mkt_df['close'] < mkt_df['mkt_ma60']) & (mkt_df['close'].shift(1) < mkt_df['mkt_ma60'].shift(1)))
-            
+
             # 计算大盘过去20天的相对表现
             mkt_df['mkt_ret20'] = mkt_df['close'] / (mkt_df['close'].shift(20) + 1e-9)
-            
+
             mkt_buy_status = mkt_df.set_index('date_str')['mkt_ok_buy'].to_dict()
             mkt_exit_status = mkt_df.set_index('date_str')['mkt_ok_exit'].to_dict()
             mkt_ret20_status = mkt_df.set_index('date_str')['mkt_ret20'].to_dict()
-    except Exception:
-        pass
-        
+            market_filter_active = True
+        except Exception as exc:
+            logger.warning(
+                "news_sentiment: 大盘择时数据加载失败 (%s: %s)，择时过滤已停用 (market_filter_active=False)",
+                etf_path, exc,
+            )
+
     # ---- Part 2: 计算个股特征因子 ----
     def _calc_factors(g):
         g = g.copy()
@@ -85,10 +118,7 @@ def calculate_news_sentiment_signals(df: pd.DataFrame) -> pd.DataFrame:
         
         # 10. 连续两天跌破 30日线 (核心生命线)
         g['under_ma30_days2'] = (g['close'] < g['ma30']) & (g['close'].shift(1) < g['ma30'].shift(1))
-        
-        # 11. 消息面突发利好代理因子：隔夜跳空高开幅度
-        g['open_pct'] = (g['open'] - g['close'].shift(1)) / (g['close'].shift(1) + 1e-9)
-        
+
         return g
         
     df = df.groupby('stock_code', group_keys=False).apply(_calc_factors)
@@ -97,9 +127,19 @@ def calculate_news_sentiment_signals(df: pd.DataFrame) -> pd.DataFrame:
     # 在消息面利好驱动下，缺口越大、爆量越猛，说明利好越硬
     df['score'] = df['vol_ratio'] * 0.4 + df['open_pct'] * 100 * 0.6
     
-    df['mkt_ok_buy'] = df['date_str'].map(mkt_buy_status).fillna(True)
-    df['mkt_ok_exit'] = df['date_str'].map(mkt_exit_status).fillna(True)
-    df['mkt_ret20'] = df['date_str'].map(mkt_ret20_status).fillna(1.0)
+    # 择时过滤生效时：数据缺失的日期按保守口径处理——无大盘数据不开新仓 (buy=False)、
+    # 也不据此强平既有持仓 (exit=True)。择时过滤停用时全放行，但通过
+    # market_filter_active 列显式暴露"过滤未生效"状态，不允许静默降级。
+    df['market_filter_active'] = market_filter_active
+    if market_filter_active:
+        # eq(True)/ne(False): 缺失日期分别落到 False(禁买)/True(不强平)，且不触发 object 降级
+        df['mkt_ok_buy'] = df['date_str'].map(mkt_buy_status).eq(True)
+        df['mkt_ok_exit'] = df['date_str'].map(mkt_exit_status).ne(False)
+        df['mkt_ret20'] = df['date_str'].map(mkt_ret20_status).fillna(1.0)
+    else:
+        df['mkt_ok_buy'] = True
+        df['mkt_ok_exit'] = True
+        df['mkt_ret20'] = 1.0
     
     # 消息面利好代理 + 量价共振 终极高胜率策略：
     # 1. 均线趋势护航：ma5_up, ma20_up, ma60_up 且 close > ma20

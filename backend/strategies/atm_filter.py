@@ -62,10 +62,5 @@ def calculate_atm_signals(df: pd.DataFrame) -> pd.DataFrame:
         g.loc[sell_mask, 'signal'] = -1
         return g
 
-    # For newer pandas versions, include_groups=False is recommended. 
-    # To maintain compatibility, we check if the parameter exists or just use a standard selection.
-    try:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_per_stock)
-    except Exception:
-        df = df.groupby('stock_code', group_keys=False).apply(_calc_per_stock)
+    df = df.groupby('stock_code', group_keys=False).apply(_calc_per_stock)
     return df

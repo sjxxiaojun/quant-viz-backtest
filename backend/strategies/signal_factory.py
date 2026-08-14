@@ -232,20 +232,54 @@ def calculate_limit_up_doji_signals(df: pd.DataFrame) -> pd.DataFrame:
     """
     涨停十字星 (Limit Up Doji) - 信号工厂:
     逻辑：昨日涨停，今日收缩量十字星，预期第二波启动。
+
+    价格口径（重要）：帧里的 open/high/low/close 是 **qfq 前复权价**，
+    而涨停是交易所按 **当日不复权成交价 / 前一日除权参考价** 判定的。
+    除权除息日相邻两根 qfq K 线的比值 ≠ 真实涨跌幅，直接用 close.pct_change()
+    判"涨停"会同时产生漏判和误判（实测 15 只 / 2022-2024 样本里就有 12 天判反）。
+    因此这里改用数据源直接给出的不复权涨跌幅列 `pct_chg`（单位：%，
+    见 data_manager 模块头的帧口径约定）做涨停判定，并派生
+    `prev_close_ref = close / (1 + pct_chg/100)`，即"换算到当日价格标度下的
+    前一日收盘（除权参考价）"，让跨日价格比较（低点不深破涨停日收盘）也落在
+    同一标度上。仅当 `pct_chg` 缺失/退化时才回退 qfq 的 close.shift(1)
+    （合成数据与单测路径；无分红拆股时两者等价）。
+
+    注 1：`prev_close` 列保持 close.shift(1) 不动。本函数的返回帧会被
+    main.py 直接喂给 BacktestEngine，引擎的涨跌停拦截会读 `prev_close`；
+    改它等于在策略文件里偷改引擎行为，故新口径只走本函数私有的
+    `prev_close_ref` 列。引擎侧同样存在"用 qfq prev_close 判涨跌停"的问题，
+    但那属于 engine.py / data_manager.py，不在本次改动范围内。
+    注 2：volume 始终是不复权股数，拆股当日的缩量判定仍会失真，但"昨日涨停
+    + 当日拆股"极罕见，此处不额外处理，避免放宽条件。
     """
     df = df.sort_values(["stock_code", "date"]).copy()
 
     def _calc_signals(group: pd.DataFrame) -> pd.DataFrame:
-        group["prev_close"] = group["close"].shift(1)
-        group["prev_pct_chg"] = group["close"] / group["prev_close"] - 1
+        qfq_prev_close = group["close"].shift(1)
+        qfq_pct_chg = group["close"] / qfq_prev_close - 1
+
+        if "pct_chg" in group.columns:
+            raw_pct_chg = pd.to_numeric(group["pct_chg"], errors="coerce") / 100.0
+        else:
+            raw_pct_chg = pd.Series(float("nan"), index=group.index, dtype=float)
+
+        # 不复权口径优先；缺失或退化（分母 <=0）时才回退 qfq 口径
+        usable = raw_pct_chg.notna() & (raw_pct_chg > -1.0)
+        group["prev_close"] = qfq_prev_close
+        group["prev_close_ref"] = (group["close"] / (1.0 + raw_pct_chg)).where(usable, qfq_prev_close)
+        # 当日涨跌幅（不复权口径）；"昨日涨停"须对该序列再 shift(1)
+        group["pct_chg_d"] = raw_pct_chg.where(usable, qfq_pct_chg)
+        group["prev_limit_up"] = group["pct_chg_d"].shift(1) > 0.095
         group["prev_volume"] = group["volume"].shift(1)
+        # 十字星形态作用于当日 K 线：小实体（同日比值，复权与否不影响）
+        # + 相对昨日缩量 + 不深破昨日（涨停日）收盘
         group["body_ratio"] = abs(group["open"] - group["close"]) / (group["high"] - group["low"] + 1e-9)
         group["signal"] = 0
         buy_cond = (
-            (group["prev_pct_chg"] > 0.095)
+            group["prev_limit_up"].fillna(False)
             & (group["body_ratio"] < 0.15)
             & (group["volume"] < group["prev_volume"] * 0.7)
-            & (group["low"] > group["prev_close"] * 0.98)
+            & (group["low"] > group["prev_close_ref"] * 0.98)
         )
         group.loc[buy_cond, "signal"] = 1
         return group

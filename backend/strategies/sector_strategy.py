@@ -81,9 +81,14 @@ def run_power_energy_strategy(lake_dir="/Users/USER/quant_data_lake"):
     if 2 not in daily_rets.columns:
         return {"error": "Backtest failed to create top quantile."}
         
-    top_ret = daily_rets[2]
-    ann_ret = float(top_ret.mean() * 50)
-    sharpe = float((top_ret.mean() / top_ret.std() * np.sqrt(50))) if top_ret.std() > 0 else 0.0
+    # 前瞻收益按 5 日持有期计算：逐日重叠采样会引入约 sqrt(5) 倍的 Sharpe 高估
+    # （相邻观测共享 4 天收益，序列强自相关），因此每 5 个交易日取一个非重叠观测，
+    # 再按 250 交易日 / 5 日持有期 = 50 期做年化。
+    holding_period = 5
+    periods_per_year = 50
+    top_ret = daily_rets[2].iloc[::holding_period]
+    ann_ret = float(top_ret.mean() * periods_per_year)
+    sharpe = float((top_ret.mean() / top_ret.std() * np.sqrt(periods_per_year))) if top_ret.std() > 0 else 0.0
     cum_ret = (1 + top_ret).cumprod()
     mdd = float((cum_ret / cum_ret.cummax() - 1).min())
     
@@ -102,7 +107,12 @@ def run_power_energy_strategy(lake_dir="/Users/USER/quant_data_lake"):
         "metrics": {
             "annual_return": ann_ret,
             "sharpe": sharpe,
-            "max_drawdown": mdd
+            "max_drawdown": mdd,
+            # 估算口径说明：该指标为因子诊断值，非可交易回测结果
+            "estimation_basis": (
+                "非重叠5日前瞻收益(每5个交易日采样1次), 年化因子50; "
+                "未扣佣金/印花税/滑点, 未建模T+1与涨跌停约束, 股票池为固定手选清单"
+            ),
         },
         "top_stocks": top_stocks
     }
@@ -137,7 +147,14 @@ def calculate_power_energy_signals(df: pd.DataFrame) -> pd.DataFrame:
         
     # 合成得分
     df['score'] = df['f_pb_inv_z'] + df['f_vol_20_z'] - df['f_boll_pos_z'] + df['f_rev_5_z']
-    df['signal'] = 1
+
+    # signal 按当日截面 score 分位生成：前 30% 买入候选、后 30% 卖出候选、中间观望，
+    # 避免恒为 1 导致 signal 列失去筛选含义（排序仍由 score 决定）
+    q_hi = df.groupby('date')['score'].transform(lambda s: s.quantile(0.7))
+    q_lo = df.groupby('date')['score'].transform(lambda s: s.quantile(0.3))
+    df['signal'] = 0
+    df.loc[df['score'] >= q_hi, 'signal'] = 1
+    df.loc[(df['score'] <= q_lo) & (df['score'] < q_hi), 'signal'] = -1
     return df
 
 
