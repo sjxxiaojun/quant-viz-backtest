@@ -35,7 +35,7 @@ class ViewModelStore {
   private listeners: Set<ViewListener> = new Set();
 
   // 外部海量数据缓存（不参与 React 组件状态响应式追踪，杜绝万级数据重渲染掉帧）
-  private heavyDataCache: Map<string, Float64Array | any[]> = new Map();
+  private heavyDataCache: Map<string, Float64Array | Array<unknown>> = new Map();
 
   public getState(): ViewState {
     return this.state;
@@ -60,12 +60,12 @@ class ViewModelStore {
   }
 
   // 外部海量数据存取
-  public setHeavyData(key: string, data: Float64Array | any[]): void {
+  public setHeavyData(key: string, data: Float64Array | Array<unknown>): void {
     this.heavyDataCache.set(key, data);
   }
 
-  public getHeavyData<T = any>(key: string): T | undefined {
-    return this.heavyDataCache.get(key) as T | undefined;
+  public getHeavyData<T = unknown>(key: string): T | undefined {
+    return this.heavyDataCache.get(key) as unknown as T | undefined;
   }
 
   public clearHeavyData(): void {

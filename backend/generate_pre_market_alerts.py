@@ -32,7 +32,7 @@ def generate_pre_market_alerts():
     top_ml = latest_ml[latest_ml['score'] > 0].nlargest(5, 'score')
     
     # 3. 输出报告
-    report = f"# 🚀 Gemini量化Pro: 2026-04-21 盘前预警报告\n"
+    report = f"# 🚀 momo quant pro: 2026-04-21 盘前预警报告\n"
     report += f"**生成时间**: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}\n"
     report += f"**最新交易日数据**: {bh_df['date'].max()}\n\n"
     

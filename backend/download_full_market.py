@@ -1,4 +1,6 @@
 import os
+
+from lake_paths import resolve_data_lake_dir
 import time
 import pandas as pd
 import akshare as ak
@@ -6,7 +8,7 @@ import baostock as bs
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Make sure this runs independently to build the full market data lake
-CACHE_DIR = "./quant_data_lake"
+CACHE_DIR = str(resolve_data_lake_dir())
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 

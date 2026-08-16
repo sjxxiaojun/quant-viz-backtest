@@ -9,13 +9,16 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+from lake_paths import resolve_data_lake_dir
+
 import akshare as ak
 import baostock as bs
 import pandas as pd
 
 
-CACHE_DIR = Path("./quant_data_lake")
-LOG_DIR = Path("./backend/data_cache")
+CACHE_DIR = resolve_data_lake_dir()
+BACKEND_DIR = Path(__file__).resolve().parent
+LOG_DIR = BACKEND_DIR / "data_cache"
 STANDARD_COLUMNS = [
     "date",
     "open",

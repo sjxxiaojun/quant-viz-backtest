@@ -14,9 +14,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from lake_paths import resolve_data_lake_dir
 
-BACKEND_DIR = Path("./backend")
-ROOT_DIR = Path("./quant_data_lake")
+
+BACKEND_DIR = Path(__file__).resolve().parent
+ROOT_DIR = resolve_data_lake_dir()
 DATA_CACHE_DIR = BACKEND_DIR / "data_cache"
 START_DATE = "2022-01-01"
 

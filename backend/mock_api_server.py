@@ -2,13 +2,15 @@ from fastapi import FastAPI
 import uvicorn
 import pyarrow.parquet as pq
 from pathlib import Path
+
+from lake_paths import resolve_data_lake_dir
 from fastapi.responses import Response
 import pandas as pd
 import json
 
 app = FastAPI()
 
-CACHE_DIR = Path("./quant_data_lake")
+CACHE_DIR = resolve_data_lake_dir()
 
 @app.get("/api/v1/market/history")
 def get_market_history(symbol: str):

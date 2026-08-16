@@ -43,6 +43,8 @@ import threading
 from typing import Dict, List, Optional, Tuple
 import time
 
+from lake_paths import resolve_data_lake_dir
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("DataManager")
 
@@ -248,11 +250,11 @@ class PoolDataFetchError(RuntimeError):
 class DataManager:
     def __init__(
         self,
-        cache_dir="./quant_data_lake",
+        cache_dir: Optional[str] = None,
         frame_cache_max_entries: Optional[int] = None,
         frame_cache_eviction: Optional[str] = None,
     ):
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(resolve_data_lake_dir() if cache_dir is None else cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.etf_cache_dir = self.cache_dir / "etf"
         self.etf_cache_dir.mkdir(parents=True, exist_ok=True)

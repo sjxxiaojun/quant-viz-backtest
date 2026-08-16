@@ -63,7 +63,8 @@ def calculate_ai_adaptive_signals_pro(df: pd.DataFrame) -> pd.DataFrame:
     regime = pd.Series(0, index=mkt_ret.index)
     # [FIX] 用滚动均值比较，而非全局均值
     regime[mkt_vol > mkt_vol_ma] = 1
-    regime[mkt_trend < -0.05] = 2
+    # pct_chg 为百分数单位（1.0 表示 1%），20 日累计跌幅超过 5% 才判为单边下行。
+    regime[mkt_trend < -5.0] = 2
 
     regime_df = pd.DataFrame({'date': mkt_ret.index, 'regime': regime.values})
     df = df.merge(regime_df, on='date', how='left')

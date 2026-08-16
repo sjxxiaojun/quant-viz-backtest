@@ -7,7 +7,7 @@
  * 3. 丝滑保证：缩放平移保持 60fps 刷新率。
  */
 
-import type * as echarts from 'echarts/core';
+import type { ECharts, EChartsCoreOption } from 'echarts/core';
 
 export interface IncrementalRenderOptions {
   threshold?: number; // 默认 5000
@@ -24,9 +24,9 @@ export class IncrementalChartRenderer {
    * 执行自适应分批渲染
    */
   public renderSeries(
-    chart: echarts.ECharts,
-    baseOption: echarts.EChartsCoreOption,
-    largeDataSeries: { seriesIndex: number; data: any[] }[],
+    chart: ECharts,
+    baseOption: EChartsCoreOption,
+    largeDataSeries: { seriesIndex: number; data: unknown[] }[],
     options: IncrementalRenderOptions = {}
   ): void {
     this.cancel();
@@ -55,9 +55,9 @@ export class IncrementalChartRenderer {
     }));
 
     // 浅拷贝 option 并注入首批数据
-    const startOption: any = { ...baseOption };
+    const startOption = { ...baseOption } as EChartsCoreOption & { series?: unknown };
     if (Array.isArray(startOption.series)) {
-      startOption.series = startOption.series.map((ser: any, idx: number) => {
+      startOption.series = startOption.series.map((ser, idx: number) => {
         const found = initialSeries.find((init) => init.seriesIndex === idx);
         return found ? { ...ser, data: found.data } : ser;
       });
@@ -79,8 +79,8 @@ export class IncrementalChartRenderer {
       for (const item of largeDataSeries) {
         if (currentOffset < item.data.length) {
           const chunk = item.data.slice(currentOffset, currentOffset + chunkSize);
-          if (chunk.length > 0 && typeof (chart as any).appendData === 'function') {
-            (chart as any).appendData({
+          if (chunk.length > 0 && typeof chart.appendData === 'function') {
+            chart.appendData({
               seriesIndex: item.seriesIndex,
               data: chunk,
             });

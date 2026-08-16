@@ -9,9 +9,11 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
+from lake_paths import resolve_data_lake_dir
 
-BACKEND_DIR = Path("./backend")
-ROOT_DIR = Path("./quant_data_lake")
+
+BACKEND_DIR = Path(__file__).resolve().parent
+ROOT_DIR = resolve_data_lake_dir()
 ETF_DIR = ROOT_DIR / "etf"
 REMOVED_ST_DIR = ROOT_DIR / "_removed_st_delisted"
 REMOVED_NON_UNIVERSE_DIR = ROOT_DIR / "_removed_not_in_universe"

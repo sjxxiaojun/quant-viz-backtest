@@ -3,12 +3,15 @@ import numpy as np
 from pathlib import Path
 import logging
 from datetime import datetime, timedelta
+from typing import Optional
+
+from lake_paths import resolve_data_lake_dir
 
 logger = logging.getLogger("DataSentinel")
 
 class DataSentinel:
-    def __init__(self, data_lake_dir: str = "./quant_data_lake"):
-        self.data_lake_dir = Path(data_lake_dir)
+    def __init__(self, data_lake_dir: Optional[str] = None):
+        self.data_lake_dir = Path(resolve_data_lake_dir() if data_lake_dir is None else data_lake_dir)
         self.a_share_dir = self.data_lake_dir 
         self.etf_dir = self.data_lake_dir / "etf"
 

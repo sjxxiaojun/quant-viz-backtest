@@ -25,7 +25,8 @@ def calculate_ai_adaptive_signals_pro_plus(df: pd.DataFrame) -> pd.DataFrame:
     # 三态划分：先标高波震荡，再标趋势（有方向的行情即使高波也按趋势市处理）
     mkt_stats['regime'] = REGIME_CALM
     mkt_stats.loc[mkt_stats['mkt_std'] > mkt_stats['mkt_std_ma'], 'regime'] = REGIME_CHOPPY
-    mkt_stats.loc[mkt_stats['mkt_trend'].abs() > 0.05, 'regime'] = REGIME_TREND
+    # pct_chg 为百分数单位（1.0 表示 1%），|20 日累计涨幅|超过 5% 才判为趋势市。
+    mkt_stats.loc[mkt_stats['mkt_trend'].abs() > 5.0, 'regime'] = REGIME_TREND
 
     df = df.merge(mkt_stats[['regime']], on='date', how='left')
     df['regime'] = df['regime'].fillna(REGIME_CALM)

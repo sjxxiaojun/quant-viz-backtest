@@ -19,14 +19,14 @@ from strategies.extra_strategies_pro_plus import (
 from strategies.multi_factor_engine import RegimeAdaptiveFactorStrategy
 
 
-def _build_market(codes, n_calm=70, n_bear=15):
-    """前 n_calm 天温和上涨（低波），后 n_bear 天每日 -3%（触发 regime==2）。"""
+def _build_market(codes, n_calm=70, n_bear=15, calm_pct=0.5, bear_pct=-3.0):
+    """前 n_calm 天温和上涨（低波），后 n_bear 天每日按 bear_pct 涨跌。"""
     rows = []
     base_date = pd.Timestamp("2025-01-01")
     for idx, code in enumerate(codes):
         close = 10.0 + idx
         for i in range(n_calm + n_bear):
-            pct = 0.5 if i < n_calm else -3.0
+            pct = calm_pct if i < n_calm else bear_pct
             close = close * (1 + pct / 100.0) * (1 + 0.0005 * idx)
             rows.append(
                 {
@@ -58,6 +58,17 @@ def test_ai_adaptive_pro_bear_regime_holds_cash():
     # 非熊市阶段应存在买入信号，确保测试非空转
     non_bear = result[result["regime"] != 2]
     assert (non_bear["signal"] == 1).any()
+
+
+def test_ai_adaptive_pro_bear_threshold_uses_percentage_units():
+    """mkt_trend 阈值为百分数口径：20 日累计 -4% 不应判熊，-6% 应判熊。"""
+    mild = _build_market(["M1", "M2", "M3"], n_calm=70, n_bear=30, calm_pct=0.5, bear_pct=-0.2)
+    mild_result = calculate_ai_adaptive_signals_pro(mild)
+    assert not (mild_result["regime"] == 2).any(), "20 日累计跌幅仅 -4%，不应触发熊市空仓"
+
+    strong = _build_market(["S1", "S2", "S3"], n_calm=70, n_bear=30, calm_pct=0.5, bear_pct=-0.3)
+    strong_result = calculate_ai_adaptive_signals_pro(strong)
+    assert (strong_result["regime"] == 2).any(), "20 日累计跌幅 -6%，应触发熊市空仓"
 
 
 def test_regime_adaptive_factor_strategy_bear_regime_holds_cash():
@@ -100,6 +111,7 @@ def test_pro_plus_regime_factor_mapping_locked():
 
     # 三态都必须在测试数据中出现
     present = set(result["regime"].unique())
+    assert REGIME_CALM in present, "0.1% 级别的平静市不应被 0.05 的旧阈值误判成趋势市"
     assert REGIME_TREND in present
     assert REGIME_CHOPPY in present
 

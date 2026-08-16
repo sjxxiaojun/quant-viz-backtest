@@ -3,7 +3,7 @@
  */
 
 import React from 'react';
-import { ShieldAlert, AlertTriangle, CheckCircle2, Info } from 'lucide-react';
+import { ShieldAlert } from 'lucide-react';
 import { Panel, SectionTitle, Tag } from '../components/ui';
 
 export function DisclosurePage() {

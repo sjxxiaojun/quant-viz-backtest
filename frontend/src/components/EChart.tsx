@@ -29,7 +29,7 @@ interface EChartProps {
   option: EChartsCoreOption;
   style?: React.CSSProperties;
   className?: string;
-  largeDataSeries?: { seriesIndex: number; data: any[] }[];
+  largeDataSeries?: { seriesIndex: number; data: unknown[] }[];
 }
 
 export function EChart({ option, style, className, largeDataSeries }: EChartProps) {

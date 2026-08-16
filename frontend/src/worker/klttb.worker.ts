@@ -118,13 +118,16 @@ if (typeof self !== 'undefined' && typeof window === 'undefined') {
     const result = downsampleKLTTB(input, targetCount);
     
     // Transferable 零拷贝返回
-    (self as any).postMessage(
+    const worker = self as unknown as {
+      postMessage(message: unknown, transfer: ArrayBuffer[]): void;
+    };
+    worker.postMessage(
       {
         id,
         buffer: result.buffer,
         count: Math.floor(result.length / 7),
       },
-      [result.buffer]
+      [result.buffer as ArrayBuffer]
     );
   };
 }

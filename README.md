@@ -95,7 +95,7 @@ export DATA_LAKE_API_URL="http://您的数据网关地址" # 云端模式可选
 pip install -r requirements.txt
 python main.py
 ```
-*(如果未配置 `DATA_LAKE_API_URL`，引擎会安全地读取本地 `./quant_data_lake` 目录)。*
+*(如果未配置 `DATA_LAKE_API_URL`，引擎会读取本地数据湖：可通过 `QUANT_DATA_LAKE_DIR` 指定目录；未指定时优先使用 `backend/../../quant_data_lake`（与仓库同级的 quant_data_lake），不存在则回退到 `backend/quant_data_lake`)。*
 
 ### 2. 启动前端
 ```bash

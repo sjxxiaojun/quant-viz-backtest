@@ -106,11 +106,11 @@ def _configure_logging() -> None:
             file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
             root.addHandler(file_handler)
         except OSError as exc:
-            logging.getLogger("GeminiQuantAPI").warning(f"backend.log 轮转文件句柄初始化失败: {exc}")
+            logging.getLogger("momoQuantAPI").warning(f"backend.log 轮转文件句柄初始化失败: {exc}")
 
 
 _configure_logging()
-logger = logging.getLogger("GeminiQuantAPI")
+logger = logging.getLogger("momoQuantAPI")
 
 data_manager = DataManager()
 vt_manager = VirtualTradingManager(DB_PATH, data_manager)
@@ -322,7 +322,7 @@ def _build_ai_context() -> Dict[str, object]:
     intraday_snapshot = _intraday_snapshot_context(virtual_accounts)
     return {
         "system": {
-            "engine_version": "Gemini Quant Pro V4.6 (Lake Routed)",
+            "engine_version": "momo quant pro V4.6 (Lake Routed)",
             "market_status": data_manager.get_market_status(),
             "local_a_share_files": len(data_manager.list_local_codes("a_share")),
             "local_etf_files": len(data_manager.list_local_codes("etf")),
@@ -2403,7 +2403,7 @@ def build_stress_test_config(req: FactorLabStressTestRequest):
 
 @app.get("/")
 def read_root():
-    return {"message": "Gemini Quant Pro API is running on 8080"}
+    return {"message": "momo quant pro API is running"}
 
 
 def _health_payload(ready: bool) -> Dict[str, object]:
@@ -2421,7 +2421,7 @@ def _health_payload(ready: bool) -> Dict[str, object]:
         "service": "quant-viz-backtest",
         "status": status if ready else "ok",
         "ready": all(checks.values()),
-        "engine_version": "Gemini Quant Pro V4.6 (Lake Routed)",
+        "engine_version": "momo quant pro V4.6 (Lake Routed)",
         "checks": checks,
     }
 
@@ -2594,7 +2594,7 @@ def get_system_status():
         "market_status": data_manager.get_market_status(),
         "data_coverage": "2022 - 2026 (实盘级数据湖)",
         "stock_pool": "A股策略 -> A股数据湖, ETF策略 -> ETF 数据湖",
-        "engine_version": "Gemini Quant Pro V4.6 (Lake Routed)",
+        "engine_version": "momo quant pro V4.6 (Lake Routed)",
         "local_a_share_files": len(data_manager.list_local_codes("a_share")),
         "local_etf_files": len(data_manager.list_local_codes("etf")),
     }

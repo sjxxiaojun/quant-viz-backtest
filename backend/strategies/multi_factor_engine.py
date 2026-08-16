@@ -170,7 +170,8 @@ class RegimeAdaptiveFactorStrategy(MultiFactorStrategy):
         
         regime_series = pd.Series(0, index=mkt_ret.index)
         regime_series[mkt_vol_daily > mkt_vol_ma_daily] = 1
-        regime_series[mkt_trend < -0.05] = 2
+        # pct_chg 为百分数单位（1.0 表示 1%），20 日累计跌幅超过 5% 才判为熊市。
+        regime_series[mkt_trend < -5.0] = 2
         
         regime_df = pd.DataFrame({'date': mkt_ret.index, 'regime': regime_series.values})
         df = df.merge(regime_df, on='date', how='left')
