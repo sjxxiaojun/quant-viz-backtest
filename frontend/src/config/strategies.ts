@@ -125,9 +125,9 @@ export const strategyInfo: Record<string, StrategyMeta> = {
     icon: Flame, category: "信号工厂 (高共识)", tags: ["反转爆点", "盘中博弈", "高灵敏"], color: "amber", pool: "blackhorse", assetClass: "a_share"
   },
   limit_up_doji: {
-    name: "涨停后十字星",
-    desc: "捕捉昨日封板、今日缩量收平的经典'空中加油'形态。判定主力洗盘意图，博取次日的二波启动脉冲。",
-    icon: Factory, category: "信号工厂 (高共识)", tags: ["形态博弈", "趋势延续"], color: "cyan", pool: "blackhorse", assetClass: "a_share"
+    name: "涨停后十字星 (低置信度/示例)",
+    desc: "捕捉昨日封板、今日缩量收平形态。近三年在回测池仅触发 6 次，统计置信度低，仅供形态工程化示例参考，不建议作为主要实盘策略。",
+    icon: Factory, category: "信号工厂 (高共识)", tags: ["低置信度", "示例策略", "形态博弈"], color: "cyan", pool: "blackhorse", assetClass: "a_share"
   },
   sector_alpha: {
     name: "行业优选 (Alpha)",

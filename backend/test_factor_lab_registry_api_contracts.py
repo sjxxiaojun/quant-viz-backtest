@@ -51,7 +51,8 @@ def test_strategies_api_returns_registry_behavior_fields():
     assert "artifact_status" in payload["ml_factor_ranker"]
 
 
-def test_factor_lab_results_api_contract(monkeypatch):
+def test_factor_lab_results_api_contract(monkeypatch, tmp_path):
+    report_dir = str(tmp_path / "factor-lab")
     monkeypatch.setattr(
         main,
         "load_latest_result",
@@ -64,7 +65,7 @@ def test_factor_lab_results_api_contract(monkeypatch):
                     "user_view": {"name_cn": "排序策略", "trigger_days": 12},
                 }
             },
-            "artifacts": {"report_dir": "/tmp/factor-lab"},
+            "artifacts": {"report_dir": report_dir},
         },
     )
 
@@ -76,7 +77,7 @@ def test_factor_lab_results_api_contract(monkeypatch):
     assert payload["summary"]["label"] == "next_5d_ret"
     assert payload["run_readiness"]["needs_backfill"] is False
     assert payload["strategy_backtests"]["ml_factor_ranker"]["user_view"]["name_cn"] == "排序策略"
-    assert payload["artifacts"]["report_dir"] == "/tmp/factor-lab"
+    assert payload["artifacts"]["report_dir"] == report_dir
     assert payload["factor_ranking"][0]["factor"] == "mom_20d"
 
 

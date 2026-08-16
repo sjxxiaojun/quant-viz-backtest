@@ -4,7 +4,7 @@ import numpy as np
 import inspect
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,14 @@ class CostModel:
         )["total"]
 
 @dataclass
+class Lot:
+    quantity: int
+    price: float
+    entry_date: str
+    available_from: Optional[str] = None
+
+
+@dataclass
 class Position:
     stock_code: str
     stock_name: str
@@ -143,6 +151,26 @@ class Position:
     market_value: float = 0.0
     industry: Optional[str] = None
     entry_date: Optional[str] = None
+    lots: List[Lot] = field(default_factory=list)
+    deferred_intent: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.lots and self.quantity > 0:
+            self.lots = [
+                Lot(
+                    quantity=self.quantity,
+                    price=self.avg_price,
+                    entry_date=self.entry_date or "1970-01-01",
+                    available_from=self.entry_date or "1970-01-01",
+                )
+            ]
+
+    def available_quantity(self, current_date: str, enforce_t1: bool = True) -> int:
+        if not enforce_t1:
+            return self.quantity
+        if not self.lots:
+            return self.quantity if (self.entry_date and self.entry_date < current_date) else 0
+        return sum(lot.quantity for lot in self.lots if lot.entry_date < current_date)
 
 class Portfolio:
     def __init__(self, initial_capital: float = 1000000.0):
@@ -566,7 +594,9 @@ class BacktestEngine:
             self.execution_stats["blocked_invalid_price_count"] += 1
 
     def _is_t1_sell_blocked(self, pos: Position, date: str) -> bool:
-        return bool(self.enforce_t1 and pos.entry_date and pos.entry_date == date)
+        if not self.enforce_t1:
+            return False
+        return pos.available_quantity(date, enforce_t1=True) <= 0
 
     def _cap_order_quantity(self, stock_row: pd.Series, requested_qty: int) -> Tuple[int, bool]:
         requested_qty = int(requested_qty or 0)
@@ -619,7 +649,23 @@ class BacktestEngine:
             return False
 
         self.portfolio.cash -= (exec_amt + total_cost)
-        self.portfolio.positions[code] = Position(code, stock_name, qty, price, exec_amt, entry_date=date)
+        if code in self.portfolio.positions:
+            pos = self.portfolio.positions[code]
+            total_qty = pos.quantity + qty
+            pos.avg_price = (pos.quantity * pos.avg_price + exec_amt) / total_qty
+            pos.quantity = total_qty
+            pos.market_value += exec_amt
+            pos.lots.append(Lot(quantity=qty, price=float(price), entry_date=date, available_from=date))
+        else:
+            self.portfolio.positions[code] = Position(
+                code,
+                stock_name,
+                qty,
+                price,
+                exec_amt,
+                entry_date=date,
+                lots=[Lot(quantity=qty, price=float(price), entry_date=date, available_from=date)],
+            )
         self.turnover_amount += exec_amt
         self.execution_stats["buy_fills"] += 1
         self._record_cost_breakdown(cost_breakdown)
@@ -678,6 +724,14 @@ class BacktestEngine:
         if remaining_qty > 0:
             pos.quantity = remaining_qty
             pos.market_value = remaining_qty * price
+            remaining_to_deduct = close_qty
+            for lot in pos.lots:
+                if remaining_to_deduct <= 0:
+                    break
+                deduct = min(lot.quantity, remaining_to_deduct)
+                lot.quantity -= deduct
+                remaining_to_deduct -= deduct
+            pos.lots = [lot for lot in pos.lots if lot.quantity > 0]
         else:
             del self.portfolio.positions[code]
         self.turnover_amount += amount
@@ -779,6 +833,29 @@ class BacktestEngine:
             open_price = self._safe_float(stock_row.get('open'))
             if open_price is None or open_price <= 0 or pos.avg_price <= 0:
                 continue
+
+            # 1. 延迟止损意图（DEFERRED_INTENT）：前一日买入触发止损因 T+1 顺延到本日开盘执行
+            if phase == self.RISK_EXIT_PHASE_OPEN and pos.deferred_intent is not None:
+                if not self._is_t1_sell_blocked(pos, date):
+                    intent_side = pos.deferred_intent
+                    pos.deferred_intent = None
+                    self.execution_stats["sell_attempts"] += 1
+                    self.execution_stats["delayed_exit_count"] += 1
+                    block_reason = self._trade_block_reason(stock_row, "open", "sell")
+                    if block_reason is not None:
+                        self._record_trade_block(block_reason, "sell")
+                        continue
+                    requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
+                    qty, partial = self._cap_order_quantity(stock_row, requested_qty)
+                    if qty > 0:
+                        fill_status = "partial" if partial else "filled"
+                        if self._close_position(
+                            date, code, float(open_price), intent_side, pos.stock_name,
+                            qty=qty, requested_qty=requested_qty, fill_status=fill_status
+                        ):
+                            blocked_reentry_codes.add(code)
+                            continue
+
             low_price = self._safe_float(stock_row.get('low'))
             high_price = self._safe_float(stock_row.get('high'))
             stop_price = pos.avg_price * (1.0 + self.stock_stop_loss)
@@ -813,6 +890,7 @@ class BacktestEngine:
             self.execution_stats["sell_attempts"] += 1
             if self._is_t1_sell_blocked(pos, date):
                 self.execution_stats["t1_sell_block_count"] += 1
+                pos.deferred_intent = exit_side
                 continue
 
             block_reason = self._trade_block_reason(stock_row, "open", "sell")
@@ -824,7 +902,7 @@ class BacktestEngine:
                 self._record_trade_block("limit_down", "sell")
                 continue
 
-            requested_qty = pos.quantity
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 continue
@@ -856,7 +934,7 @@ class BacktestEngine:
                     self.execution_stats["delayed_exit_count"] += 1
                 continue
 
-            requested_qty = pos.quantity
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 if self.execution_mode == "signal_close_to_next_open":
@@ -890,7 +968,7 @@ class BacktestEngine:
                 continue
 
             name = stock_row['stock_name']
-            requested_qty = pos.quantity
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 continue
@@ -953,7 +1031,7 @@ class BacktestEngine:
                 self.execution_stats["delayed_exit_count"] += 1
                 continue
 
-            requested_qty = pos.quantity
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 self.execution_stats["delayed_exit_count"] += 1

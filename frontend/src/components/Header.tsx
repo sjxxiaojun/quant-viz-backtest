@@ -16,7 +16,7 @@ export function Header({ view, setView }: HeaderProps) {
             <BrainCircuit className="text-white w-6 h-6" />
           </div>
           <h1 className="text-3xl font-black tracking-tighter text-blue-500 cursor-pointer" onClick={() => setView('mall')}>
-            Gemini量化pro
+            momo quant pro
           </h1>
         </div>
         <p className="text-slate-500 font-medium ml-13 italic text-xs">集成机器学习与全市场数据的专业量化平台</p>

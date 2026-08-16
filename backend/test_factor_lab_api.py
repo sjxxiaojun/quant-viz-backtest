@@ -25,7 +25,8 @@ def test_factor_lab_artifact_snapshot_restores_manifest(tmp_path):
         assert (tmp_path / name).read_text(encoding="utf-8") == f"old-{name}"
 
 
-def test_factor_lab_results_api_returns_latest_result(monkeypatch):
+def test_factor_lab_results_api_returns_latest_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "FACTOR_LAB_REPORT_DIR", tmp_path)
     monkeypatch.setattr(
         main,
         "load_latest_result",
@@ -124,7 +125,7 @@ def test_factor_lab_results_api_upgrades_legacy_payload_with_readiness_and_user_
         "artifacts": {"report_dir": str(tmp_path)},
     }
 
-    monkeypatch.setattr(main, "load_latest_result", lambda: legacy_payload)
+    monkeypatch.setattr(main, "load_latest_factor_lab_result", lambda: legacy_payload)
     monkeypatch.setattr(main, "resolve_factor_lab_symbols", lambda pool, max_symbols, end_date=None, start_date=None: ["600519"])
     monkeypatch.setattr(main.data_manager, "get_cached_window", lambda symbol: ("2023-01-01", "2025-12-31"))
 
@@ -339,7 +340,7 @@ def test_factor_lab_backtest_allows_matching_config_with_partial_oos_score_windo
     assert resp.json()["total_return"] == expected["total_return"]
 
 
-def test_factor_lab_run_api_builds_result_and_cost_comparison(monkeypatch):
+def test_factor_lab_run_api_builds_result_and_cost_comparison(monkeypatch, tmp_path):
     sample_df = pd.DataFrame(
         [
             {
@@ -374,7 +375,7 @@ def test_factor_lab_run_api_builds_result_and_cost_comparison(monkeypatch):
             "model_metrics": [{"key": "test_rank_ic", "label": "测试 RankIC", "value": 0.08, "format": "ratio"}],
             "bucket_returns": [{"bucket": "Q1", "return": -0.01}, {"bucket": "Q5", "return": 0.03}],
             "stability": [{"key": "coverage", "label": "覆盖率", "value": 0.9, "format": "percent"}],
-            "artifacts": {"report_dir": "/tmp/factor-lab-test"},
+            "artifacts": {"report_dir": str(tmp_path / "factor-lab-test")},
         },
     )
 
@@ -659,44 +660,39 @@ def test_factor_lab_run_returns_structured_error_without_mock_persistence(monkey
     assert persist_calls["count"] == 0
 
 
-def test_factor_lab_stress_test_api_returns_display_contract_and_updates_latest(monkeypatch):
+def test_factor_lab_stress_test_api_returns_display_contract_and_updates_latest(monkeypatch, tmp_path):
     sample_df = pd.DataFrame(
         [
             {
                 "date": "2026-01-02",
-                "stock_code": "000001",
-                "stock_name": "平安银行",
+                "stock_code": symbol,
+                "stock_name": symbol,
                 "open": 10.0,
-                "high": 10.3,
+                "high": 10.5,
                 "low": 9.8,
-                "close": 10.1,
-                "volume": 1000.0,
-                "amount": 10100.0,
-                "pct_chg": 1.0,
-                "turnover_rate": 1.2,
+                "close": 10.2,
+                "volume": 1000,
+                "amount": 10200.0,
             }
+            for symbol in ["000001", "000002", "000003"]
         ]
     )
     latest_payload = {
         "summary": {
             "start_date": "2024-01-01",
             "end_date": "2026-01-02",
-            "pool": "core",
+            "pool": "all",
             "label": "next_5d_ret",
             "top_n": 3,
-            "max_symbols": 3,
-            "score_source": "walk_forward_composite_score",
-            "walk_forward": {"coverage_ratio": 0.8},
+            "max_symbols": 500,
         },
-        "model_metrics": [{"key": "test_rank_ic", "value": 0.05}],
-        "bucket_returns": [{"bucket": "Q1", "return": -0.01}, {"bucket": "Q5", "return": 0.03}],
         "strategy_backtests": {
             "ml_factor_ranker": {
                 "factor": "ml_factor_ranker",
                 "with_cost": {
                     "total_return": 0.08,
                     "summary": {
-                        "annual_return": 0.10,
+                        "annual_return": 0.11,
                         "max_drawdown": -0.07,
                         "cost_stats": {"cost_pct_initial": 0.01},
                     },
@@ -708,7 +704,7 @@ def test_factor_lab_stress_test_api_returns_display_contract_and_updates_latest(
         "backtest_compare": {"best_total_return_factor": "ml_factor_ranker"},
         "factor_ranking": [{"factor": "mom_20d"}],
         "feature_importance": [],
-        "artifacts": {"report_dir": "/tmp/factor-lab-stress-test"},
+        "artifacts": {"report_dir": str(tmp_path / "factor-lab-stress-test")},
     }
     stress_payload = {
         "run_id": "stress_test",
@@ -768,7 +764,7 @@ def test_factor_lab_stress_test_api_returns_display_contract_and_updates_latest(
     assert persisted["result"]["self_iteration"]["promotion_decision"]["status"] in {"shadow", "research_pass", "no_promotion"}
 
 
-def test_factor_lab_stress_test_prefers_current_artifact_symbols(monkeypatch):
+def test_factor_lab_stress_test_prefers_current_artifact_symbols(monkeypatch, tmp_path):
     sample_df = pd.DataFrame(
         [
             {
@@ -794,7 +790,7 @@ def test_factor_lab_stress_test_prefers_current_artifact_symbols(monkeypatch):
             "top_n": 3,
             "max_symbols": 500,
         },
-        "artifacts": {"report_dir": "/tmp/factor-lab-stress-test"},
+        "artifacts": {"report_dir": str(tmp_path / "factor-lab-stress-test")},
     }
     captured = {}
 

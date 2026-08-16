@@ -5,6 +5,7 @@
 # Runtime state
 .omc/
 .omx/
+.playwright-mcp/
 
 # Secrets and local environment
 .env

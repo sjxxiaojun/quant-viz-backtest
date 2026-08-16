@@ -433,17 +433,6 @@ def _raw_header_request(header_name: bytes, header_value: bytes, host: str = EXT
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "已知缺陷：secrets.compare_digest 只接受纯 ASCII 字符串。"
-        "攻击者用原始 socket 发一个非 ASCII 的 X-Quant-Api-Key，"
-        "_has_valid_quant_api_key 会抛 TypeError，接口返回 500 而不是 403。"
-        "不是鉴权绕过（请求仍进不来），但是鉴权路径上的未处理异常。"
-        "修复方式：比较前先 provided.encode('utf-8') / expected.encode('utf-8')。"
-    ),
-    strict=False,
-    raises=TypeError,
-)
 @pytest.mark.parametrize(
     "raw_value", ["密钥".encode("utf-8"), b"\xe9\xe8", b"\xff\xfe"], ids=["utf8", "latin1", "binary"]
 )

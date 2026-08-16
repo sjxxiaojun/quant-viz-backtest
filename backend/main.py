@@ -2505,7 +2505,17 @@ def _has_valid_quant_api_key(request: Request) -> bool:
     auth = request.headers.get("Authorization", "").strip()
     if auth.lower().startswith("bearer "):
         provided = provided or auth.split(" ", 1)[1].strip()
-    return bool(provided) and secrets.compare_digest(provided, expected)
+    if not provided:
+        return False
+    try:
+        return secrets.compare_digest(provided, expected)
+    except TypeError:
+        try:
+            return secrets.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+        except Exception:
+            return False
+    except Exception:
+        return False
 
 
 def _require_automation_request(request: Request) -> None:
