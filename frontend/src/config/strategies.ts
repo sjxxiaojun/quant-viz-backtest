@@ -116,12 +116,12 @@ export const strategyInfo: Record<string, StrategyMeta> = {
   },
   overnight: {
     name: "一夜持股 (Signal Factory)",
-    desc: "来自 acodex 核心信号。锁定 14:50 分具有强力承接、主力资金净流入且价格位于 20 日高位的标的。赚取次日竞价溢价。",
+    desc: "根据日线量价特征筛选隔夜候选；默认收盘后生成信号、次日开盘成交。日线数据不能还原14:50的可见信息。",
     icon: Zap, category: "信号工厂 (高共识)", tags: ["短线接力", "隔夜溢价", "情绪流"], color: "violet", pool: "blackhorse", assetClass: "a_share"
   },
   weak_to_strong: {
     name: "弱转强 (Signal Factory)",
-    desc: "识别开盘低开后、在 30 分钟内迅速放量收复失地并突破前高的高辨识度结构。捕捉分歧转一致的爆发性机会。",
+    desc: "用日线开盘缺口、收盘修复和成交量识别弱转强候选；不能验证盘中30分钟路径，默认次日开盘成交。",
     icon: Flame, category: "信号工厂 (高共识)", tags: ["反转爆点", "盘中博弈", "高灵敏"], color: "amber", pool: "blackhorse", assetClass: "a_share"
   },
   limit_up_doji: {

@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 import logging
 
 import pandas as pd
@@ -22,7 +22,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from ai_automation import AIAutomationService, allowed_action_catalog
 from automation_store import AutomationStore
@@ -37,18 +37,24 @@ from strategy_versioning import StrategyVersionStore, artifact_fingerprint
 from virtual_trading_manager import VirtualTradingManager
 from strategies.sector_strategy import run_power_energy_strategy
 
+from research_contracts import ENGINE_VERSION, RUNTIME_DIR, ExecutionDataService, DataContractError, historical_universe, persist_snapshot, market_now, TradingCalendar
+from job_service import JobStore, JobQueue, report_stage
+
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
-DB_PATH = BACKEND_DIR / "virtual_trading.db"
+DB_PATH = Path(os.getenv("QUANT_DB_PATH", str(BACKEND_DIR / "virtual_trading.db")))
+job_store = JobStore(RUNTIME_DIR / "research_jobs.db")
+job_queue = JobQueue(job_store)
 
 
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
     global MARKET_WARMUP_THREAD
+    job_queue.start()
     _configure_ai_handlers()
     # 启动即打印当前鉴权口径（回环豁免开/关、API Key 有没有配），避免"以为自己没暴露"。
     log_api_auth_state()
-    if MARKET_WARMUP_THREAD is None or not MARKET_WARMUP_THREAD.is_alive():
+    if os.getenv("QUANT_WARM_MARKET_CACHE", "1") != "0" and (MARKET_WARMUP_THREAD is None or not MARKET_WARMUP_THREAD.is_alive()):
         MARKET_WARMUP_THREAD = threading.Thread(target=_warm_latest_market_cache, daemon=True)
         MARKET_WARMUP_THREAD.start()
     if not os.getenv("PYTEST_CURRENT_TEST"):
@@ -57,6 +63,7 @@ async def _app_lifespan(app: FastAPI):
         yield
     finally:
         automation_scheduler.stop()
+        job_queue.stop()
 
 
 app = FastAPI(lifespan=_app_lifespan)
@@ -113,6 +120,7 @@ _configure_logging()
 logger = logging.getLogger("momoQuantAPI")
 
 data_manager = DataManager()
+execution_data_service = ExecutionDataService(data_manager)
 vt_manager = VirtualTradingManager(DB_PATH, data_manager)
 strategy_version_store = StrategyVersionStore(DB_PATH)
 automation_store = AutomationStore(DB_PATH)
@@ -127,12 +135,15 @@ STOCK_POOL = POOLS.get("core", [])
 ETF_POOL = POOLS.get("etf", [])
 BLACKHORSE_POOL = POOLS.get("blackhorse", [])
 POWER_ENERGY_POOL = POOLS.get("power_energy", [])
+from virtual_trading_v2 import VirtualTradingV2
+vt_manager_v2 = VirtualTradingV2(data_manager, execution_data_service, strategy_version_store, POOLS)
+
 A_SHARE_POOL_NAMES = {"core", "blackhorse", "power_energy"}
 FACTOR_LAB_WARMUP_DAYS = 260
 BACKTEST_WARMUP_DAYS = 150
 BACKTEST_MAX_CONCURRENT = 2
 BACKTEST_MAX_SYMBOLS = 500
-BACKTEST_MAX_DAYS = 260 * 5
+BACKTEST_MAX_DAYS = 366 * 5
 BACKTEST_MAX_ROWS = 1_000_000
 BACKTEST_MAX_COMPARE_STRATEGIES = 4
 BACKTEST_MAX_COMPARE_ROWS = BACKTEST_MAX_ROWS
@@ -186,7 +197,7 @@ def _execute_virtual_trade_locked() -> Dict[str, object]:
     if not VIRTUAL_TRADE_EXECUTE_LOCK.acquire(blocking=False):
         raise RuntimeError("virtual trading simulation is already running")
     try:
-        return vt_manager.execute_daily()
+        return vt_manager_v2.execute_daily()
     finally:
         VIRTUAL_TRADE_EXECUTE_LOCK.release()
 
@@ -322,7 +333,7 @@ def _build_ai_context() -> Dict[str, object]:
     intraday_snapshot = _intraday_snapshot_context(virtual_accounts)
     return {
         "system": {
-            "engine_version": "momo quant pro V4.6 (Lake Routed)",
+            "engine_version": ENGINE_VERSION,
             "market_status": data_manager.get_market_status(),
             "local_a_share_files": len(data_manager.list_local_codes("a_share")),
             "local_etf_files": len(data_manager.list_local_codes("etf")),
@@ -470,6 +481,7 @@ def resolve_close_slippage_rate(req: Any) -> float:
 
 
 class BacktestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     start_date: str
     end_date: str
     initial_capital: float = Field(gt=0, le=1_000_000_000)
@@ -494,6 +506,8 @@ class BacktestRequest(BaseModel):
     close_slippage_rate: Optional[float] = Field(default=None, ge=0.0, le=0.1)
     commission_min: float = Field(default=5.0, ge=0.0, le=1000.0)
     allow_mock: bool = False
+    price_mode: Literal["strict_raw", "approximate_adjusted"] = "strict_raw"
+    same_close_approximation: bool = False
 
 
 class BacktestJobSubmitResponse(BaseModel):
@@ -506,125 +520,13 @@ class BacktestJobStatusResponse(BaseModel):
     created_at: float
     updated_at: float
     error: Optional[str] = None
-
-
-def _cleanup_backtest_jobs(now: Optional[float] = None) -> None:
-    ts = now if now is not None else time.time()
-    with BACKTEST_JOBS_LOCK:
-        expired = [
-            job_id
-            for job_id, job in BACKTEST_JOBS.items()
-            if ts - float(job.get("updated_at", job.get("created_at", ts))) > BACKTEST_JOB_TTL_SECONDS
-        ]
-        for job_id in expired:
-            BACKTEST_JOBS.pop(job_id, None)
-
-
-def _create_backtest_job(req: BacktestRequest) -> str:
-    job_id = uuid.uuid4().hex
-    ts = time.time()
-    with BACKTEST_JOBS_LOCK:
-        BACKTEST_JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "created_at": ts,
-            "updated_at": ts,
-            "error": None,
-            "result": None,
-            "request": req.model_dump(),
-        }
-    return job_id
-
-
-def _set_backtest_job(job_id: str, **updates: object) -> None:
-    ts = time.time()
-    with BACKTEST_JOBS_LOCK:
-        job = BACKTEST_JOBS.get(job_id)
-        if not job:
-            return
-        job.update(updates)
-        job["updated_at"] = ts
-
-
-def _get_backtest_job(job_id: str) -> Optional[Dict[str, object]]:
-    with BACKTEST_JOBS_LOCK:
-        job = BACKTEST_JOBS.get(job_id)
-        return dict(job) if job else None
-
-
-def _run_backtest_job(job_id: str) -> None:
-    job = _get_backtest_job(job_id)
-    if not job:
-        return
-    try:
-        _set_backtest_job(job_id, status="running")
-        req_data = job.get("request") or {}
-        req = BacktestRequest(**req_data)
-        result = execute_backtest(req, allow_mock=bool(req.allow_mock))
-        _set_backtest_job(job_id, status="succeeded", result=result)
-    except Exception as exc:
-        _set_backtest_job(job_id, status="failed", error=str(exc))
-
-
-def _cleanup_compare_jobs(now: Optional[float] = None) -> None:
-    ts = now if now is not None else time.time()
-    with COMPARE_JOBS_LOCK:
-        expired = [
-            job_id
-            for job_id, job in COMPARE_JOBS.items()
-            if ts - float(job.get("updated_at", job.get("created_at", ts))) > COMPARE_JOB_TTL_SECONDS
-        ]
-        for job_id in expired:
-            COMPARE_JOBS.pop(job_id, None)
-
-
-def _create_compare_job(req: "CompareRequest") -> str:
-    job_id = uuid.uuid4().hex
-    ts = time.time()
-    with COMPARE_JOBS_LOCK:
-        COMPARE_JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "created_at": ts,
-            "updated_at": ts,
-            "error": None,
-            "result": None,
-            "request": req.model_dump(),
-        }
-    return job_id
-
-
-def _set_compare_job(job_id: str, **updates: object) -> None:
-    ts = time.time()
-    with COMPARE_JOBS_LOCK:
-        job = COMPARE_JOBS.get(job_id)
-        if not job:
-            return
-        job.update(updates)
-        job["updated_at"] = ts
-
-
-def _get_compare_job(job_id: str) -> Optional[Dict[str, object]]:
-    with COMPARE_JOBS_LOCK:
-        job = COMPARE_JOBS.get(job_id)
-        return dict(job) if job else None
-
-
-def _run_compare_job(job_id: str) -> None:
-    job = _get_compare_job(job_id)
-    if not job:
-        return
-    try:
-        _set_compare_job(job_id, status="running")
-        req_data = job.get("request") or {}
-        req = CompareRequest(**req_data)
-        result = execute_compare_request(req)
-        _set_compare_job(job_id, status="succeeded", result=result)
-    except Exception as exc:
-        _set_compare_job(job_id, status="failed", error=str(exc))
+    stage: Optional[str] = None
 
 
 class CompareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    price_mode: Literal["strict_raw", "approximate_adjusted"] = "strict_raw"
+    same_close_approximation: bool = False
     strategies: List[str]
     start_date: str
     end_date: str
@@ -649,6 +551,8 @@ class CompareRequest(BaseModel):
 
 
 class FactorLabRunRequest(BaseModel):
+    price_mode: Literal["strict_raw", "approximate_adjusted"] = "strict_raw"
+    model_config = ConfigDict(extra="forbid")
     start_date: str
     end_date: str
     pool: str = "core"
@@ -942,31 +846,28 @@ def resolve_symbols(
         if pool_ctx["effective_pool"] == "all" and pool_ctx["asset_class"] == "a_share":
             all_symbols = dedupe_symbols(get_symbols_for_pool("all", "a_share"))
             sample_limit = requested_max_symbols or BACKTEST_MAX_SYMBOLS
-            selected_symbols = data_manager.select_local_a_share_symbols(
-                sample_limit,
-                min_end_date=min_end_date,
-                min_start_date=min_start_date,
-                allow_late_start=True,
-            )
-            symbols = dedupe_symbols(selected_symbols or all_symbols[:sample_limit])[:sample_limit]
-            selection_metadata = data_manager.get_last_symbol_selection_metadata()
+            cutoff = (datetime.strptime(req.start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+            try:
+                symbols, selection_metadata = historical_universe(data_manager, sample_limit, cutoff)
+            except DataContractError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
             pool_ctx.update(
                 {
                     **selection_metadata,
                     "symbols_before_budget": len(all_symbols),
-                    "selection_method": "full_market_backtest_prescreen_v2",
-                    "method_cn": "全A轻量预筛：历史覆盖 + 流动性优先",
+                    "selection_method": "historical_liquidity_v2",
+                    "method_cn": "开始前流动性预筛，固定研究样本",
                     "local_universe_size": len(all_symbols),
                     "prescreen_universe_size": len(all_symbols),
                     "requested_max_symbols": sample_limit,
                     "budget_truncated": len(all_symbols) > len(symbols),
                     "is_budget_sample": len(all_symbols) > len(symbols),
                     "deep_scored_all_symbols": False,
-                    "availability_cutoff": min_end_date,
+                    "availability_cutoff": cutoff,
                     "history_coverage_start": min_start_date,
                     "allow_late_start": True,
                     "sample_source_note": (
-                        f"本次先从本地 {len(all_symbols)} 只 A 股做轻量预筛，"
+                        f"本次按开始前数据从本地历史 A 股做预筛，"
                         f"选出 {len(symbols)} 只进入深度回测。"
                     ),
                 }
@@ -975,7 +876,7 @@ def resolve_symbols(
             symbols = dedupe_symbols(get_symbols_for_pool(pool_ctx["effective_pool"], pool_ctx["asset_class"]))
             pool_ctx["symbols_before_budget"] = len(symbols)
 
-    if not req.stocks and requested_max_symbols is not None and pool_ctx.get("selection_method") != "full_market_backtest_prescreen_v2":
+    if not req.stocks and requested_max_symbols is not None and pool_ctx.get("selection_method") != "historical_liquidity_v2":
         if len(symbols) > requested_max_symbols:
             symbols = symbols[:requested_max_symbols]
             pool_ctx["budget_truncated"] = True
@@ -1047,16 +948,14 @@ def resolve_factor_lab_symbols(
 
     if normalized_pool == "all":
         sample_size = requested_max or FACTOR_LAB_DEFAULT_ALL_SAMPLE
-        availability_cutoff = _factor_lab_availability_cutoff(end_date)
-        warmup_start = _factor_lab_warmup_start(start_date)
-        symbols = (
-            data_manager.select_local_a_share_symbols(
-                sample_size,
-                min_end_date=availability_cutoff,
-                min_start_date=warmup_start,
-            )
-            or dedupe_symbols(get_symbols_for_pool("all", "a_share"))[:sample_size]
-        )
+        if not start_date:
+            raise HTTPException(status_code=422, detail="历史股票池需要 start_date")
+        cutoff = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            symbols, metadata = historical_universe(data_manager, sample_size, cutoff)
+            data_manager._last_symbol_selection_metadata = metadata
+        except DataContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         return symbols[:sample_size]
 
     symbols = dedupe_symbols(get_symbols_for_pool(normalized_pool, "a_share"))
@@ -2122,6 +2021,11 @@ def execute_backtest(
     allow_mock: bool = False,
     semaphore: Optional[threading.BoundedSemaphore] = None,
 ) -> Dict:
+    if strategy_version_store.resolve_strategy_spec(req.factor) is None:
+        raise HTTPException(status_code=422, detail=f"未知策略：{req.factor}")
+    if req.weight_mode not in {"equal", "score"}:
+        raise HTTPException(status_code=422, detail="weight_mode 仅支持 equal/score")
+    report_stage("选择历史股票池")
     current_pool, pool_ctx, warmup_start = prepare_backtest_universe(req)
     # 默认使用普通回测并发预算；Factor Lab 等内部编排传入自己的信号量，与用户回测互不抢占。
     slot = semaphore if semaphore is not None else BACKTEST_SEMAPHORE
@@ -2165,6 +2069,13 @@ def execute_backtest(
             # Do not block strategy backtest if benchmark data is temporarily unavailable.
             benchmark_warning = str(exc)
 
+        report_stage("校验未复权成交数据")
+        try:
+            df = execution_data_service.prepare(df, allow_approximate=req.price_mode == "approximate_adjusted" or allow_mock)
+        except DataContractError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        snapshot_id = persist_snapshot(df, req.model_dump(), {**pool_ctx, "symbols": current_pool})
+        report_stage("生成信号与逐日撮合")
         strategy_spec = strategy_version_store.resolve_strategy_spec(req.factor)
         if strategy_spec is not None:
             strategy_func = strategy_spec.func
@@ -2229,7 +2140,7 @@ def execute_backtest(
         }
         engine_params = inspect.signature(BacktestEngine.__init__).parameters
         if strategy_spec is not None and "execution_mode" in engine_params:
-            engine_kwargs["execution_mode"] = strategy_spec.execution_mode
+            engine_kwargs["execution_mode"] = strategy_spec.execution_mode if req.same_close_approximation else "next_open_rebalance"
         if resolved_take_profit is not None:
             if "stock_take_profit" in engine_params:
                 engine_kwargs["stock_take_profit"] = resolved_take_profit
@@ -2238,8 +2149,14 @@ def execute_backtest(
 
         engine = BacktestEngine(**engine_kwargs)
         result = engine.run_backtest(df, signal_func, req.start_date, req.end_date, benchmark_data=benchmark_df)
+        result.update({"engine_version": ENGINE_VERSION, "data_snapshot_id": snapshot_id,
+                       "signal_as_of": str(df.date.max()), "request": req.model_dump(),
+                       "data_as_of": str(df.date.max()), "strategy_version": strategy_version_store.get_active_version_id(req.factor),
+                       "quality_notes": ["固定样本不保证无幸存者偏差", "分红按记录的现金金额计提；未包含差别化股息税", "日线成交量容量为近似，非开盘盘口容量"]})
+        if req.price_mode == "approximate_adjusted" or allow_mock or req.same_close_approximation:
+            result["quality_notes"].append("近似研究结果，不可作为新版模拟账户成交依据")
         result["data_sources_used"] = data_sources
-        result["data_quality"] = data_manager.get_last_pool_quality()
+        result["data_quality"] = data_manager._build_pool_quality(df, current_pool, warmup_start, req.end_date, data_sources, allow_late_start=bool(pool_ctx.get("allow_late_start")))
         result["resolved_pool"] = {
             "requested_pool": req.pool,
             **pool_ctx,
@@ -2250,7 +2167,7 @@ def execute_backtest(
             "holding_policy": strategy_spec.holding_policy if strategy_spec is not None else "custom",
             "resolved_max_hold_days": resolved_max_hold_days,
             "resolved_take_profit": resolved_take_profit,
-            "execution_mode": strategy_spec.execution_mode if strategy_spec is not None else "next_open_rebalance",
+            "execution_mode": engine.execution_mode,
             "portfolio_circuit_breaker_active": False,
             "deprecated_circuit_breaker_requested": req.circuit_breaker,
             "risk_control_note": "组合熔断已停用；组合回撤仅作为风险指标展示。",
@@ -2265,17 +2182,8 @@ def execute_backtest(
                     "message": benchmark_warning,
                 }
             )
-        trades = result.get("trades")
-        if isinstance(trades, list):
-            max_trades = 500
-            total_trades = len(trades)
-            if total_trades > max_trades:
-                result["trades_total"] = total_trades
-                result["trades_truncated"] = True
-                result["trades"] = trades[-max_trades:]
-            else:
-                result["trades_total"] = total_trades
-                result["trades_truncated"] = False
+        result["trades_total"] = len(result.get("trades", []))
+        result["trades_truncated"] = False
         return result
     finally:
         slot.release()
@@ -2303,6 +2211,7 @@ def build_factor_lab_backtest_request(
         slippage_rate=req.slippage_rate,
         close_slippage_rate=req.close_slippage_rate,
         commission_min=req.commission_min,
+        price_mode=req.price_mode,
     )
 
 
@@ -2421,7 +2330,7 @@ def _health_payload(ready: bool) -> Dict[str, object]:
         "service": "quant-viz-backtest",
         "status": status if ready else "ok",
         "ready": all(checks.values()),
-        "engine_version": "momo quant pro V4.6 (Lake Routed)",
+        "engine_version": ENGINE_VERSION,
         "checks": checks,
     }
 
@@ -2594,7 +2503,7 @@ def get_system_status():
         "market_status": data_manager.get_market_status(),
         "data_coverage": "2022 - 2026 (实盘级数据湖)",
         "stock_pool": "A股策略 -> A股数据湖, ETF策略 -> ETF 数据湖",
-        "engine_version": "momo quant pro V4.6 (Lake Routed)",
+        "engine_version": ENGINE_VERSION,
         "local_a_share_files": len(data_manager.list_local_codes("a_share")),
         "local_etf_files": len(data_manager.list_local_codes("etf")),
     }
@@ -2755,17 +2664,16 @@ def run_backtest(req: BacktestRequest, response: Response):
 
 @app.post("/api/backtest/jobs", response_model=BacktestJobSubmitResponse)
 def submit_backtest_job(req: BacktestRequest):
-    _cleanup_backtest_jobs()
-    job_id = _create_backtest_job(req)
-    thread = threading.Thread(target=_run_backtest_job, args=(job_id,), daemon=True)
-    thread.start()
+    try:
+        job_id = job_queue.submit("backtest", req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
     return BacktestJobSubmitResponse(job_id=job_id)
 
 
 @app.get("/api/backtest/jobs/{job_id}", response_model=BacktestJobStatusResponse)
 def get_backtest_job_status(job_id: str):
-    _cleanup_backtest_jobs()
-    job = _get_backtest_job(job_id)
+    job = job_store.get(job_id, include_result=False)
     if not job:
         raise HTTPException(status_code=404, detail="回测任务不存在或已过期。")
     return BacktestJobStatusResponse(
@@ -2774,13 +2682,13 @@ def get_backtest_job_status(job_id: str):
         created_at=float(job.get("created_at", 0.0)),
         updated_at=float(job.get("updated_at", 0.0)),
         error=str(job.get("error")) if job.get("error") else None,
+        stage=job.get("stage"),
     )
 
 
 @app.get("/api/backtest/jobs/{job_id}/result")
 def get_backtest_job_result(job_id: str):
-    _cleanup_backtest_jobs()
-    job = _get_backtest_job(job_id)
+    job = job_store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="回测任务不存在或已过期。")
     status = str(job.get("status", "unknown"))
@@ -2827,6 +2735,8 @@ def execute_compare_request(req: CompareRequest) -> Dict[str, Dict]:
             close_slippage_rate=req.close_slippage_rate,
             commission_min=req.commission_min,
             allow_mock=req.allow_mock,
+            price_mode=req.price_mode,
+            same_close_approximation=req.same_close_approximation,
         )
         _, pool_ctx, _ = prepare_backtest_universe(br)
         total_estimated_rows += int(pool_ctx.get("estimated_rows", 0))
@@ -2858,17 +2768,16 @@ def compare_strategies(req: CompareRequest, response: Response):
 
 @app.post("/api/backtest/compare/jobs", response_model=BacktestJobSubmitResponse)
 def submit_compare_job(req: CompareRequest):
-    _cleanup_compare_jobs()
-    job_id = _create_compare_job(req)
-    thread = threading.Thread(target=_run_compare_job, args=(job_id,), daemon=True)
-    thread.start()
+    try:
+        job_id = job_queue.submit("compare", req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
     return BacktestJobSubmitResponse(job_id=job_id)
 
 
 @app.get("/api/backtest/compare/jobs/{job_id}", response_model=BacktestJobStatusResponse)
 def get_compare_job_status(job_id: str):
-    _cleanup_compare_jobs()
-    job = _get_compare_job(job_id)
+    job = job_store.get(job_id, include_result=False)
     if not job:
         raise HTTPException(status_code=404, detail="策略对比任务不存在或已过期。")
     return BacktestJobStatusResponse(
@@ -2877,13 +2786,13 @@ def get_compare_job_status(job_id: str):
         created_at=float(job.get("created_at", 0.0)),
         updated_at=float(job.get("updated_at", 0.0)),
         error=str(job.get("error")) if job.get("error") else None,
+        stage=job.get("stage"),
     )
 
 
 @app.get("/api/backtest/compare/jobs/{job_id}/result")
 def get_compare_job_result(job_id: str):
-    _cleanup_compare_jobs()
-    job = _get_compare_job(job_id)
+    job = job_store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="策略对比任务不存在或已过期。")
     status = str(job.get("status", "unknown"))
@@ -2977,6 +2886,12 @@ def _execute_factor_lab_run(req: FactorLabRunRequest):
                 "FACTOR_LAB_DATA_EMPTY",
                 run_readiness=run_readiness,
             )
+        report_stage("校验因子研究的成交与复权数据")
+        df = execution_data_service.prepare(df, allow_approximate=req.price_mode == "approximate_adjusted")
+    except DataContractError as exc:
+        with FACTOR_LAB_ARTIFACT_LOCK:
+            restore_factor_lab_artifacts(artifact_snapshot)
+        return factor_lab_error_response(422, str(exc), "FACTOR_LAB_DATA_CONTRACT", run_readiness=run_readiness)
     except HTTPException as exc:
         return factor_lab_error_response(
             exc.status_code,
@@ -3015,11 +2930,13 @@ def _execute_factor_lab_run(req: FactorLabRunRequest):
         label=req.label,
         top_n=req.top_n,
         max_symbols=req.max_symbols,
+        price_mode=req.price_mode,
     )
 
     try:
         with FACTOR_LAB_ARTIFACT_LOCK:
             result = execute_factor_lab_pipeline(df, config, write_latest_summary=False)
+        result.setdefault("summary", {})["price_mode"] = req.price_mode
         result.setdefault("summary", {}).update(
             build_factor_lab_universe_metadata(req.pool, symbols, req.max_symbols, req.end_date, req.start_date)
         )
@@ -3352,10 +3269,13 @@ def list_strategy_versions(strategy_id: str):
     }
 
 
+from research_api import make_router
+app.include_router(make_router(job_store, job_queue, data_manager, FactorLabRunRequest, _require_local_request))
+
 @app.get("/api/virtual-trade/accounts")
-def get_vt_accounts():
+def get_vt_accounts(version: Literal["legacy", "v2"] = "v2"):
     try:
-        return _virtual_accounts_with_intraday_snapshot()
+        return vt_manager_v2.get_accounts() if version == "v2" else _virtual_accounts_with_intraday_snapshot()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3364,9 +3284,11 @@ def get_vt_history(
     strategy_id: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    version: Literal["legacy", "v2"] = "v2",
 ):
     try:
-        return vt_manager.get_trade_log(strategy_id, limit=limit, offset=offset)
+        manager = vt_manager_v2 if version == "v2" else vt_manager
+        return manager.get_trade_log(strategy_id, limit=limit, offset=offset)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3384,16 +3306,16 @@ def execute_vt_daily(request: Request):
         raise HTTPException(status_code=500, detail=f"执行失败: {e}")
 
 @app.get("/api/virtual-trade/equity-history")
-def get_vt_equity_history(strategy_id: str):
+def get_vt_equity_history(strategy_id: str, version: Literal["legacy", "v2"] = "v2"):
     try:
-        return vt_manager.get_equity_history(strategy_id)
+        return (vt_manager_v2 if version == "v2" else vt_manager).get_equity_history(strategy_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/virtual-trade/stats")
-def get_vt_stats(strategy_id: str):
+def get_vt_stats(strategy_id: str, version: Literal["legacy", "v2"] = "v2"):
     try:
-        return vt_manager.get_performance_stats(strategy_id)
+        return (vt_manager_v2 if version == "v2" else vt_manager).get_performance_stats(strategy_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

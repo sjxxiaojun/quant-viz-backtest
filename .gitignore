@@ -68,3 +68,6 @@ backend/quant_data_lake/
 !.vscode/extensions.json
 *.sw?
 *.swo
+
+# Versioned local research runtime, never publish account or market data
+backend/runtime/

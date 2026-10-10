@@ -1,8 +1,12 @@
+import { marketDate } from './api/marketDate';
 import React, { lazy, Suspense, useState } from 'react';
 import { Header } from './components/Header';
 import { StrategyMall } from './components/StrategyMall';
 import { useBacktest } from './hooks/useBacktest';
 import { useMarketData } from './hooks/useMarketData';
+import { useView } from './hooks/useView';
+import { ResultContext } from './components/ResultContext';
+const ResearchTasks = lazy(() => import('./components/ResearchTasks').then(mod => ({ default: mod.ResearchTasks })));
 import type { BacktestConfig } from './types';
 import { coerceRuntimePoolForStrategy, getRuntimePoolForStrategy } from './config/strategies';
 
@@ -19,8 +23,7 @@ const DailyReport = lazy(() => import('./components/DailyReport').then((mod) => 
 const OvernightConsole = lazy(() => import('./components/OvernightConsole').then((mod) => ({ default: mod.OvernightConsole })));
 
 const DEFAULT_START_DATE = "2022-01-01";
-const DEFAULT_END_DATE = new Date().toISOString().slice(0, 10);
-type AppView = 'mall' | 'console' | 'dashboard' | 'compare' | 'factorLab' | 'virtualTrade' | 'dailyReport' | 'overnight';
+const DEFAULT_END_DATE = marketDate();
 
 function ViewFallback() {
   return (
@@ -31,7 +34,7 @@ function ViewFallback() {
 }
 
 export default function App() {
-  const [view, setView] = useState<AppView>('mall');
+  const [view, setView] = useView();
   const { sysStatus } = useMarketData();
   const { loading, error, result, runBacktest, setResult } = useBacktest();
   
@@ -70,6 +73,7 @@ export default function App() {
         )}
 
         <Suspense fallback={<ViewFallback />}>
+          {view === 'tasks' && <ResearchTasks />}
           {view === 'console' && (
             <main className="grid grid-cols-1 lg:grid-cols-12 gap-8 animate-in slide-in-from-right-4 duration-500">
               <div className="lg:col-span-3 space-y-8">
@@ -89,7 +93,8 @@ export default function App() {
                     {error}
                   </div>
                 )}
-	                <KPICards result={result} />
+	                <ResultContext result={result} />
+                <KPICards result={result} />
                 <EquityCurve result={result} />
                 {result && <TradeTable result={result} />}
               </div>

@@ -16,6 +16,8 @@ def _write_factor_lab_artifacts(report_dir, run_id="run_a", config_hash="cfg_a")
     (report_dir / "latest_manifest.json").write_text(
         json.dumps(
             {
+                "evaluation_version": "causal-wf-v2",
+                "trained_through": "2026-04-19",
                 "run_id": run_id,
                 "config_hash": config_hash,
                 "generated_at": "2026-04-29T10:00:00",
@@ -34,6 +36,7 @@ def _write_factor_lab_artifacts(report_dir, run_id="run_a", config_hash="cfg_a")
                 "run_id": run_id,
                 "config_hash": config_hash,
                 "is_oos_score": True,
+                "recipe_as_of": "2026-04-19",
             },
             {
                 "date": "2026-04-20",
@@ -42,6 +45,7 @@ def _write_factor_lab_artifacts(report_dir, run_id="run_a", config_hash="cfg_a")
                 "run_id": run_id,
                 "config_hash": config_hash,
                 "is_oos_score": True,
+                "recipe_as_of": "2026-04-19",
             },
         ]
     ).to_csv(report_dir / "latest_scores.csv", index=False)
@@ -296,6 +300,7 @@ def test_resolved_strategy_version_uses_pinned_artifact(tmp_path):
                 "run_id": "different",
                 "config_hash": "different",
                 "is_oos_score": True,
+                "recipe_as_of": "2026-04-19",
             }
         ]
     ).to_csv(latest_scores, index=False)

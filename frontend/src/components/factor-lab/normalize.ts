@@ -1,3 +1,4 @@
+import { marketDate } from '../../api/marketDate';
 /**
  * Factor Lab /results /run 响应主体的运行时收敛。
  * 字段表驱动 (见 parse.ts)；生命周期/压测相关见 normalizeLifecycle.ts。
@@ -43,7 +44,7 @@ import {
 /** 可选回看区间下界(本地数据湖起始年份) */
 export const DEFAULT_START_DATE = '2022-01-01';
 /** 可选回看区间上界(今天) */
-export const DEFAULT_END_DATE = new Date().toISOString().slice(0, 10);
+export const DEFAULT_END_DATE = marketDate();
 
 export const DEFAULT_FACTOR_LAB_RUN_CONFIG: FactorLabRunConfig = {
   start_date: DEFAULT_START_DATE,
@@ -445,7 +446,7 @@ function normalizeSummary(source: Record<string, unknown>, fallback: FactorLabRu
       : fallback.max_symbols,
     total_symbols: totalSymbolsRaw !== undefined ? toNum(totalSymbolsRaw) : undefined,
     train_samples: trainRaw !== undefined ? toNum(trainRaw) : undefined,
-    ...parseFields<Pick<FactorLabSummary, 'rows_raw' | 'rows_sample' | 'feature_count' | 'best_factor' | 'best_model_test_rank_ic' | 'best_model_test_top20_ret' | 'universe' | 'sample_source_note' | 'research_note' | 'run_difference_note' | 'run_difference_reasons' | 'score_source'>>(source, {
+    ...parseFields<Pick<FactorLabSummary, 'rows_raw' | 'rows_sample' | 'feature_count' | 'best_factor' | 'best_model_test_rank_ic' | 'best_model_test_top20_ret' | 'universe' | 'sample_source_note' | 'research_note' | 'run_difference_note' | 'run_difference_reasons' | 'score_source' | 'price_mode'>>(source, {
       rows_raw: 'num?',
       rows_sample: 'num?',
       feature_count: 'num?',
@@ -455,6 +456,7 @@ function normalizeSummary(source: Record<string, unknown>, fallback: FactorLabRu
       universe: 'str',
       sample_source_note: 'str',
       research_note: 'str',
+      price_mode: 'str',
       run_difference_note: 'str',
       run_difference_reasons: 'str[]',
       score_source: 'str?',

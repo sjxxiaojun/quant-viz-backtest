@@ -340,6 +340,17 @@ class DataManager:
             return self.etf_cache_dir / f"{symbol}_full_history.parquet"
         return self.cache_dir / f"{symbol}_full_history.parquet"
 
+    def _read_cache_path(self, symbol):
+        """Quarantined historical bars can be read, but writes retain the canonical path."""
+        path = self.get_cache_path(symbol)
+        if path.exists() or self.is_etf_symbol(self._normalize_symbol(symbol)):
+            return path
+        for directory in sorted(self.cache_dir.glob("_removed*")):
+            archived = directory / path.name
+            if archived.exists():
+                return archived
+        return path
+
     def get_stock_name(self, symbol) -> str:
         symbol = self._normalize_symbol(symbol)
         if symbol in PRETTY_NAMES:
@@ -771,7 +782,7 @@ class DataManager:
         """
         if self.api_url:
             return self._read_remote_cached_frame(symbol)
-        cache_path = self.get_cache_path(symbol)
+        cache_path = self._read_cache_path(symbol)
         if not cache_path.exists():
             return pd.DataFrame()
         try:
@@ -835,7 +846,7 @@ class DataManager:
                 logger.debug(f"[{symbol}] Remote window read failed: {e}")
             return None, None
 
-        cache_path = self.get_cache_path(symbol)
+        cache_path = self._read_cache_path(symbol)
         if not cache_path.exists():
             return None, None
         cache_key = str(cache_path)
@@ -1707,7 +1718,7 @@ class DataManager:
 
     def _read_latest_cached_row(self, symbol):
         symbol = self._normalize_symbol(symbol)
-        cache_path = self.get_cache_path(symbol)
+        cache_path = self._read_cache_path(symbol)
         if not cache_path.exists():
             return None
 
@@ -2044,17 +2055,8 @@ class DataManager:
         """
         获取当前日期之前的最新交易日 (A股)。
         """
-        now = datetime.now()
-        # 如果是交易日且已经过 16:00，则最新交易日就是今天
-        if now.weekday() < 5:
-             if now.hour >= 16:
-                 return now.strftime("%Y-%m-%d")
-        
-        # 否则寻找最近的一个周五或周一至周五
-        curr = now - timedelta(days=1)
-        while curr.weekday() >= 5: # 5=Sat, 6=Sun
-            curr -= timedelta(days=1)
-        return curr.strftime("%Y-%m-%d")
+        from research_contracts import TradingCalendar
+        return TradingCalendar().latest_completed()
 
     def check_data_integrity(self, symbols: list[str], target_date: str) -> tuple[bool, str]:
         """

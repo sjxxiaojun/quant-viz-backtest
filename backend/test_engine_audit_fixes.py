@@ -114,10 +114,13 @@ class TestTransferFee:
         assert buy["transfer_fee"] == pytest.approx(1.0)
         assert sell["transfer_fee"] == pytest.approx(1.0)
 
-    def test_non_sh_stock_pays_no_transfer_fee(self):
-        cm = CostModel(commission_rate=0.0, commission_min=0.0, slippage_rate=0.0, stamp_tax_rate=0.0)
-        for code in ("000001", "300750", "430047", None):
+    def test_all_a_share_markets_pay_transfer_fee(self):
+        cm = CostModel()
+        for code in ("000001", "300750", "830799"):
+            assert cm.calculate_cost_breakdown(100000.0, True, stock_code=code)["transfer_fee"] == 1.0
+        for code in ("510300", "159915", "110000"):
             assert cm.calculate_cost_breakdown(100000.0, True, stock_code=code)["transfer_fee"] == 0.0
+
 
     def test_engine_records_transfer_fee_in_cost_stats(self):
         cm = CostModel(commission_rate=0.0, commission_min=0.0, slippage_rate=0.0,

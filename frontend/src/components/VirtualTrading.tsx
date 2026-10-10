@@ -32,6 +32,7 @@ const FLOW_PAGE_SIZE = 50;
 const TICKER_SIZE = 8;
 
 export function VirtualTrading() {
+  const [accountVersion, setAccountVersion] = useState<'legacy' | 'v2'>(() => localStorage.getItem('momo:account-version') === 'legacy' ? 'legacy' : 'v2');
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [tickerTrades, setTickerTrades] = useState<VirtualTrade[]>([]);
   const [flowTrades, setFlowTrades] = useState<VirtualTrade[]>([]);
@@ -245,6 +246,10 @@ export function VirtualTrading() {
 
   return (
     <div className="space-y-3 pb-12">
+      <Panel><label>账户口径 <select aria-label="账户口径" className="ml-3 bg-slate-900 p-2" value={accountVersion} onChange={e => {
+        const version = e.target.value as 'legacy' | 'v2'; localStorage.setItem('momo:account-version', version); setAccountVersion(version); setSelectedStrategy(null); void fetchData();
+      }}><option value="v2">新版日线账户</option><option value="legacy">旧账（保留历史）</option></select></label>
+      <p className="mt-2 text-xs text-amber-300">{accountVersion === 'legacy' ? '旧账保持原成本和撮合口径；执行按钮只更新新版账户。' : '数据完整后才创建或推进账户；首次创建为100万元现金，不重算旧账。'}</p></Panel>
       <TradeTicker trades={tickerTrades} />
 
       {error && (
@@ -304,7 +309,9 @@ export function VirtualTrading() {
             <button
               key={key}
               type="button"
-              onClick={() => setActiveSection(key)}
+              onClick={() =>
+
+ setActiveSection(key)}
               aria-current={active ? 'page' : undefined}
               className={cn(
                 'flex flex-1 items-center justify-between gap-2 rounded-ctl px-3 py-2 text-left transition-colors',

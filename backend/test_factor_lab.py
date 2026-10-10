@@ -85,7 +85,7 @@ def test_ml_factor_strategies_registered():
 
 def test_run_factor_lab_emits_walk_forward_summary(tmp_path):
     rows = []
-    dates = pd.bdate_range("2024-01-01", periods=120)
+    dates = pd.bdate_range("2024-01-01", periods=220)
     for stock_idx, code in enumerate(["000001", "000002", "000003", "000004", "000005", "000006"]):
         price = 10.0 + stock_idx
         for idx, dt in enumerate(dates):
@@ -209,7 +209,7 @@ def test_latest_model_requires_matching_manifest(tmp_path, monkeypatch):
 
 def test_walk_forward_predictions_cap_retrain_windows(monkeypatch):
     rows = []
-    dates = pd.bdate_range("2024-01-01", periods=130)
+    dates = pd.bdate_range("2024-01-01", periods=240)
     features = ["f%d" % idx for idx in range(5)]
     for date_idx, dt in enumerate(dates):
         for stock_idx in range(6):
@@ -227,6 +227,10 @@ def test_walk_forward_predictions_cap_retrain_windows(monkeypatch):
     fit_calls = {"count": 0}
 
     class DummyModel:
+        def __init__(self):
+            from types import SimpleNamespace
+            self.named_steps = {"model": SimpleNamespace(feature_importances_=np.ones(5), coef_=np.ones(5))}
+
         def fit(self, x, y):
             fit_calls["count"] += 1
             return self
@@ -248,7 +252,7 @@ def test_walk_forward_predictions_cap_retrain_windows(monkeypatch):
         features,
         random_state=7,
         max_windows=3,
-        max_train_rows=200,
+        max_train_rows=1000,
         rf_n_estimators=8,
     )
 

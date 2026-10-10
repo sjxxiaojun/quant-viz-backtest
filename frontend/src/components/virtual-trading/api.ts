@@ -254,9 +254,10 @@ export function normalizeAutomationStatus(item: unknown): AutomationStatus {
 }
 
 /* ============================ 请求 ============================ */
+export function accountVersion(): 'legacy' | 'v2' { return localStorage.getItem('momo:account-version') === 'legacy' ? 'legacy' : 'v2'; }
 
 export async function fetchAccounts(signal?: AbortSignal): Promise<Account[]> {
-  const data = await apiGet<unknown>('/api/virtual-trade/accounts', { timeout: 10000, signal });
+  const data = await apiGet<unknown>(`/api/virtual-trade/accounts?version=${accountVersion()}`, { timeout: 10000, signal });
   return assertArray(data, normalizeAccount, '账户数据');
 }
 
@@ -266,7 +267,7 @@ export async function fetchTradeHistory(
   signal?: AbortSignal,
 ): Promise<VirtualTrade[]> {
   const data = await apiGet<unknown>(
-    `/api/virtual-trade/history?limit=${limit}&offset=${offset}`,
+    `/api/virtual-trade/history?limit=${limit}&offset=${offset}&version=${accountVersion()}`,
     { timeout: 10000, signal },
   );
   return assertArray(data, normalizeTrade, '交易流水');
@@ -282,7 +283,7 @@ export async function fetchEquityHistory(
   signal?: AbortSignal,
 ): Promise<EquityPoint[]> {
   const data = await apiGet<unknown>(
-    `/api/virtual-trade/equity-history?strategy_id=${encodeURIComponent(strategyId)}`,
+    `/api/virtual-trade/equity-history?strategy_id=${encodeURIComponent(strategyId)}&version=${accountVersion()}`,
     { timeout: 10000, signal },
   );
   return assertArray(data, normalizeEquityPoint, '净值曲线');
@@ -293,7 +294,7 @@ export async function fetchPerformanceStats(
   signal?: AbortSignal,
 ): Promise<PerformanceStats> {
   const data = await apiGet<unknown>(
-    `/api/virtual-trade/stats?strategy_id=${encodeURIComponent(strategyId)}`,
+    `/api/virtual-trade/stats?strategy_id=${encodeURIComponent(strategyId)}&version=${accountVersion()}`,
     { timeout: 10000, signal },
   );
   return normalizeStats(data);

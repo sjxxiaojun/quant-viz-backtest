@@ -113,3 +113,9 @@ npm run dev
 - **多级缓存架构**: 内存 LRU 缓存 + 磁盘 Parquet + API 数据流，确保回测在毫秒级完成，杜绝冗余的网络请求风暴。
 
 *Automated Quantitative Backtesting & Visualization Platform.*
+
+## Daily research v2 (2026-10-11)
+
+默认使用严格未复权成交数据、开始前冻结的历史样本和因果滚动评估。旧模拟账户保留，新账户使用独立账本。完整任务历史、取消/恢复、数据诊断、成交分页和导出已接入“数据与任务”。策略数量以实际 API 目录为准。
+
+详见 [v2 行为、接口、验证与迁移说明](docs/reliable-research-v2.md)。免费数据源不可达或缺少公司行动时，严格模式明确报错；近似研究模式需显式开启。

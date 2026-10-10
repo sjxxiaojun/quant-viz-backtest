@@ -8,6 +8,21 @@ import main
 
 client = TestClient(main.app)
 
+@pytest.fixture(autouse=True)
+def deterministic_queue(monkeypatch):
+    # API contract tests inject a synchronous executor; process isolation is tested separately.
+    def submit(kind, payload):
+        job_id = main.job_store.create(kind, payload)
+        main.job_store.update(job_id, status="running")
+        if kind == "backtest":
+            value = main.execute_backtest(main.BacktestRequest(**payload))
+        else:
+            value = main.execute_compare_request(main.CompareRequest(**payload))
+        main.job_store.update(job_id, status="succeeded", result=value)
+        return job_id
+    monkeypatch.setattr(main.job_queue, "submit", submit)
+
+
 
 def _min_req():
     return {
@@ -87,11 +102,7 @@ def test_backtest_job_status_404_when_missing():
 
 
 def test_backtest_job_result_returns_425_when_running(monkeypatch):
-    def fake_runner(_job_id: str):
-        # keep running state; do not complete
-        return None
-
-    monkeypatch.setattr(main, "_run_backtest_job", fake_runner)
+    monkeypatch.setattr(main.job_queue, "submit", lambda kind, payload: main.job_store.create(kind, payload))
 
     resp = client.post("/api/backtest/jobs", json=_min_req())
     job_id = resp.json()["job_id"]

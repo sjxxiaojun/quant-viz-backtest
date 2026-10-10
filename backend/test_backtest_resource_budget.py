@@ -20,15 +20,11 @@ def test_backtest_all_pool_prescreens_to_default_limit(monkeypatch):
 
     calls = {}
 
-    def select_symbols(limit, min_end_date=None, min_start_date=None, allow_late_start=False):
+    def select_symbols(manager, limit, as_of):
         calls["limit"] = limit
-        calls["min_end_date"] = min_end_date
-        calls["min_start_date"] = min_start_date
-        calls["allow_late_start"] = allow_late_start
-        return _symbols(limit)
-
-    monkeypatch.setattr(main.data_manager, "select_local_a_share_symbols", select_symbols)
-    monkeypatch.setattr(main.data_manager, "get_last_symbol_selection_metadata", lambda: {})
+        calls["as_of"] = as_of
+        return _symbols(limit), {}
+    monkeypatch.setattr(main, "historical_universe", select_symbols)
 
     req = main.BacktestRequest(
         start_date="2024-01-01",
@@ -42,12 +38,10 @@ def test_backtest_all_pool_prescreens_to_default_limit(monkeypatch):
 
     assert len(symbols) == main.BACKTEST_MAX_SYMBOLS
     assert calls["limit"] == main.BACKTEST_MAX_SYMBOLS
-    assert calls["min_end_date"] == "2024-12-31"
-    assert calls["min_start_date"] == warmup_start
-    assert calls["allow_late_start"] is True
+    assert calls["as_of"] == "2023-12-31"
     assert pool_ctx["symbols_before_budget"] == 5021
     assert pool_ctx["symbols_count"] == main.BACKTEST_MAX_SYMBOLS
-    assert pool_ctx["selection_method"] == "full_market_backtest_prescreen_v2"
+    assert pool_ctx["selection_method"] == "historical_liquidity_v2"
     assert pool_ctx["budget_truncated"] is True
 
 
@@ -57,7 +51,7 @@ def test_backtest_all_pool_respects_requested_max_symbols(monkeypatch):
         "list_local_codes",
         lambda asset_type="a_share": _symbols(5021) if asset_type == "a_share" else [],
     )
-    monkeypatch.setattr(main.data_manager, "select_local_a_share_symbols", lambda limit, **kwargs: _symbols(limit))
+    monkeypatch.setattr(main, "historical_universe", lambda manager, limit, as_of: (_symbols(limit), {}))
     monkeypatch.setattr(main.data_manager, "get_last_symbol_selection_metadata", lambda: {})
 
     req = main.BacktestRequest(
@@ -133,7 +127,7 @@ def test_compare_all_pool_uses_prescreened_budget(monkeypatch):
         "list_local_codes",
         lambda asset_type="a_share": _symbols(5021) if asset_type == "a_share" else [],
     )
-    monkeypatch.setattr(main.data_manager, "select_local_a_share_symbols", lambda limit, **kwargs: _symbols(limit))
+    monkeypatch.setattr(main, "historical_universe", lambda manager, limit, as_of: (_symbols(limit), {}))
     monkeypatch.setattr(main.data_manager, "get_last_symbol_selection_metadata", lambda: {})
 
     def fake_execute(req, *args, **kwargs):

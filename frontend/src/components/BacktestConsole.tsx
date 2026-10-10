@@ -1,3 +1,4 @@
+import { marketDate } from '../api/marketDate';
 import React, { useEffect, useMemo } from 'react';
 import { Loader2, Lock, Play } from 'lucide-react';
 import { cn } from '../utils';
@@ -17,7 +18,7 @@ interface BacktestConsoleProps {
 }
 
 const DATE_MIN = '2022-01-01';
-const TODAY = new Date().toISOString().slice(0, 10);
+const TODAY = marketDate();
 
 const DATE_PRESETS = [
   { label: '近1年', months: 12 },
@@ -30,11 +31,11 @@ const CAPITAL_PRESETS = [500000, 1000000, 2000000, 5000000];
 
 function getPresetDates(months: number): { start: string; end: string } {
   const today = new Date();
-  const end = today.toISOString().slice(0, 10);
+  const end = marketDate(today);
   if (months === 0) return { start: DATE_MIN, end };
   const startDate = new Date(today);
   startDate.setMonth(startDate.getMonth() - months);
-  const startStr = startDate.toISOString().slice(0, 10);
+  const startStr = marketDate(startDate);
   return { start: startStr < DATE_MIN ? DATE_MIN : startStr, end };
 }
 
@@ -340,6 +341,10 @@ export function BacktestConsole({ config, setConfig, onRun, onSwitchStrategy, lo
         </div>
       </details>
 
+      <details className="rounded-xl border border-slate-700 p-3 text-xs"><summary>高级成交假设</summary>
+        <label className="mt-3 block"><input type="checkbox" checked={config.price_mode === 'approximate_adjusted'} onChange={e => setConfig({ ...config, price_mode: e.target.checked ? 'approximate_adjusted' : 'strict_raw' })} /> 允许复权价近似研究（默认使用真实成交价）</label>
+        <label className="mt-3 block"><input type="checkbox" checked={config.same_close_approximation ?? false} onChange={e => setConfig({ ...config, same_close_approximation: e.target.checked })} /> 尾盘信号按同日收盘近似成交（不用于新版模拟盘）</label>
+      </details>
       {dateRangeInvalid && (
         <div className="rounded-ctl border border-up/30 bg-up/10 px-3 py-2 text-[11px] font-medium text-up-soft">
           起始日期不能晚于结束日期。

@@ -206,6 +206,8 @@ export function DailyReport() {
 
   return (
     <div className="space-y-3">
+      <div className="rounded-xl border border-amber-900/50 p-3 text-sm text-amber-200">日报为指定日期的历史报告，请核对报告日期和行情截至日；盘中快照不代表当日完整收盘数据。</div>
+
       {error && (
         <div className="rounded-panel border border-up/30 bg-up/10 px-4 py-2.5 text-xs text-up-soft">
           {error}

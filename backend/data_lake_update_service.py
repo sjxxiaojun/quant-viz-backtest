@@ -86,20 +86,14 @@ class DataLakeUpdateService:
         }
 
     def is_trade_day(self, day: Optional[datetime] = None) -> bool:
-        day = day or datetime.now()
-        if day.weekday() >= 5:
-            return False
+        from research_contracts import TradingCalendar, market_now
+        day = day or market_now()
         try:
-            prev = day - timedelta(days=7)
-            calendar = self.data_manager._market_trading_calendar(
-                pd.Timestamp(prev.date()),
-                pd.Timestamp(day.date()),
-            )
-            if len(calendar) > 0:
-                return pd.Timestamp(day.date()).normalize() in {d.normalize() for d in calendar}
+            date = day.date().isoformat()
+            return date in TradingCalendar().dates(date, date)
         except Exception:
-            pass
-        return True
+            logger.warning("无法验证交易日历，暂停自动任务。")
+            return False
 
     def _asset_freshness(self, asset_type: str, target_date: str, max_scan: int) -> Dict[str, object]:
         symbols = self.data_manager.list_local_codes(asset_type)

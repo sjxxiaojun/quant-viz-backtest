@@ -69,7 +69,7 @@ export async function pollJobResult<T = unknown>(
       if (signal.aborted) return null;
       return apiGet<T>(resultPath, { timeout: 30000, signal });
     }
-    if (status.status === 'failed') {
+    if (['failed', 'canceled', 'interrupted'].includes(status.status)) {
       throw new Error(status.error || failureMessage);
     }
     if (Date.now() - start > timeoutMs) {

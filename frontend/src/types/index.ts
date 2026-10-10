@@ -1,3 +1,6 @@
+import type { ApiSchemas } from '../api/schema.generated';
+type GeneratedBacktestRequest = ApiSchemas['BacktestRequest'];
+
 export interface Trade {
   date: string;
   stock_code: string;
@@ -34,6 +37,16 @@ export interface BenchmarkHistoryData {
 }
 
 export interface BacktestResult {
+  engine_version?: string;
+  data_snapshot_id?: string;
+  data_as_of?: string;
+  signal_as_of?: string;
+  strategy_version?: string;
+  quality_notes?: string[];
+  request?: Record<string, unknown>;
+  trades_total?: number;
+  trades_truncated?: boolean;
+  strategy_behavior?: { execution_mode?: string; effective_cost_model?: Record<string, unknown> };
   total_return: number;
   history: HistoryData[];
   benchmark_history?: BenchmarkHistoryData[];
@@ -90,7 +103,11 @@ export interface BacktestResult {
   };
 }
 
-export interface BacktestConfig {
+export interface BacktestConfig extends GeneratedBacktestRequest {
+  price_mode?: "strict_raw" | "approximate_adjusted";
+  same_close_approximation?: boolean;
+  commission_min?: number;
+  stamp_tax_rate?: number;
   start_date: string;
   end_date: string;
   initial_capital: number;
@@ -110,6 +127,7 @@ export interface BacktestConfig {
 export type FactorLabPool = 'core' | 'blackhorse' | 'all';
 
 export interface FactorLabRunConfig {
+  price_mode?: "strict_raw" | "approximate_adjusted";
   start_date: string;
   end_date: string;
   pool: FactorLabPool;
@@ -220,6 +238,7 @@ export interface FactorLabExternalIdea {
 }
 
 export interface FactorLabSummary {
+  price_mode?: string;
   run_id?: string;
   start_date: string;
   end_date: string;
