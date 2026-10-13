@@ -22,6 +22,8 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: uv sync --locked --python 3.12
         working-directory: backend
+      - run: uv run --locked python scripts/check_repository_privacy.py
+        working-directory: backend
       - run: uv run --locked pytest -q
         working-directory: backend
       - run: npm ci

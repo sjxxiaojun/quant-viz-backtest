@@ -37,7 +37,7 @@ Pages use #console?job=<id>, #compare?job=<id>, #factorLab?job=<id> and #tasks. 
 - New cases exercise future-liquidity/label perturbations, raw-vs-adjusted separation, shared ledger equality, T+0/T+1, corporate actions, restart/cancellation, two real subprocess slots, 600-trade pagination/export, official calendar holidays, daily account catch-up and missing-day stop.
 - Frozen real cache: 000001 turtle, 2023-06-01..2024-12-31, 39 fills in approximate_adjusted mode. Baseline final value 1,090,823.95; v2 1,090,304.02; difference -519.93. Added Shenzhen transfer fees plus cash/lot rounding explain the change. This is an accounting comparison, not strict raw-price performance validation.
 - Strict 518880 online-price verification was blocked by the Eastmoney connection/proxy failure. No adjusted prices were substituted. Restoring current-market operation requires reachable free data providers and complete raw/action/calendar coverage; old caches were not presented as current data.
-- Original 14 account records and 412 trade records match the backup. No live-broker connection is introduced.
+- Original account and trade records match the backup. No live-broker connection is introduced.
 
 Provider field reference: https://github.com/zxygithub/baostock/blob/master/docs/pythonAPI.md (query_dividend_data). 159915 effective limit reference: https://docs.static.szse.cn/www/aboutus/trends/conference/W020200821767425488573.pdf. ETF settlement reference: https://www.sse.com.cn/assortment/fund/etf/question/c/c_20240118_5734755.shtml.
 

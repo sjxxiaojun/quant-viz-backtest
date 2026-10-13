@@ -4,7 +4,7 @@
 
 ## 启动
 
-后端使用 **Python 3.12**，旧 `backend/venv` 不会被覆盖。
+后端使用 **Python 3.12**，使用独立的 `backend/.venv` 环境。
 
 ```bash
 cd backend

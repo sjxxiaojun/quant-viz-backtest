@@ -74,3 +74,8 @@ backend/runtime/
 
 # Names/defaults only; local credentials remain ignored.
 !backend/.env.example
+
+# Per-session planning and one-off scratch scripts
+docs/_session/
+backend/scratch/
+*.bundle
