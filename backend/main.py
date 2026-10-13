@@ -1,3 +1,9 @@
+import sys
+if sys.version_info < (3, 12):
+    raise SystemExit("Python 3.12 required: cd backend && uv sync --locked --python 3.12; use .venv/bin/python")
+
+from api_models import (BacktestRequest, BacktestJobSubmitResponse, BacktestJobStatusResponse, CompareRequest, FactorLabRunRequest, FactorLabBacktestRequest, FactorLabStressTestRequest, FactorLabPromoteRequest, FactorLabArtifactCleanupRequest, StrategyVersionActionRequest, StrategyVersionIterateRequest, StrategyActivateVersionRequest, StrategyRollbackRequest, AutomationSnapshotRequest, AutomationEodUpdateRequest, AIDecisionAction, AIDecisionRequest, AutomationAICycleRequest, AutomationAIManagedWorkRequest)
+from api_auth import PROXY_FORWARDING_HEADERS, _trusted_local_hosts, _detected_proxy_headers, _is_trusted_local_request, _require_local_request, _has_valid_quant_api_key, _require_automation_request, describe_api_auth_state, log_api_auth_state
 import copy
 import dataclasses
 import inspect
@@ -68,55 +74,10 @@ async def _app_lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=_app_lifespan)
 
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
-        "QUANT_API_ALLOWED_ORIGINS",
-        "http://localhost:5173,http://127.0.0.1:5173",
-    ).split(",")
-    if origin.strip()
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-BACKEND_LOG_PATH = Path(os.getenv("QUANT_BACKEND_LOG", str(BACKEND_DIR / "backend.log")))
-BACKEND_LOG_MAX_BYTES = 10 * 1024 * 1024
-BACKEND_LOG_BACKUP_COUNT = 3
-
-
-def _configure_logging() -> None:
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    # 其他模块可能在导入期调用过 basicConfig；仅在缺失时补齐控制台输出，避免重复 handler。
-    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root.handlers):
-        console = logging.StreamHandler()
-        console.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-        root.addHandler(console)
-    already_rotating = any(
-        isinstance(h, RotatingFileHandler) and Path(getattr(h, "baseFilename", "")) == BACKEND_LOG_PATH
-        for h in root.handlers
-    )
-    if not already_rotating:
-        try:
-            file_handler = RotatingFileHandler(
-                BACKEND_LOG_PATH,
-                maxBytes=BACKEND_LOG_MAX_BYTES,
-                backupCount=BACKEND_LOG_BACKUP_COUNT,
-                encoding="utf-8",
-            )
-            file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-            root.addHandler(file_handler)
-        except OSError as exc:
-            logging.getLogger("momoQuantAPI").warning(f"backend.log 轮转文件句柄初始化失败: {exc}")
-
-
+from app_runtime import configure_cors, _configure_logging
+configure_cors(app)
 _configure_logging()
+
 logger = logging.getLogger("momoQuantAPI")
 
 data_manager = DataManager()
@@ -480,199 +441,61 @@ def resolve_close_slippage_rate(req: Any) -> float:
     return DEFAULT_CLOSE_SLIPPAGE_RATE
 
 
-class BacktestRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    start_date: str
-    end_date: str
-    initial_capital: float = Field(gt=0, le=1_000_000_000)
-    stocks: Optional[List[str]] = None
-    max_symbols: Optional[int] = Field(default=None, ge=1, le=BACKTEST_MAX_SYMBOLS)
-    factor: str = "bottom_fishing"
-    pool: str = "auto"
-
-    max_positions: int = Field(default=5, ge=1, le=50)
-    weight_mode: str = "equal"
-    max_hold_days: Optional[int] = Field(default=None, ge=1, le=260)
-
-    stop_loss: float = Field(default=-0.08, gt=-1.0, lt=0.0)
-    take_profit: Optional[float] = Field(default=None, gt=0.0, le=10.0)
-    circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
-    commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
-    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
-    slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    # 收盘（尾盘）成交滑点。None = 不指定，沿用引擎默认 0.0015（既有回测结果不变）；
-    # 显式传值时直接生效，解析规则见 resolve_close_slippage_rate()。
-    close_slippage_rate: Optional[float] = Field(default=None, ge=0.0, le=0.1)
-    commission_min: float = Field(default=5.0, ge=0.0, le=1000.0)
-    allow_mock: bool = False
-    price_mode: Literal["strict_raw", "approximate_adjusted"] = "strict_raw"
-    same_close_approximation: bool = False
 
 
-class BacktestJobSubmitResponse(BaseModel):
-    job_id: str
 
 
-class BacktestJobStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    created_at: float
-    updated_at: float
-    error: Optional[str] = None
-    stage: Optional[str] = None
 
 
-class CompareRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    price_mode: Literal["strict_raw", "approximate_adjusted"] = "strict_raw"
-    same_close_approximation: bool = False
-    strategies: List[str]
-    start_date: str
-    end_date: str
-    initial_capital: float = Field(gt=0, le=1_000_000_000)
-    stocks: Optional[List[str]] = None
-    max_symbols: Optional[int] = Field(default=None, ge=1, le=BACKTEST_MAX_SYMBOLS)
-    pool: str = "auto"
-    max_positions: int = Field(default=5, ge=1, le=50)
-    weight_mode: str = "equal"
-    max_hold_days: Optional[int] = Field(default=None, ge=1, le=260)
-    stop_loss: float = Field(default=-0.08, gt=-1.0, lt=0.0)
-    take_profit: Optional[float] = Field(default=None, gt=0.0, le=10.0)
-    circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
-    commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
-    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
-    slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    # 与 BacktestRequest 同义：None = 沿用引擎默认收盘滑点。
-    close_slippage_rate: Optional[float] = Field(default=None, ge=0.0, le=0.1)
-    commission_min: float = Field(default=5.0, ge=0.0, le=1000.0)
-    allow_mock: bool = False
 
 
-class FactorLabRunRequest(BaseModel):
-    price_mode: Literal["strict_raw", "approximate_adjusted"] = "strict_raw"
-    model_config = ConfigDict(extra="forbid")
-    start_date: str
-    end_date: str
-    pool: str = "core"
-    label: str = "next_5d_ret"
-    top_n: int = Field(default=5, ge=1, le=50)
-    max_symbols: Optional[int] = Field(default=None, ge=1, le=FACTOR_LAB_MAX_SYMBOLS)
-    initial_capital: float = Field(default=1000000.0, gt=0, le=1_000_000_000)
-    stop_loss: float = Field(default=-0.08, gt=-1.0, lt=0.0)
-    circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
-    commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
-    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
-    slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    # 与 BacktestRequest 同义：None = 沿用引擎默认收盘滑点。
-    close_slippage_rate: Optional[float] = Field(default=None, ge=0.0, le=0.1)
-    commission_min: float = Field(default=5.0, ge=0.0, le=1000.0)
 
 
-class FactorLabBacktestRequest(BacktestRequest):
-    factor: str = "ml_factor_ranker"
-    label: str = "next_5d_ret"
-    top_n: int = Field(default=5, ge=1, le=50)
 
 
-class FactorLabStressTestRequest(BaseModel):
-    pool: str = "core"
-    max_symbols: int = Field(default=300, ge=3, le=FACTOR_LAB_MAX_SYMBOLS)
-    top_n: int = Field(default=5, ge=1, le=50)
-    initial_capital: float = Field(default=1000000.0, gt=0, le=1_000_000_000)
-    factors: List[str] = Field(default_factory=lambda: ["ml_factor_ranker"])
-    horizon_days: int = Field(default=252, ge=20, le=260)
-    paths_per_scenario: int = Field(default=2, ge=1, le=200)
-    seed: int = 42
-    scenarios: List[str] = Field(default_factory=lambda: ["bull", "bear", "sideways"])
-    anchor_date: Optional[str] = None
-    lookback_days: int = Field(default=260, ge=90, le=520)
-    commission_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    # 证券交易印花税自 2023-08-28 起由 0.1% 降至 0.05%（卖出单边），历史分段费率由引擎层按成交日期处理。
-    stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.1)
-    slippage_rate: float = Field(default=0.0003, ge=0.0, le=0.1)
-    stop_loss: float = Field(default=-0.08, gt=-1.0, lt=0.0)
-    circuit_breaker: float = Field(default=-0.15, gt=-1.0, lt=0.0)
 
 
-class FactorLabPromoteRequest(BaseModel):
-    strategy_id: str = "ai_ml"
-    candidate_factor: str = "ml_factor_ranker"
-    created_by: str = "local_user"
-    note: str = ""
 
 
-class FactorLabArtifactCleanupRequest(BaseModel):
-    keep_recent_runs: int = Field(default=FACTOR_LAB_KEEP_RECENT_RUNS, ge=1, le=50)
-    dry_run: bool = False
-    delete_training_sample: bool = False
 
 
-class StrategyVersionActionRequest(BaseModel):
-    user: str = "local_user"
-    note: str = ""
 
 
-class StrategyVersionIterateRequest(BaseModel):
-    user: str = "local_user"
-    note: str = ""
 
 
-class StrategyActivateVersionRequest(BaseModel):
-    version_id: str
-    user: str = "local_user"
-    note: str = ""
 
 
-class StrategyRollbackRequest(BaseModel):
-    user: str = "local_user"
-    reason: str = ""
 
 
-class AutomationSnapshotRequest(BaseModel):
-    limit: int = Field(default=6000, ge=1, le=8000)
 
 
-class AutomationEodUpdateRequest(BaseModel):
-    target_date: Optional[str] = None
-    dry_run: bool = False
-    buffer_days: int = Field(default=7, ge=1, le=60)
-    workers_a_share: int = Field(default=6, ge=1, le=16)
-    workers_etf: int = Field(default=4, ge=1, le=12)
-    retry: int = Field(default=3, ge=1, le=5)
-    task_timeout: int = Field(default=90, ge=10, le=600)
-    limit_a_share: int = Field(default=0, ge=0, le=10000)
-    limit_etf: int = Field(default=0, ge=0, le=2000)
-    skip_a_share: bool = False
-    skip_etf: bool = False
 
 
-class AIDecisionAction(BaseModel):
-    type: str
-    params: Dict[str, object] = Field(default_factory=dict)
 
 
-class AIDecisionRequest(BaseModel):
-    decision_id: Optional[str] = None
-    actor: str = "external_ai"
-    source: str = "external_ai"
-    summary: str = ""
-    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    actions: List[AIDecisionAction] = Field(default_factory=list)
-    dry_run: bool = False
 
 
-class AutomationAICycleRequest(BaseModel):
-    decision: Optional[AIDecisionRequest] = None
-    dry_run: bool = False
 
 
-class AutomationAIManagedWorkRequest(BaseModel):
-    work_type: str = "simulation_supervision"
-    decision: Optional[AIDecisionRequest] = None
-    dry_run: bool = False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _configure_ai_handlers() -> None:
@@ -1618,6 +1441,8 @@ def validate_factor_lab_backtest_artifacts(req: FactorLabBacktestRequest) -> Non
         label=req.label,
         top_n=req.top_n,
         max_symbols=req.max_symbols,
+        price_mode=req.price_mode,
+        enable_hist_gradient_boosting=req.enable_hist_gradient_boosting,
     )
     expected_hash = _config_hash(expected_config)
     if str(manifest.get("config_hash") or "") != expected_hash:
@@ -2015,187 +1840,24 @@ def make_zero_cost_model() -> CostModel:
     return model
 
 
-def execute_backtest(
-    req: BacktestRequest,
-    override_cost_model: Optional[CostModel] = None,
-    allow_mock: bool = False,
-    semaphore: Optional[threading.BoundedSemaphore] = None,
-) -> Dict:
-    if strategy_version_store.resolve_strategy_spec(req.factor) is None:
-        raise HTTPException(status_code=422, detail=f"未知策略：{req.factor}")
-    if req.weight_mode not in {"equal", "score"}:
-        raise HTTPException(status_code=422, detail="weight_mode 仅支持 equal/score")
-    report_stage("选择历史股票池")
-    current_pool, pool_ctx, warmup_start = prepare_backtest_universe(req)
-    # 默认使用普通回测并发预算；Factor Lab 等内部编排传入自己的信号量，与用户回测互不抢占。
-    slot = semaphore if semaphore is not None else BACKTEST_SEMAPHORE
-    if not slot.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail="当前已有回测任务运行中，请稍后再试。")
+def execute_backtest(req, override_cost_model=None, allow_mock=False, semaphore=None, *, prepared=None):
+    from backtest_service import BacktestContext, execute_backtest as compute
+    context = BacktestContext(strategy_version_store, prepare_backtest_universe, data_manager,
+        execution_data_service, BACKTEST_SEMAPHORE, BACKTEST_MAX_ROWS, BacktestEngine,
+        PositionManager, resolve_close_slippage_rate)
+    return compute(req, override_cost_model, allow_mock, semaphore, context=context, prepared=prepared)
 
-    try:
-        df, data_sources = data_manager.get_stock_pool_data(
-            current_pool,
-            warmup_start,
-            req.end_date,
-            allow_mock=allow_mock,
-            allow_late_start=bool(pool_ctx.get("allow_late_start")),
-        )
-    except (DataFetchError, PoolDataFetchError) as exc:
-        slot.release()
-        raise HTTPException(status_code=502, detail=str(exc))
-    except Exception:
-        slot.release()
-        raise
-
-    try:
-        if df.empty:
-            raise HTTPException(status_code=400, detail="未获取到行情数据。")
-        if len(df) > BACKTEST_MAX_ROWS:
-            raise HTTPException(
-                status_code=413,
-                detail=f"实际加载 {len(df):,} 行行情，超过单次预算 {BACKTEST_MAX_ROWS:,} 行。",
-            )
-
-        benchmark_df = None
-        benchmark_warning = None
-        try:
-            benchmark_df, _ = data_manager.get_stock_data(
-                "510300",
-                req.start_date,
-                req.end_date,
-                allow_mock=allow_mock,
-            )
-        except DataFetchError as exc:
-            # Do not block strategy backtest if benchmark data is temporarily unavailable.
-            benchmark_warning = str(exc)
-
-        report_stage("校验未复权成交数据")
-        try:
-            df = execution_data_service.prepare(df, allow_approximate=req.price_mode == "approximate_adjusted" or allow_mock)
-        except DataContractError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        snapshot_id = persist_snapshot(df, req.model_dump(), {**pool_ctx, "symbols": current_pool})
-        report_stage("生成信号与逐日撮合")
-        strategy_spec = strategy_version_store.resolve_strategy_spec(req.factor)
-        if strategy_spec is not None:
-            strategy_func = strategy_spec.func
-            df = strategy_func(df)
-        else:
-            def _calc_mom(g):
-                g = g.copy()
-                g["mom"] = g["close"].pct_change(20)
-                g["signal"] = 0
-                g.loc[g["mom"] > 0.1, "signal"] = 1
-                g.loc[g["mom"] < 0, "signal"] = -1
-                return g
-
-            df = df.groupby("stock_code", group_keys=False).apply(_calc_mom)
-
-        resolved_max_hold_days = req.max_hold_days
-        resolved_take_profit = req.take_profit
-        if strategy_spec is not None:
-            if resolved_max_hold_days is None:
-                resolved_max_hold_days = strategy_spec.default_max_hold_days
-            if resolved_take_profit is None:
-                resolved_take_profit = strategy_spec.default_take_profit
-
-        pos_manager = PositionManager(
-            max_positions=req.max_positions,
-            weight_mode=req.weight_mode,
-            max_hold_days=resolved_max_hold_days,
-            strategy_spec=strategy_spec,
-        )
-
-        engine = None
-
-        signal_by_date = {
-            date: group
-            for date, group in df.groupby("date", sort=False)
-        }
-        empty_signals = df.iloc[0:0]
-
-        def signal_func(date, day_data):
-            day_signals = signal_by_date.get(date, empty_signals)
-            if day_signals.empty:
-                return {}
-            current_positions = engine.portfolio.positions if engine is not None else None
-            return pos_manager.generate_target_weights(
-                date,
-                day_data,
-                day_signals,
-                current_positions=current_positions,
-            )
-
-        cost_model = override_cost_model or CostModel(
-            commission_rate=req.commission_rate,
-            commission_min=0.0 if req.commission_rate == 0 else req.commission_min,
-            stamp_tax_rate=req.stamp_tax_rate,
-            slippage_rate=req.slippage_rate,
-            close_slippage_rate=resolve_close_slippage_rate(req),
-        )
-        engine_kwargs = {
-            "initial_capital": req.initial_capital,
-            "cost_model": cost_model,
-            "stock_stop_loss": req.stop_loss,
-        }
-        engine_params = inspect.signature(BacktestEngine.__init__).parameters
-        if strategy_spec is not None and "execution_mode" in engine_params:
-            engine_kwargs["execution_mode"] = strategy_spec.execution_mode if req.same_close_approximation else "next_open_rebalance"
-        if resolved_take_profit is not None:
-            if "stock_take_profit" in engine_params:
-                engine_kwargs["stock_take_profit"] = resolved_take_profit
-            elif "take_profit" in engine_params:
-                engine_kwargs["take_profit"] = resolved_take_profit
-
-        engine = BacktestEngine(**engine_kwargs)
-        result = engine.run_backtest(df, signal_func, req.start_date, req.end_date, benchmark_data=benchmark_df)
-        result.update({"engine_version": ENGINE_VERSION, "data_snapshot_id": snapshot_id,
-                       "signal_as_of": str(df.date.max()), "request": req.model_dump(),
-                       "data_as_of": str(df.date.max()), "strategy_version": strategy_version_store.get_active_version_id(req.factor),
-                       "quality_notes": ["固定样本不保证无幸存者偏差", "分红按记录的现金金额计提；未包含差别化股息税", "日线成交量容量为近似，非开盘盘口容量"]})
-        if req.price_mode == "approximate_adjusted" or allow_mock or req.same_close_approximation:
-            result["quality_notes"].append("近似研究结果，不可作为新版模拟账户成交依据")
-        result["data_sources_used"] = data_sources
-        result["data_quality"] = data_manager._build_pool_quality(df, current_pool, warmup_start, req.end_date, data_sources, allow_late_start=bool(pool_ctx.get("allow_late_start")))
-        result["resolved_pool"] = {
-            "requested_pool": req.pool,
-            **pool_ctx,
-        }
-        result["strategy_behavior"] = {
-            "factor": req.factor,
-            "signal_type": strategy_spec.signal_type if strategy_spec is not None else "custom",
-            "holding_policy": strategy_spec.holding_policy if strategy_spec is not None else "custom",
-            "resolved_max_hold_days": resolved_max_hold_days,
-            "resolved_take_profit": resolved_take_profit,
-            "execution_mode": engine.execution_mode,
-            "portfolio_circuit_breaker_active": False,
-            "deprecated_circuit_breaker_requested": req.circuit_breaker,
-            "risk_control_note": "组合熔断已停用；组合回撤仅作为风险指标展示。",
-            # 本次实际生效的成本口径（含零成本对照组），让"我设的滑点到底有没有生效"
-            # 可以直接从回测结果里核对，而不是靠猜。字段随 CostModel 自动同步。
-            "effective_cost_model": dataclasses.asdict(cost_model),
-        }
-        if benchmark_warning:
-            result.setdefault("warnings", []).append(
-                {
-                    "code": "BENCHMARK_UNAVAILABLE",
-                    "message": benchmark_warning,
-                }
-            )
-        result["trades_total"] = len(result.get("trades", []))
-        result["trades_truncated"] = False
-        return result
-    finally:
-        slot.release()
 
 
 def build_factor_lab_backtest_request(
     req: FactorLabRunRequest,
     factor: str,
     symbols: Optional[List[str]] = None,
-) -> BacktestRequest:
+) -> FactorLabBacktestRequest:
     scoped_symbols = dedupe_symbols(symbols or []) or None
-    return BacktestRequest(
+    return FactorLabBacktestRequest(
+        label=req.label,
+        top_n=req.top_n,
         start_date=req.start_date,
         end_date=req.end_date,
         initial_capital=req.initial_capital,
@@ -2212,6 +1874,7 @@ def build_factor_lab_backtest_request(
         close_slippage_rate=req.close_slippage_rate,
         commission_min=req.commission_min,
         price_mode=req.price_mode,
+        enable_hist_gradient_boosting=req.enable_hist_gradient_boosting,
     )
 
 
@@ -2310,7 +1973,6 @@ def build_stress_test_config(req: FactorLabStressTestRequest):
     )
 
 
-@app.get("/")
 def read_root():
     return {"message": "momo quant pro API is running"}
 
@@ -2335,12 +1997,10 @@ def _health_payload(ready: bool) -> Dict[str, object]:
     }
 
 
-@app.get("/healthz")
 def healthz():
     return _health_payload(ready=False)
 
 
-@app.get("/readyz")
 def readyz():
     payload = _health_payload(ready=True)
     if not payload["ready"]:
@@ -2348,134 +2008,6 @@ def readyz():
     return payload
 
 
-# 可信本机来源白名单：按 TCP 对端地址判断，并额外识别反向代理特征。
-# 背景：部署在 nginx / frp / cloudflare tunnel 之后时，所有外部请求的对端地址
-# 都是回环地址，纯粹按对端地址做豁免等于把状态变更接口（含自动化下单相关）
-# 对公网敞开。这里不粗暴删掉本机豁免（会破坏本机日常使用），而是：
-# 只要请求带任何代理转发特征头，就一律不给回环豁免，只能走 X-Quant-Api-Key。
-# 想彻底关闭本机豁免仍可把 QUANT_API_TRUSTED_HOSTS 设为空串。
-def _trusted_local_hosts() -> set:
-    raw = os.getenv("QUANT_API_TRUSTED_HOSTS", "127.0.0.1,::1")
-    return {item.strip() for item in raw.split(",") if item.strip()}
-
-
-# 常见反向代理 / 隧道 / CDN 的转发特征头。出现其中任意一个，
-# 都说明 request.client.host 是代理自己的地址而非真实调用方。
-PROXY_FORWARDING_HEADERS = (
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
-    "x-forwarded-port",
-    "x-forwarded-server",
-    "x-original-forwarded-for",
-    "forwarded",
-    "x-real-ip",
-    "x-client-ip",
-    "true-client-ip",
-    "cf-connecting-ip",
-    "fastly-client-ip",
-    "fly-client-ip",
-    "x-cluster-client-ip",
-)
-
-
-def _detected_proxy_headers(request: Request) -> List[str]:
-    headers = request.headers
-    return [name for name in PROXY_FORWARDING_HEADERS if headers.get(name)]
-
-
-def _is_trusted_local_request(request: Request) -> bool:
-    host = request.client.host if request.client else ""
-    if host not in _trusted_local_hosts():
-        return False
-    proxy_headers = _detected_proxy_headers(request)
-    if proxy_headers:
-        # 回环地址 + 转发头 = 反向代理后的外部请求，取消豁免。
-        logger.warning(
-            "拒绝对回环来源 %s 授予本机豁免：请求带有反向代理转发头 %s，"
-            "请改用 X-Quant-Api-Key 鉴权（并确认 QUANT_AI_API_KEY 已配置）。",
-            host or "unknown",
-            ",".join(proxy_headers),
-        )
-        return False
-    return True
-
-
-def _require_local_request(request: Request) -> None:
-    if not _is_trusted_local_request(request):
-        raise HTTPException(status_code=403, detail="状态变更接口仅允许本机访问。")
-
-
-def _has_valid_quant_api_key(request: Request) -> bool:
-    expected = os.getenv("QUANT_AI_API_KEY", "").strip()
-    if not expected:
-        return False
-    provided = request.headers.get("X-Quant-Api-Key", "").strip()
-    auth = request.headers.get("Authorization", "").strip()
-    if auth.lower().startswith("bearer "):
-        provided = provided or auth.split(" ", 1)[1].strip()
-    if not provided:
-        return False
-    try:
-        return secrets.compare_digest(provided, expected)
-    except TypeError:
-        try:
-            return secrets.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
-        except Exception:
-            return False
-    except Exception:
-        return False
-
-
-def _require_automation_request(request: Request) -> None:
-    if _is_trusted_local_request(request):
-        return
-    if _has_valid_quant_api_key(request):
-        return
-    raise HTTPException(status_code=403, detail="自动化/AI 接口仅允许本机或有效 X-Quant-Api-Key 访问。")
-
-
-def describe_api_auth_state() -> Dict[str, Any]:
-    """当前鉴权口径快照，供启动日志与后续鉴权回归测试使用。"""
-    hosts = sorted(_trusted_local_hosts())
-    return {
-        "loopback_exemption_enabled": bool(hosts),
-        "trusted_hosts": hosts,
-        "api_key_configured": bool(os.getenv("QUANT_AI_API_KEY", "").strip()),
-        # 带反向代理转发头的请求永远拿不到本机豁免，见 _is_trusted_local_request()。
-        "proxy_headers_revoke_exemption": True,
-        "proxy_headers_watched": list(PROXY_FORWARDING_HEADERS),
-    }
-
-
-def log_api_auth_state() -> None:
-    """启动时把鉴权状态打到日志，一眼看清自己有没有暴露。"""
-    state = describe_api_auth_state()
-    summary = (
-        "鉴权状态 | 本机(回环)豁免=%s [%s] | API Key(QUANT_AI_API_KEY)=%s | 带反向代理转发头的请求一律不豁免"
-        % (
-            "开启" if state["loopback_exemption_enabled"] else "关闭",
-            ",".join(state["trusted_hosts"]) or "空",
-            "已配置" if state["api_key_configured"] else "未配置",
-        )
-    )
-    if state["loopback_exemption_enabled"] and not state["api_key_configured"]:
-        logger.warning(
-            "%s —— 状态变更接口（含自动化下单相关）目前只靠【本机来源】保护。"
-            "若本服务要暴露到 nginx/frp/cloudflare tunnel 之后，请先配置 QUANT_AI_API_KEY，"
-            "并把 QUANT_API_TRUSTED_HOSTS 设为空串以彻底关闭回环豁免。",
-            summary,
-        )
-    elif not state["loopback_exemption_enabled"] and not state["api_key_configured"]:
-        logger.error(
-            "%s —— 回环豁免已关闭且未配置 API Key，所有状态变更接口将一律返回 403（含本机调用）。",
-            summary,
-        )
-    else:
-        logger.info("%s", summary)
-
-
-@app.get("/api/market/latest")
 def get_latest():
     overview_symbols = _latest_overview_symbols()
     cached = data_manager.get_latest_market_cached()
@@ -2497,11 +2029,10 @@ def get_power_storage_strategy():
         logger.error(f"Error running power storage strategy: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/system/status")
 def get_system_status():
     return {
         "market_status": data_manager.get_market_status(),
-        "data_coverage": "2022 - 2026 (实盘级数据湖)",
+        "data_coverage": "按所选标的逐日校验，缓存数量不代表完整覆盖",
         "stock_pool": "A股策略 -> A股数据湖, ETF策略 -> ETF 数据湖",
         "engine_version": ENGINE_VERSION,
         "local_a_share_files": len(data_manager.list_local_codes("a_share")),
@@ -2628,7 +2159,6 @@ def post_ai_decision(req: AIDecisionRequest, request: Request):
     )
 
 
-@app.get("/api/strategies")
 def get_strategies():
     res = {}
     for key, spec in STRATEGY_REGISTRY.items():
@@ -2643,6 +2173,10 @@ def get_strategies():
             "default_take_profit": spec.default_take_profit,
             "execution_mode": spec.execution_mode,
             "requires_artifact": spec.requires_artifact,
+            "implementation_version": "legacy-preserved-v2",
+            "canonical_strategy_id": "ai_ml" if key == "ai_ml_pro_plus" else key,
+            "equivalent_strategy_ids": ["ai_ml", "ai_ml_pro_plus"] if key in {"ai_ml", "ai_ml_pro_plus"} else [],
+            "factor_semantics": {"turnover": "成交量滚动均值（历史名称；不是实际换手率）"} if key in {"ai_ml", "ai_ml_pro_plus"} else {},
         }
         if spec.requires_artifact:
             res[key]["artifact_status"] = get_factor_lab_artifact_status()
@@ -2931,6 +2465,7 @@ def _execute_factor_lab_run(req: FactorLabRunRequest):
         top_n=req.top_n,
         max_symbols=req.max_symbols,
         price_mode=req.price_mode,
+        enable_hist_gradient_boosting=req.enable_hist_gradient_boosting,
     )
 
     try:
@@ -3399,11 +2934,11 @@ def get_latest_daily_report(request: Request, regenerate: bool = False):
 def get_daily_report_by_date(date_str: str):
     """获取指定日期晨报"""
     from daily_morning_report import REPORT_DIR
-    
+
     report_path = REPORT_DIR / f"{date_str}.json"
     if not report_path.exists():
         raise HTTPException(status_code=404, detail=f"未找到 {date_str} 的晨报")
-    
+
     try:
         with open(report_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -3462,7 +2997,7 @@ def run_overnight_scan(date: Optional[str] = None):
     import subprocess
     import json
     import os
-    
+
     # 1. 检查 state.json 是否已经有这一天的数据
     if date and os.path.exists(OVERNIGHT_STATE_FILE):
         try:
@@ -3489,7 +3024,7 @@ def run_overnight_scan(date: Optional[str] = None):
     cmd = [OVERNIGHT_PYTHON, OVERNIGHT_ENGINE]
     if date:
         cmd.extend(["--date", date])
-        
+
     try:
         # 执行脚本，最长等待 25 秒
         result = subprocess.run(
@@ -3504,12 +3039,12 @@ def run_overnight_scan(date: Optional[str] = None):
                 status_code=500,
                 detail=f"扫描引擎执行出错: {result.stderr}"
             )
-            
+
         # 重新读取最新的 state.json
         if os.path.exists(OVERNIGHT_STATE_FILE):
             with open(OVERNIGHT_STATE_FILE, "r", encoding="utf-8") as f:
                 new_state = json.load(f)
-                
+
             # 找到目标日期（如果没传 date，那就是今天或最新交易日）
             target_date = date
             if not target_date:
@@ -3523,7 +3058,7 @@ def run_overnight_scan(date: Optional[str] = None):
                     dates = sorted(list(new_state.get("history", {}).keys()))
                     if dates:
                         target_date = dates[-1]
-            
+
             history = new_state.get("history", {})
             if target_date in history:
                 return {
@@ -3534,7 +3069,7 @@ def run_overnight_scan(date: Optional[str] = None):
                     "params": new_state.get("params", {}),
                     "stdout": result.stdout
                 }
-                
+
         return {
             "status": "success",
             "message": "扫描完成但未能在 state.json 找到对应记录",
@@ -3550,6 +3085,12 @@ def run_overnight_scan(date: Optional[str] = None):
         logger.exception("隔夜扫描执行失败")
         raise HTTPException(status_code=500, detail=f"扫描执行失败: {e}")
 
+
+from api_routes import make_read_router
+app.include_router(make_read_router(sys.modules[__name__]))
+
+from terminal_api import make_terminal_router
+app.include_router(make_terminal_router(sys.modules[__name__]))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=int(os.getenv("MOMO_PORT", "8080")))

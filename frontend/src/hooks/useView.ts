@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 
-export const views = ['mall', 'console', 'dashboard', 'compare', 'factorLab', 'virtualTrade', 'dailyReport', 'overnight', 'tasks'] as const;
+export const views = ['market', 'experiment', 'mall', 'console', 'dashboard', 'compare', 'factorLab', 'virtualTrade', 'dailyReport', 'overnight', 'tasks'] as const;
 export type AppView = typeof views[number];
 
 export function readView(): AppView {
   const value = window.location.hash.slice(1).split('?')[0];
-  return views.includes(value as AppView) ? value as AppView : 'mall';
+  return views.includes(value as AppView) ? value as AppView : 'market';
 }
 
 export function useView() {

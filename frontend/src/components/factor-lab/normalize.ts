@@ -342,6 +342,8 @@ export function normalizeModelRecipe(source: unknown): FactorLabModelRecipe | un
   return parseFieldsOrNull<FactorLabModelRecipe>(source, {
     baseline_model: 'str',
     nonlinear_model: 'str',
+    nonlinear_v2_model: 'str',
+    nonlinear_v2_weight: 'num?',
     baseline_weight: 'num?',
     nonlinear_weight: 'num?',
     selection_metric: 'str',
@@ -436,6 +438,7 @@ function normalizeSummary(source: Record<string, unknown>, fallback: FactorLabRu
   const totalSymbolsRaw = source.total_symbols ?? source.symbols;
   return {
     run_id: toStr(source.run_id),
+    enable_hist_gradient_boosting: source.enable_hist_gradient_boosting === true,
     start_date: toStr(source.start_date ?? nested.start_date ?? source.date_start, fallback.start_date),
     end_date: toStr(source.end_date ?? nested.end_date ?? source.date_end, fallback.end_date),
     pool: toStr(source.pool ?? nested.pool, fallback.pool),

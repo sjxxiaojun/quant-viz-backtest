@@ -288,7 +288,7 @@ class DataManager:
         if eviction not in ("lru", "fifo"):
             eviction = FRAME_CACHE_EVICTION_DEFAULT
         self._frame_cache_eviction = eviction
-        self.api_url = os.environ.get("DATA_LAKE_API_URL")
+        self.api_url = None if os.getenv("QUANT_DATA_OFFLINE") == "1" else os.environ.get("DATA_LAKE_API_URL")
 
     def _frame_cache_touch_locked(self, cache_key):
         # LRU 语义下命中即移动到队尾；FIFO 保持插入序，淘汰始终从队首开始
@@ -308,10 +308,20 @@ class DataManager:
         """
         Check if today is a trading day and if data is likely available.
         """
-        now = datetime.now()
-        if now.weekday() >= 5: return "休市 (周末)"
-        if now.hour < 16: return f"交易中 (上次同步: {(now - timedelta(days=1)).strftime('%Y-%m-%d')})"
-        return "数据就绪 (今日已收盘)"
+        from research_contracts import TradingCalendar, RUNTIME_DIR, market_now
+        now = market_now()
+        if not (RUNTIME_DIR / 'trade_calendar.json').exists():
+            return '交易日历待验证；行情新鲜度请查看数据诊断'
+        try:
+            dates = TradingCalendar().dates(now.date().isoformat(), now.date().isoformat())
+        except Exception:
+            return '交易日历未覆盖当前日期'
+        if not dates:
+            return '休市（已验证交易日历）'
+        clock = now.hour * 60 + now.minute
+        if 570 <= clock < 690 or 780 <= clock < 900:
+            return '交易时段；本地行情仍需核验'
+        return '非交易时段；本地行情仍需核验'
 
     def _get_bs_symbol(self, symbol):
         """
@@ -829,7 +839,7 @@ class DataManager:
                 cached_window = self._cache_window_cache.get(cache_key)
                 if cached_window is not None and time.monotonic() - cached_window[0] < 300:
                     return cached_window[1], cached_window[2]
-            
+
             import urllib.request
             import json
             url = f"{self.api_url}/api/v1/market/window?symbol={symbol}"
@@ -1138,7 +1148,7 @@ class DataManager:
     ) -> Tuple[pd.DataFrame, Dict[str, str], List[str]]:
         if getattr(self, "api_url", None):
             return pd.DataFrame(), {}, list(symbols)
-            
+
         start_year = int(start_date[:4])
         end_year = int(end_date[:4])
         frames = []
@@ -1205,8 +1215,13 @@ class DataManager:
             cache_path = self.get_cache_path(symbol)
             with self._cache_write_locks_lock:
                 lock = self._cache_write_locks.setdefault(str(cache_path), threading.Lock())
-            with lock:
-                tmp_path = cache_path.with_name(f".{cache_path.name}.tmp")
+            from data_provider import cache_lock
+            with lock, cache_lock(cache_path):
+                if cache_path.exists():
+                    previous = pd.read_parquet(cache_path)
+                    merged = pd.concat([previous, merged]).drop_duplicates('date', keep='last').sort_values('date')
+                import uuid
+                tmp_path = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
                 merged.to_parquet(tmp_path, index=False)
                 tmp_path.replace(cache_path)
             with self._frame_cache_lock:
@@ -1215,22 +1230,22 @@ class DataManager:
         return merged
 
     def _fetch_from_akshare(self, symbol, start_date, end_date):
-        ak = _get_akshare()
+        from data_provider import fetch_provider
         symbol = self._normalize_symbol(symbol)
         is_etf = self.is_etf_symbol(symbol)
         fetchers = []
 
         if is_etf:
             fetchers.extend([
-                ("AKSHARE", lambda: ak.fund_etf_hist_em(
+                ("AKSHARE", lambda: fetch_provider('akshare', 'fund_etf_hist_em',
                     symbol=symbol,
                     period="daily",
                     start_date=start_date.replace("-", ""),
                     end_date=end_date.replace("-", ""),
                     adjust="qfq",
                 )),
-                ("AKSHARE_SINA", lambda: ak.fund_etf_hist_sina(symbol=f"{self._infer_etf_exchange(symbol)}{symbol}")),
-                ("AKSHARE", lambda: ak.stock_zh_a_hist(
+                ("AKSHARE_SINA", lambda: fetch_provider('akshare', 'fund_etf_hist_sina', symbol=f"{self._infer_etf_exchange(symbol)}{symbol}")),
+                ("AKSHARE", lambda: fetch_provider('akshare', 'stock_zh_a_hist',
                     symbol=symbol,
                     period="daily",
                     start_date=start_date.replace("-", ""),
@@ -1239,7 +1254,7 @@ class DataManager:
                 )),
             ])
         else:
-            fetchers.append(("AKSHARE", lambda: ak.stock_zh_a_hist(
+            fetchers.append(("AKSHARE", lambda: fetch_provider('akshare', 'stock_zh_a_hist',
                 symbol=symbol,
                 period="daily",
                 start_date=start_date.replace("-", ""),
@@ -1250,8 +1265,7 @@ class DataManager:
         last_error = None
         for source, fetcher in fetchers:
             try:
-                with _no_proxy_environment():
-                    raw_df = fetcher()
+                raw_df = fetcher()
                 normalized = self._normalize_market_frame(symbol, raw_df, source=source)
                 filtered = self._filter_by_range(normalized, start_date, end_date)
                 if not filtered.empty:
@@ -1266,47 +1280,17 @@ class DataManager:
     def _fetch_from_baostock(self, symbol, start_date, end_date, auto_login=True):
         if not auto_login:
             return pd.DataFrame(), ""
-
-        bs = _get_baostock()
+        from data_provider import fetch_provider
         symbol = self._normalize_symbol(symbol)
-        with self._baostock_lock, _no_proxy_environment():
-            login_result = bs.login()
-            if login_result.error_code != "0":
-                logger.warning(f"[{symbol}] Baostock login failed: {login_result.error_msg}")
-                return pd.DataFrame(), ""
-
-            try:
-                bs_symbol = self._get_bs_symbol(symbol)
-                fields = "date,open,high,low,close,volume,amount,pctChg,turn,tradestatus,peTTM,pbMRQ,psTTM,pcfNcfTTM,isST"
-                rs = bs.query_history_k_data_plus(
-                    bs_symbol,
-                    fields,
-                    start_date=start_date,
-                    end_date=end_date,
-                    frequency="d",
-                    adjustflag="2",
-                )
-                data_list = []
-                while rs.next():
-                    data_list.append(rs.get_row_data())
-                if not data_list:
-                    return pd.DataFrame(), ""
-
-                new_df = pd.DataFrame(data_list, columns=rs.fields)
-                rs_name = bs.query_stock_basic(code=bs_symbol)
-                if rs_name.next():
-                    stock_name = rs_name.get_row_data()[1]
-                else:
-                    stock_name = PRETTY_NAMES.get(symbol, symbol)
-                new_df["stock_code"] = symbol
-                new_df["stock_name"] = stock_name
-                normalized = self._normalize_market_frame(symbol, new_df, source="BAOSTOCK")
-                return self._filter_by_range(normalized, start_date, end_date), "BAOSTOCK"
-            except Exception as e:
-                logger.warning(f"[{symbol}] Baostock Error: {e}")
-                return pd.DataFrame(), ""
-            finally:
-                bs.logout()
+        try:
+            new_df = fetch_provider('baostock', 'history', symbol=self._get_bs_symbol(symbol), start=start_date, end=end_date, adjustflag='2')
+            new_df['stock_code'] = symbol
+            new_df['stock_name'] = PRETTY_NAMES.get(symbol, symbol)
+            normalized = self._normalize_market_frame(symbol, new_df, source='BAOSTOCK')
+            return self._filter_by_range(normalized, start_date, end_date), 'BAOSTOCK'
+        except Exception as exc:
+            logger.warning('[%s] Baostock: %s', symbol, exc)
+            return pd.DataFrame(), ''
 
     def list_local_codes(self, asset_type="a_share"):
         now = time.monotonic()
@@ -1779,18 +1763,18 @@ class DataManager:
         df = pd.DataFrame({'date': [d.strftime('%Y-%m-%d') for d in dates]})
         df['dt'] = pd.to_datetime(df['date'])
         df = df[df['dt'].dt.dayofweek < 5].copy()
-        
+
         np.random.seed(hash(symbol) % 4294967295)
         price = 100.0 if symbol.startswith('6') else 10.0
         if symbol.startswith('5') or symbol.startswith('1'): price = 3.0 # ETF
-        
+
         close_prices = []
         curr = price
         for _ in range(len(df)):
             change = np.random.normal(0.0002, 0.012) # Slight drift
             curr *= (1 + change)
             close_prices.append(curr)
-        
+
         df['close'] = close_prices
         df['open'] = df['close'] * (1 + np.random.normal(0, 0.003, len(df)))
         df['high'] = df[['open', 'close']].max(axis=1) * (1 + np.abs(np.random.normal(0, 0.005, len(df))))
@@ -1910,7 +1894,7 @@ class DataManager:
         import concurrent.futures
 
         failures = {}
-        
+
         def fetch(symbol):
             return self.get_stock_data(
                 symbol,
@@ -1920,7 +1904,7 @@ class DataManager:
                 allow_mock=allow_mock,
                 allow_late_start=allow_late_start,
             )
-            
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_symbol = {executor.submit(fetch, sym): sym for sym in symbols_to_fetch}
             for future in concurrent.futures.as_completed(future_to_symbol):
@@ -1936,7 +1920,7 @@ class DataManager:
                 except Exception as e:
                     logger.error(f"[{sym}] Thread failed: {e}")
                     failures[sym] = str(e)
-                    
+
         if failures and not allow_mock:
             raise PoolDataFetchError(failures, start_date, end_date)
 
@@ -2012,6 +1996,8 @@ class DataManager:
             self._latest_market_cache_ts = time.monotonic()
             return list(fallback)
 
+        if os.getenv('QUANT_DATA_OFFLINE') == '1':
+            return self.get_latest_market_fallback(symbols, limit)
         try:
             now = time.monotonic()
             ak = _get_akshare()
@@ -2064,7 +2050,7 @@ class DataManager:
         """
         logger.info(f"正在全量审计 {len(symbols)} 只标的数据完整性 (目标日期: {target_date})...")
         missing = []
-        
+
         # 为了速度，我们并行检查
         import concurrent.futures
         def check_one(sym):
@@ -2082,10 +2068,10 @@ class DataManager:
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
             results = list(executor.map(check_one, symbols))
             missing = [r for r in results if r is not None]
-        
+
         ready_pct = (len(symbols) - len(missing)) / len(symbols) * 100
         if len(missing) > 0:
             logger.warning(f"全量审计报告: 就绪率 {ready_pct:.1f}%, 缺失 {len(missing)} 只标的。")
             return False, f"数据未完全就绪 ({ready_pct:.1f}%)，缺失 {len(missing)} 只标的。"
-        
+
         return True, "全量数据已就绪"

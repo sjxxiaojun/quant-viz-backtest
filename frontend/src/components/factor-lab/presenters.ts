@@ -123,7 +123,7 @@ export function formatScoreSource(source: string | undefined): string {
 export function formatModelBlend(result: FactorLabResult | null): string {
   const recipe = result?.summary.model_recipe ?? result?.research_iteration?.model_recipe;
   if (!recipe) return '融合比例后端未返回';
-  return `线性 ${formatPercent(recipe.baseline_weight)} / 非线性 ${formatPercent(recipe.nonlinear_weight)}`;
+  return `Ridge ${formatPercent(recipe.baseline_weight)} / RF ${formatPercent(recipe.nonlinear_weight)} / ${recipe.nonlinear_v2_model === 'hist_gradient_boosting' ? 'HGB' : 'RF_v2'} ${formatPercent(recipe.nonlinear_v2_weight ?? 0)}`;
 }
 
 export function formatOosState(value: boolean | undefined): string {

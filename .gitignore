@@ -71,3 +71,6 @@ backend/quant_data_lake/
 
 # Versioned local research runtime, never publish account or market data
 backend/runtime/
+
+# Names/defaults only; local credentials remain ignored.
+!backend/.env.example

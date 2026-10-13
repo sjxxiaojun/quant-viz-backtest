@@ -15,7 +15,7 @@ from strategy_registry import STRATEGY_REGISTRY
 
 
 def dump_engine(engine, pending):
-    return {"engine_config": {"stock_stop_loss": engine.stock_stop_loss, "take_profit": engine.take_profit, "cost_model": dataclasses.asdict(engine.cost_model)}, "cash": engine.portfolio.cash, "initial_capital": engine.initial_capital,
+    return {"engine_version": ENGINE_VERSION, "engine_config": {"stock_stop_loss": engine.stock_stop_loss, "take_profit": engine.take_profit, "cost_model": dataclasses.asdict(engine.cost_model)}, "cash": engine.portfolio.cash, "initial_capital": engine.initial_capital,
             "positions": {c: dataclasses.asdict(p) for c, p in engine.portfolio.positions.items()},
             "dividend_receivables": engine.portfolio.dividend_receivables,
             "history": engine.portfolio.history, "trades": engine.trades, "pending": pending,
@@ -67,7 +67,7 @@ class VirtualTradingV2:
             engine = restore_engine(state)
             value = engine.portfolio.total_value
             accounts.append({"strategy_id": row["strategy_id"], "account_id": f"v2:{row['strategy_id']}",
-                             "engine_version": ENGINE_VERSION, "name": row["name"], "cash": engine.portfolio.cash,
+                             "engine_version": state.get('engine_version', 'daily-v2'), "name": row["name"], "cash": engine.portfolio.cash,
                              "total_value": value, "start_value": engine.initial_capital, "last_update": row["last_update"],
                              "return_rate": value / engine.initial_capital - 1, "top_holdings": list(engine.portfolio.positions),
                              "data_snapshot_id": row["snapshot_id"], "strategy_version": row["version_id"],
@@ -112,6 +112,8 @@ class VirtualTradingV2:
             if row and row["last_update"] >= target:
                 continue
             try:
+                if row and json.loads(row['state']).get('engine_version', 'daily-v2') != ENGINE_VERSION:
+                    raise DataContractError('账户属于旧引擎版本，保留原账并暂停推进；请显式归档后新建账户。')
                 spec = self.version_store.resolve_strategy_spec(strategy_id)
                 version = self.version_store.get_active_version_id(strategy_id)
                 if row and row["version_id"] != version:

@@ -36,7 +36,7 @@ def make_router(store, queue, manager, factor_request, require_local):
         return job
 
     @router.get("/api/research/jobs", response_model=list[JobView])
-    def list_jobs(kind: Optional[Literal["backtest", "compare", "factor_lab"]] = None, limit: int = Query(50, ge=1, le=100)):
+    def list_jobs(kind: Optional[Literal["backtest", "compare", "factor_lab", "experiment"]] = None, limit: int = Query(50, ge=1, le=100)):
         return store.list(kind, limit)
 
     @router.get("/api/research/jobs/{job_id}", response_model=JobView)
@@ -59,6 +59,8 @@ def make_router(store, queue, manager, factor_request, require_local):
         return job["result"]
 
     def trade_rows(value, strategy=None):
+        if value.get('kind') == 'experiment':
+            return value.get('test_result', {}).get('trades', [])
         if strategy:
             return value.get(strategy, {}).get("trades", [])
         if "backtest" in value:

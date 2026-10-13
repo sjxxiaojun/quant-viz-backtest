@@ -1,4 +1,5 @@
 import { useJobResume } from './useJobResume';
+import { restoreBacktestConfig } from '../api/backtestConfig';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiPost, getApiErrorMessage, isRequestCanceled } from '../api/client';
 import { assertBacktestResult } from '../api/guards';
@@ -10,12 +11,16 @@ type BacktestJobSubmitResponse = {
   job_id: string;
 };
 
-export function useBacktest() {
+export function useBacktest(onRestore?: (config: BacktestConfig) => void) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const recoverResult = useCallback((value: unknown) => setResult(assertBacktestResult(value)), []);
-  useJobResume('backtest', recoverResult, setError, setLoading);
+  const recoverConfig = useCallback((value: unknown) => {
+    const config = restoreBacktestConfig(value);
+    if (config) onRestore?.(config);
+  }, [onRestore]);
+  useJobResume('backtest', recoverResult, setError, setLoading, recoverConfig);
   const requestSeq = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
 

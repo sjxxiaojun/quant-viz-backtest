@@ -8,8 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "api:types": "../backend/venv/bin/python3 ../backend/scripts/generate_api_types.py",
-    "api:check": "../backend/venv/bin/python3 ../backend/scripts/generate_api_types.py --check",
+    "api:types": "../backend/.venv/bin/python ../backend/scripts/generate_api_types.py",
+    "api:check": "../backend/.venv/bin/python ../backend/scripts/generate_api_types.py --check",
     "test": "vitest run"
   },
   "dependencies": {

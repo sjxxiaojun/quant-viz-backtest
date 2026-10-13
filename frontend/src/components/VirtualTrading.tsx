@@ -267,13 +267,13 @@ export function VirtualTrading() {
       <Panel className="flex flex-col justify-between gap-3 md:flex-row md:items-center">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <h2 className="text-base font-semibold text-slate-100">多策略实盘模拟</h2>
+            <h2 className="text-base font-semibold text-slate-100">多策略模拟账户</h2>
             <span className="num rounded-ctl border border-line bg-bg2 px-2 py-0.5 text-[10px] text-slate-400">
               数据日期 {lastUpdate}
             </span>
           </div>
           <p className="mt-1 text-xs text-slate-500">
-            仿真账户按历史数据生成持仓，用最新可用收盘价推进净值；每笔模拟成交计入 0.2% 交易摩擦。
+            仿真账户按完整日线推进持仓与净值；交易成本使用账户保存的佣金、税费与滑点配置。
           </p>
         </div>
         <button

@@ -31,6 +31,7 @@ function buildBacktestRequest(config: FactorLabRunConfig) {
     end_date: config.end_date,
     initial_capital: 1000000,
     factor: 'ml_factor_ranker',
+    enable_hist_gradient_boosting: config.enable_hist_gradient_boosting ?? false,
     price_mode: config.price_mode ?? 'strict_raw',
     commission_rate: 0.0003,
     slippage_rate: 0.0003,

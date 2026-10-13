@@ -107,3 +107,12 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   filter: invert(0.6);
   cursor: pointer;
 }
+
+@layer components {
+  .terminal-button { @apply inline-flex items-center justify-center gap-2 rounded-md border border-line-strong bg-bg2 px-3 py-2 text-xs text-slate-300 transition-colors hover:border-accent/40 hover:text-blue-300 disabled:cursor-not-allowed disabled:opacity-40; }
+  .terminal-input { @apply w-full rounded-md border border-line-strong bg-bg2 px-3 py-2 text-xs text-slate-200 outline-none focus:border-accent/50; }
+  .terminal-table { @apply w-full whitespace-nowrap text-left text-xs; }
+  .terminal-table th { @apply border-b border-line bg-bg2/50 px-4 py-3 text-[10px] font-medium text-slate-500; }
+  .terminal-table td { @apply border-b border-line px-4 py-3; }
+  .terminal-table tbody tr { @apply hover:bg-bg2/40; }
+}

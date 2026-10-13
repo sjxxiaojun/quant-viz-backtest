@@ -68,10 +68,18 @@ class DataLakeUpdateService:
         return summary
 
     def data_freshness(self, *, target_date: Optional[str] = None, max_scan: int = 500) -> Dict[str, object]:
-        target_date = target_date or self.default_target_date()
+        calendar_error = None
+        if target_date is None:
+            try:
+                target_date = self.default_target_date()
+            except Exception as exc:
+                calendar_error = str(exc)
         max_scan = max(1, int(max_scan or 500))
         a_share = self._asset_freshness("a_share", target_date, max_scan)
         etf = self._asset_freshness("etf", target_date, max_scan)
+        if calendar_error:
+            return {'target_date': None, 'status': 'blocked', 'score': None, 'sampled': True,
+                    'calendar_error': calendar_error, 'max_scan': max_scan, 'a_share': a_share, 'etf': etf}
         coverage = [item["coverage_ratio"] for item in (a_share, etf) if item["checked_count"] > 0]
         avg_coverage = sum(coverage) / len(coverage) if coverage else 0.0
         status = "ready" if avg_coverage >= 0.98 else "degraded" if avg_coverage >= 0.75 else "blocked"
@@ -95,7 +103,7 @@ class DataLakeUpdateService:
             logger.warning("无法验证交易日历，暂停自动任务。")
             return False
 
-    def _asset_freshness(self, asset_type: str, target_date: str, max_scan: int) -> Dict[str, object]:
+    def _asset_freshness(self, asset_type: str, target_date: Optional[str], max_scan: int) -> Dict[str, object]:
         symbols = self.data_manager.list_local_codes(asset_type)
         checked = self._sample_symbols(symbols, max_scan)
         fresh = 0
@@ -116,6 +124,8 @@ class DataLakeUpdateService:
                     continue
                 max_date = str(pd.to_datetime(df["date"], errors="coerce").dropna().max().date())
                 latest_date = max(max_date, latest_date or max_date)
+                if target_date is None:
+                    continue
                 if max_date >= target_date:
                     fresh += 1
                 elif len(stale) < 10:
@@ -129,10 +139,10 @@ class DataLakeUpdateService:
             "asset_type": asset_type,
             "total_local": len(symbols),
             "checked_count": checked_count,
-            "fresh_count": fresh,
+            "fresh_count": fresh if target_date else None,
             "missing_or_error_count": missing,
-            "stale_count": max(0, checked_count - fresh),
-            "coverage_ratio": (fresh / checked_count) if checked_count else 0.0,
+            "stale_count": max(0, checked_count - fresh) if target_date else None,
+            "coverage_ratio": (fresh / checked_count) if checked_count and target_date else None if not target_date else 0.0,
             "latest_date_seen": latest_date,
             "stale_examples": stale[:10],
         }

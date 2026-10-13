@@ -235,6 +235,7 @@ export function normalizeAutomationStatus(item: unknown): AutomationStatus {
     ? {
         target_date: optionalString(item.data_freshness.target_date),
         status: optionalString(item.data_freshness.status),
+        calendar_error: optionalString(item.data_freshness.calendar_error),
         score: optionalNumber(item.data_freshness.score) ?? undefined,
         a_share: normalizeFreshnessSample(item.data_freshness.a_share),
         etf: normalizeFreshnessSample(item.data_freshness.etf),

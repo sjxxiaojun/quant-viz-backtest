@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -135,6 +135,7 @@ class FactorLabConfig:
     end_date: str
     pool: str = "core"
     price_mode: str = "strict_raw"
+    enable_hist_gradient_boosting: bool = False
     label: str = "next_5d_ret"
     top_n: int = 5
     max_symbols: Optional[int] = None
@@ -561,6 +562,7 @@ def _build_model_pipelines(
     rf_n_estimators: int = 40,
     rf_max_samples: Optional[float] = 0.65,
     rf_n_jobs: int = 1,
+    enable_hist_gradient_boosting: bool = False,
 ) -> Dict[str, Pipeline]:
     rf_kwargs = {
         "n_estimators": max(8, int(rf_n_estimators)),
@@ -571,7 +573,7 @@ def _build_model_pipelines(
     }
     if rf_max_samples is not None and 0 < float(rf_max_samples) <= 1:
         rf_kwargs["max_samples"] = float(rf_max_samples)
-    return {
+    pipelines = {
         "baseline": Pipeline(
             steps=[
                 ("imputer", SimpleImputer(strategy="median")),
@@ -605,6 +607,11 @@ def _build_model_pipelines(
             ]
         ),
     }
+    if enable_hist_gradient_boosting:
+        pipelines['nonlinear_v2'] = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')),
+            ('model', HistGradientBoostingRegressor(max_iter=80, max_leaf_nodes=15,
+                learning_rate=.05, l2_regularization=1, early_stopping=False, random_state=random_state))])
+    return pipelines
 
 
 def _safe_predict(model: Pipeline, features: pd.DataFrame) -> np.ndarray:
@@ -711,6 +718,7 @@ def train_models(
     rf_n_estimators: int = 40,
     rf_max_samples: Optional[float] = 0.65,
     rf_n_jobs: int = 1,
+    enable_hist_gradient_boosting: bool = False,
 ) -> Dict[str, object]:
     train = sample[sample["split"] == "train"].copy()
     if train.empty:
@@ -731,6 +739,7 @@ def train_models(
         rf_n_estimators=rf_n_estimators,
         rf_max_samples=rf_max_samples,
         rf_n_jobs=rf_n_jobs,
+        enable_hist_gradient_boosting=enable_hist_gradient_boosting,
     )
     baseline = pipelines["baseline"]
     nonlinear = pipelines["nonlinear"]
@@ -754,6 +763,7 @@ def train_models(
     scored["ml_score"] = scored.groupby("date")["nonlinear_pred"].rank(pct=True)
     scored["ml_v2_score"] = scored.groupby("date")["nonlinear_v2_pred"].rank(pct=True)
     model_recipe = _optimize_model_blend(scored)
+    model_recipe["nonlinear_v2_model"] = "hist_gradient_boosting" if enable_hist_gradient_boosting else "random_forest_v2"
     scored["composite_score"] = _blend_score_multi(
         scored,
         float(model_recipe["baseline_weight"]),
@@ -780,7 +790,7 @@ def train_models(
     rf_v2_importance = pd.DataFrame(
         {
             "feature": fit_feature_columns,
-            "importance": rf_v2_model.feature_importances_,
+            "importance": getattr(rf_v2_model, "feature_importances_", np.zeros(len(fit_feature_columns))),
             "model": "random_forest_v2",
         }
     )
@@ -792,7 +802,8 @@ def train_models(
             "model": "ridge_abs_coef",
         }
     )
-    feature_importance = pd.concat([rf_importance, rf_v2_importance, ridge_importance], ignore_index=True)
+    importance_frames = [rf_importance, ridge_importance] if enable_hist_gradient_boosting else [rf_importance, rf_v2_importance, ridge_importance]
+    feature_importance = pd.concat(importance_frames, ignore_index=True)
     feature_importance["importance"] = feature_importance.groupby("model")["importance"].transform(
         lambda s: s / (s.sum() + 1e-12)
     )
@@ -1228,8 +1239,9 @@ def run_factor_lab(
     run_config_hash = _config_hash(config)
 
     sample, feature_columns, feature_groups = build_model_sample(raw_df, target_label=config.label, winsorize=False)
+    feature_columns = [column for column in FEATURE_COLUMNS if column in sample]
     sample = sample[(sample["date"] >= config.start_date) & (sample["date"] <= config.end_date)].copy()
-    from .data_prep import generate_features, add_labels, FEATURE_COLUMNS
+    from .data_prep import generate_features, add_labels
     causal_features, _ = generate_features(raw_df)
     causal_sample = add_labels(causal_features, target_label=config.label)
     causal_sample = causal_sample[(causal_sample.date >= config.start_date) & (causal_sample.date <= config.end_date)].copy()
@@ -1254,6 +1266,7 @@ def run_factor_lab(
         rf_n_estimators=config.rf_n_estimators,
         rf_max_samples=config.rf_max_samples,
         rf_n_jobs=config.rf_n_jobs,
+        enable_hist_gradient_boosting=config.enable_hist_gradient_boosting,
     )
     walk_forward_bundle = generate_walk_forward_predictions(
         split_by_time(causal_sample),
@@ -1264,6 +1277,7 @@ def run_factor_lab(
         rf_n_estimators=config.walk_forward_rf_n_estimators,
         rf_max_samples=config.rf_max_samples,
         rf_n_jobs=config.rf_n_jobs,
+        enable_hist_gradient_boosting=config.enable_hist_gradient_boosting,
         baseline_weight=float(model_bundle["model_recipe"].get("baseline_weight", DEFAULT_BASELINE_WEIGHT)),
         nonlinear_weight=float(model_bundle["model_recipe"].get("nonlinear_weight", DEFAULT_NONLINEAR_WEIGHT)),
     )
@@ -1299,6 +1313,7 @@ def run_factor_lab(
     summary["pool"] = config.pool
     summary["label"] = config.label
     summary["top_n"] = config.top_n
+    summary["enable_hist_gradient_boosting"] = config.enable_hist_gradient_boosting
     summary["max_symbols"] = config.max_symbols
     summary["total_symbols"] = summary["symbols"]
     summary["train_samples"] = int(summary["split_counts"].get("train", 0))
@@ -1306,11 +1321,14 @@ def run_factor_lab(
     summary["universe"] = "%s 股票池" % config.pool
     summary["research_note"] = "本次策略体检已更新两套 ML 策略卡、专家模式研究摘要和详细回测结果。"
     summary["evaluation_version"] = "causal-wf-v2"
+    summary["research_revision"] = "terminal-v3"
     summary["walk_forward"] = walk_forward_bundle["summary"]
     summary["score_source"] = score_source
     summary["model_recipe"] = {
         "baseline_model": "Ridge 线性基线",
         "nonlinear_model": "RandomForest 非线性模型",
+        "nonlinear_v2_model": model_bundle["model_recipe"].get("nonlinear_v2_model", "random_forest_v2"),
+        "nonlinear_v2_weight": float(model_bundle["model_recipe"].get("nonlinear_v2_weight", 0)),
         "baseline_weight": float(model_bundle["model_recipe"].get("baseline_weight", DEFAULT_BASELINE_WEIGHT)),
         "nonlinear_weight": float(model_bundle["model_recipe"].get("nonlinear_weight", DEFAULT_NONLINEAR_WEIGHT)),
         "selection_metric": model_bundle["model_recipe"].get("selection_metric"),
@@ -1329,6 +1347,7 @@ def run_factor_lab(
         "evaluation_version": "causal-wf-v2",
         "price_mode": config.price_mode,
         "folds": walk_forward_bundle["summary"]["folds"],
+        "research_revision": "terminal-v3",
         "trained_through": model_bundle["trained_through"],
         "feature_bounds": model_bundle["feature_bounds"],
         "run_id": summary["run_id"],

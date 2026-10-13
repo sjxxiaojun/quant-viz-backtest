@@ -103,13 +103,13 @@ export function KPICards({ result }: KPICardsProps) {
   const summary = result.summary;
   const extras = summary as BacktestResult['summary'] & SummaryExtras;
   const benchmarkReturn =
-    typeof extras.benchmark_return === 'number'
+    result.benchmark_history?.length && typeof extras.benchmark_return === 'number'
       ? extras.benchmark_return
       : result.benchmark_history && result.benchmark_history.length > 0
         ? result.benchmark_history[result.benchmark_history.length - 1].value - 1
         : null;
   const excessReturn =
-    typeof extras.excess_return === 'number'
+    benchmarkReturn != null && typeof extras.excess_return === 'number'
       ? extras.excess_return
       : benchmarkReturn != null
         ? result.total_return - benchmarkReturn

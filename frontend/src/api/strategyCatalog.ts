@@ -20,6 +20,9 @@ export interface StrategyCatalogEntry {
   requiresArtifact: boolean;
   defaultMaxHoldDays: number | null;
   defaultTakeProfit: number | null;
+  canonicalStrategyId?: string;
+  implementationVersion?: string;
+  factorSemantics?: Record<string,string>;
   /** 本地补充文案 (仅老策略有) */
   desc?: string;
   tags?: string[];
@@ -77,6 +80,9 @@ function normalizeEntry(id: string, source: unknown): StrategyCatalogEntry | nul
     requiresArtifact: source.requires_artifact === true,
     defaultMaxHoldDays: toOptionalNumber(source.default_max_hold_days),
     defaultTakeProfit: toOptionalNumber(source.default_take_profit),
+    canonicalStrategyId: typeof source.canonical_strategy_id === 'string' ? source.canonical_strategy_id : id,
+    implementationVersion: typeof source.implementation_version === 'string' ? source.implementation_version : undefined,
+    factorSemantics: isRecord(source.factor_semantics) ? Object.fromEntries(Object.entries(source.factor_semantics).filter((entry): entry is [string,string] => typeof entry[1] === 'string')) : undefined,
     desc: local?.desc,
     tags: local?.tags,
   };

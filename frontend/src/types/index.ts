@@ -60,6 +60,7 @@ export interface BacktestResult {
     weight: number;
   }[];
   summary: {
+    cost_stats?: { total_cost?: number; turnover_ratio?: number };
     initial_capital: number;
     final_value: number;
     max_drawdown: number;
@@ -127,6 +128,7 @@ export interface BacktestConfig extends GeneratedBacktestRequest {
 export type FactorLabPool = 'core' | 'blackhorse' | 'all';
 
 export interface FactorLabRunConfig {
+  enable_hist_gradient_boosting?: boolean;
   price_mode?: "strict_raw" | "approximate_adjusted";
   start_date: string;
   end_date: string;
@@ -195,6 +197,8 @@ export interface FactorLabWalkForwardSummary {
 }
 
 export interface FactorLabModelRecipe {
+  nonlinear_v2_model?: string;
+  nonlinear_v2_weight?: number;
   baseline_model?: string;
   nonlinear_model?: string;
   baseline_weight?: number;
@@ -238,6 +242,7 @@ export interface FactorLabExternalIdea {
 }
 
 export interface FactorLabSummary {
+  enable_hist_gradient_boosting?: boolean;
   price_mode?: string;
   run_id?: string;
   start_date: string;

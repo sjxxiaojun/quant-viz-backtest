@@ -6,7 +6,7 @@ from research_contracts import EVALUATION_VERSION
 
 
 def generate_predictions(frame, features, random_state, max_windows=0, max_train_rows=80000,
-                         rf_n_estimators=24, rf_max_samples=0.65, rf_n_jobs=1, **ignored):
+                         rf_n_estimators=24, rf_max_samples=0.65, rf_n_jobs=1, enable_hist_gradient_boosting=False, **ignored):
     from .pipeline import mine_candidate_factors, train_models, _model_metrics, _blend_score_multi
     scored = frame.copy()
     names = ["baseline", "", "v2"]
@@ -49,7 +49,7 @@ def generate_predictions(frame, features, random_state, max_windows=0, max_train
         # Remove labels before any fitting/selection function is invoked.
         infer["label_reg"] = np.nan
         combined = pd.concat([historical, infer], sort=False)
-        bundle = train_models(combined, selected, random_state + len(folds), rf_n_estimators, rf_max_samples, 1)
+        bundle = train_models(combined, selected, random_state + len(folds), rf_n_estimators, rf_max_samples, 1, enable_hist_gradient_boosting=enable_hist_gradient_boosting)
         predictions = bundle["scored"].loc[infer.index]
         for source, target in [("baseline_pred", "walk_forward_baseline_pred"), ("nonlinear_pred", "walk_forward_pred"), ("nonlinear_v2_pred", "walk_forward_v2_pred")]:
             scored.loc[infer.index, target] = predictions[source]
@@ -57,7 +57,7 @@ def generate_predictions(frame, features, random_state, max_windows=0, max_train
         scored.loc[infer.index, "walk_forward_composite_score"] = _blend_score_multi(predictions, recipe["baseline_weight"], recipe["nonlinear_weight"], recipe.get("nonlinear_v2_weight", 0))
         scored.loc[infer.index, "fold_id"] = len(folds)
         scored.loc[infer.index, "recipe_as_of"] = valid_dates[-1]
-        folds.append({"fold_id": len(folds), "train_start": train_dates[0], "train_end": train_dates[-1], "validation_end": valid_dates[-1], "prediction_start": infer_dates[0], "prediction_end": infer_dates[-1], "feature_columns": selected, "model_recipe": recipe, "mining": mining})
+        folds.append({"fold_id": len(folds), "train_start": train_dates[0], "train_end": train_dates[-1], "validation_end": valid_dates[-1], "prediction_start": infer_dates[0], "prediction_end": infer_dates[-1], "validation_start": valid_dates[0], "feature_columns": selected, "model_recipe": recipe, "mining": mining})
         latest = {**bundle, "feature_bounds": bounds, "trained_through": valid_dates[-1]}
     for source, target in [("walk_forward_baseline_pred", "walk_forward_baseline_score"), ("walk_forward_pred", "walk_forward_score"), ("walk_forward_v2_pred", "walk_forward_v2_score")]:
         scored[target] = scored.groupby("date")[source].rank(pct=True)
@@ -72,4 +72,4 @@ def generate_predictions(frame, features, random_state, max_windows=0, max_train
                         "retrain_interval_dates": 20, "train_dates": 120, "validation_dates": 40, "prediction_dates": 20,
                         "coverage_ratio": float(scored.walk_forward_composite_score.notna().mean()), "oos_enforced": True,
                         "max_retrain_windows": max_windows or None, "sampled_walk_forward": bool(max_windows and len(folds) >= max_windows),
-                        "folds": folds, "message": "需要至少160个交易日预热；预算截断时明确展示未预测区间。"}}
+                        "folds": folds, "message": "需要至少160个交易日预热；预算截断时明确展示未预测区间。" if len(predicted) else "无法完成样本外评估：需要超过160个交易日及足够的历史训练样本。"}}

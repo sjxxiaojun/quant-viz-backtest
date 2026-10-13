@@ -34,10 +34,12 @@ function StrategyRow({ entry, onRun }: { entry: StrategyCatalogEntry; onRun: (id
         <Tag>{getExecutionModeLabel(entry.executionMode)}</Tag>
         <Tag>{getHoldingPolicyLabel(entry.holdingPolicy)}</Tag>
         {entry.requiresArtifact && <Tag tone="warn">依赖模型工件</Tag>}
+        {entry.canonicalStrategyId && entry.canonicalStrategyId !== entry.id && <Tag tone="warn">兼容别名 · {entry.canonicalStrategyId}</Tag>}
       </div>
       {entry.desc && (
         <p className="line-clamp-2 text-[11px] leading-relaxed text-slate-500">{entry.desc}</p>
       )}
+      {Object.values(entry.factorSemantics ?? {}).map(note => <p key={note} className="text-[10px] text-amber-300/80">{note}</p>)}
     </button>
   );
 }

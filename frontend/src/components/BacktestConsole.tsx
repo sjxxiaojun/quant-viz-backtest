@@ -29,12 +29,10 @@ const DATE_PRESETS = [
 
 const CAPITAL_PRESETS = [500000, 1000000, 2000000, 5000000];
 
-function getPresetDates(months: number): { start: string; end: string } {
-  const today = new Date();
-  const end = marketDate(today);
-  if (months === 0) return { start: DATE_MIN, end };
-  const startDate = new Date(today);
-  startDate.setMonth(startDate.getMonth() - months);
+function getPresetDates(months: number, end: string): { start: string; end: string } {
+  if (!end || months === 0) return { start: DATE_MIN, end };
+  const startDate = new Date(`${end}T12:00:00+08:00`);
+  startDate.setUTCMonth(startDate.getUTCMonth() - months);
   const startStr = marketDate(startDate);
   return { start: startStr < DATE_MIN ? DATE_MIN : startStr, end };
 }
@@ -89,7 +87,7 @@ export function BacktestConsole({ config, setConfig, onRun, onSwitchStrategy, lo
 
   const activePreset = useMemo(() => {
     for (const p of DATE_PRESETS) {
-      const { start, end } = getPresetDates(p.months);
+      const { start, end } = getPresetDates(p.months, config.end_date);
       if (config.start_date === start && config.end_date === end) return p.label;
     }
     return null;
@@ -129,7 +127,7 @@ export function BacktestConsole({ config, setConfig, onRun, onSwitchStrategy, lo
               type="button"
               className={chipClass(activePreset === p.label)}
               onClick={() => {
-                const { start, end } = getPresetDates(p.months);
+                const { start, end } = getPresetDates(p.months, config.end_date);
                 setConfig(prev => ({ ...prev, start_date: start, end_date: end }));
               }}
             >
@@ -255,7 +253,6 @@ export function BacktestConsole({ config, setConfig, onRun, onSwitchStrategy, lo
               >
                 <option value="equal">等权分配</option>
                 <option value="score">按分数加权</option>
-                <option value="risk_parity">风险平价</option>
               </select>
             </div>
           </div>
@@ -355,7 +352,7 @@ export function BacktestConsole({ config, setConfig, onRun, onSwitchStrategy, lo
         <button
           type="button"
           onClick={onRun}
-          disabled={loading || dateRangeInvalid}
+          disabled={loading || !config.start_date || !config.end_date || dateRangeInvalid}
           className="flex w-full items-center justify-center gap-2 rounded-ctl bg-accent py-2.5 text-xs font-semibold text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-40"
         >
           {loading ? (
