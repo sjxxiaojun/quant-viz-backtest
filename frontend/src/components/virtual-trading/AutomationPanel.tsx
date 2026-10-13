@@ -92,10 +92,11 @@ export function AutomationPanel({ status, error, runningJob, onRunJob }: Automat
             目标 {freshness?.target_date || '--'} · {freshness?.status || 'unknown'}
           </div>
           <div className="num mt-0.5 text-[10px] text-slate-500">
-            A股 {freshness?.a_share?.fresh_count ?? 0}/{freshness?.a_share?.checked_count ?? 0}
-            (本地 {freshness?.a_share?.total_local ?? 0}) · ETF {freshness?.etf?.fresh_count ?? 0}/
+            A股 {freshness?.calendar_error ? '未验证' : freshness?.a_share?.fresh_count ?? 0}/{freshness?.a_share?.checked_count ?? 0}
+            (本地 {freshness?.a_share?.total_local ?? 0}) · ETF {freshness?.calendar_error ? '未验证' : freshness?.etf?.fresh_count ?? 0}/
             {freshness?.etf?.checked_count ?? 0}(本地 {freshness?.etf?.total_local ?? 0})
           </div>
+          {freshness?.calendar_error && <p className="mt-2 text-xs text-amber-300">{freshness.calendar_error}</p>}
         </Panel>
 
         <Panel level={2} padded={false} className="p-3">

@@ -107,7 +107,10 @@ def test_store_uses_job_specific_stale_timeouts(tmp_path):
     assert store.list_runs(job_type="eod_update")[0]["status"] == "running"
 
 
-def test_scheduler_runs_due_trade_day_tasks_once():
+def test_scheduler_runs_due_trade_day_tasks_once(monkeypatch):
+    # This test exercises an enabled fake scheduler, independent of the host's
+    # setting that disables real background scheduling in CI and previews.
+    monkeypatch.setenv('QUANT_AUTOMATION_SCHEDULER_ENABLED', '1')
     class FakeStore:
         def __init__(self):
             self.state = {}

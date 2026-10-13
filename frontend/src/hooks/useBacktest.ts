@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
+import { useJobResume } from './useJobResume';
+import { restoreBacktestConfig } from '../api/backtestConfig';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiPost, getApiErrorMessage, isRequestCanceled } from '../api/client';
 import { assertBacktestResult } from '../api/guards';
 import { pollJobResult } from '../api/pollJob';
@@ -9,10 +11,16 @@ type BacktestJobSubmitResponse = {
   job_id: string;
 };
 
-export function useBacktest() {
+export function useBacktest(onRestore?: (config: BacktestConfig) => void) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
+  const recoverResult = useCallback((value: unknown) => setResult(assertBacktestResult(value)), []);
+  const recoverConfig = useCallback((value: unknown) => {
+    const config = restoreBacktestConfig(value);
+    if (config) onRestore?.(config);
+  }, [onRestore]);
+  useJobResume('backtest', recoverResult, setError, setLoading, recoverConfig);
   const requestSeq = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -26,8 +34,10 @@ export function useBacktest() {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    window.dispatchEvent(new Event('momo:job-submitted'));
     setLoading(true);
     setError(null);
+    setResult(null);
     try {
       const payloadConfig = withAllPoolBudget(config);
       // 先提交异步 job, 避免长回测阻塞请求线程
@@ -37,6 +47,7 @@ export function useBacktest() {
       });
       const jobId = submit?.job_id;
       if (!jobId) throw new Error('后端未返回 job_id');
+      localStorage.setItem('momo:backtest:job', jobId);
 
       const payload = await pollJobResult<unknown>(
         `/api/backtest/jobs/${jobId}`,

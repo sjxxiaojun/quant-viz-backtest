@@ -10,6 +10,7 @@ interface JobStatusResponse {
   job_id: string;
   status: 'queued' | 'running' | 'succeeded' | 'failed' | string;
   error?: string | null;
+  stage?: string | null;
 }
 
 export interface PollJobOptions {
@@ -22,6 +23,7 @@ export interface PollJobOptions {
   maxIntervalMs?: number;
   timeoutMessage?: string;
   failureMessage?: string;
+  onStatus?: (status: JobStatusResponse) => void;
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -64,12 +66,13 @@ export async function pollJobResult<T = unknown>(
     if (signal.aborted) return null;
 
     const status = await apiGet<JobStatusResponse>(statusPath, { timeout: 8000, signal });
+    if (!signal.aborted) options.onStatus?.(status);
 
     if (status.status === 'succeeded') {
       if (signal.aborted) return null;
       return apiGet<T>(resultPath, { timeout: 30000, signal });
     }
-    if (status.status === 'failed') {
+    if (['failed', 'canceled', 'interrupted'].includes(status.status)) {
       throw new Error(status.error || failureMessage);
     }
     if (Date.now() - start > timeoutMs) {

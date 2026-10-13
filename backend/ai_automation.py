@@ -141,7 +141,7 @@ class AIAutomationService:
                 "actions": [{"type": "generate_daily_report", "params": {"mode": "local_fallback"}}],
             }
 
-        api_key = os.getenv("QUANT_AI_API_KEY", "").strip()
+        api_key = os.getenv("QUANT_AI_MODEL_API_KEY", os.getenv("QUANT_AI_API_KEY", "")).strip()
         compatible = os.getenv("QUANT_AI_OPENAI_COMPATIBLE", "").strip().lower() in {"1", "true", "yes"}
         payload: Dict[str, Any]
         if compatible:

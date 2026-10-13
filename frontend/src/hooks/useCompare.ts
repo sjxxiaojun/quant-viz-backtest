@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
+import { useJobResume } from './useJobResume';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { apiPost, getApiErrorMessage, isRequestCanceled } from '../api/client';
 import { assertBacktestResult, isRecord } from '../api/guards';
 import { pollJobResult } from '../api/pollJob';
@@ -13,6 +14,11 @@ export function useCompare() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [results, setResults] = useState<Record<string, BacktestResult> | null>(null);
+  const recoverResult = useCallback((value: unknown) => {
+    if (!isRecord(value)) throw new Error('对比结果格式错误');
+    setResults(Object.fromEntries(Object.entries(value).map(([key,item]) => [key, assertBacktestResult(item)])));
+  }, []);
+  useJobResume('compare', recoverResult, setError, setLoading);
   const requestSeq = useRef(0);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -27,6 +33,7 @@ export function useCompare() {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    window.dispatchEvent(new Event('momo:job-submitted'));
     setLoading(true);
     setError(null);
     try {
@@ -37,6 +44,7 @@ export function useCompare() {
       }, { timeout: 15000, signal: controller.signal });
       const jobId = submit?.job_id;
       if (!jobId) throw new Error('后端未返回 compare job_id');
+      localStorage.setItem('momo:compare:job', jobId);
 
       const payload = await pollJobResult<unknown>(
         `/api/backtest/compare/jobs/${jobId}`,

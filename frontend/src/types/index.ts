@@ -1,3 +1,6 @@
+import type { ApiSchemas } from '../api/schema.generated';
+type GeneratedBacktestRequest = ApiSchemas['BacktestRequest'];
+
 export interface Trade {
   date: string;
   stock_code: string;
@@ -34,6 +37,16 @@ export interface BenchmarkHistoryData {
 }
 
 export interface BacktestResult {
+  engine_version?: string;
+  data_snapshot_id?: string;
+  data_as_of?: string;
+  signal_as_of?: string;
+  strategy_version?: string;
+  quality_notes?: string[];
+  request?: Record<string, unknown>;
+  trades_total?: number;
+  trades_truncated?: boolean;
+  strategy_behavior?: { execution_mode?: string; effective_cost_model?: Record<string, unknown> };
   total_return: number;
   history: HistoryData[];
   benchmark_history?: BenchmarkHistoryData[];
@@ -47,6 +60,7 @@ export interface BacktestResult {
     weight: number;
   }[];
   summary: {
+    cost_stats?: { total_cost?: number; turnover_ratio?: number };
     initial_capital: number;
     final_value: number;
     max_drawdown: number;
@@ -90,7 +104,11 @@ export interface BacktestResult {
   };
 }
 
-export interface BacktestConfig {
+export interface BacktestConfig extends GeneratedBacktestRequest {
+  price_mode?: "strict_raw" | "approximate_adjusted";
+  same_close_approximation?: boolean;
+  commission_min?: number;
+  stamp_tax_rate?: number;
   start_date: string;
   end_date: string;
   initial_capital: number;
@@ -110,6 +128,8 @@ export interface BacktestConfig {
 export type FactorLabPool = 'core' | 'blackhorse' | 'all';
 
 export interface FactorLabRunConfig {
+  enable_hist_gradient_boosting?: boolean;
+  price_mode?: "strict_raw" | "approximate_adjusted";
   start_date: string;
   end_date: string;
   pool: FactorLabPool;
@@ -177,6 +197,8 @@ export interface FactorLabWalkForwardSummary {
 }
 
 export interface FactorLabModelRecipe {
+  nonlinear_v2_model?: string;
+  nonlinear_v2_weight?: number;
   baseline_model?: string;
   nonlinear_model?: string;
   baseline_weight?: number;
@@ -220,6 +242,8 @@ export interface FactorLabExternalIdea {
 }
 
 export interface FactorLabSummary {
+  enable_hist_gradient_boosting?: boolean;
+  price_mode?: string;
   run_id?: string;
   start_date: string;
   end_date: string;

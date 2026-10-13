@@ -35,7 +35,7 @@ def get_factor_lab_artifact_readiness(report_root: Path = REPORT_ROOT) -> dict:
     scores_path = report_root / "latest_scores.csv"
     model_path = report_root / "latest_model.joblib"
     manifest = _load_manifest(manifest_path)
-    if not manifest:
+    if not manifest or manifest.get("evaluation_version") != "causal-wf-v2" or not manifest.get("trained_through") or manifest.get("price_mode", "strict_raw") != "strict_raw":
         return {
             "ready": False,
             "status": "missing",
@@ -129,7 +129,7 @@ def _merge_persisted_scores(
     manifest_path: Path = LATEST_MANIFEST_PATH,
 ) -> Optional[pd.DataFrame]:
     manifest = _load_manifest(manifest_path)
-    if not manifest:
+    if not manifest or manifest.get("evaluation_version") != "causal-wf-v2":
         return None
     expected_run_id = str(manifest.get("run_id") or "")
     expected_config_hash = str(manifest.get("config_hash") or "")
@@ -162,6 +162,9 @@ def _merge_persisted_scores(
             return None
     else:
         return None
+    if "recipe_as_of" not in scores:
+        return None
+    scores = scores[scores["date"].astype(str) > scores["recipe_as_of"].astype(str)].copy()
     score_cols = ["date", "stock_code", "score", "composite_score", "ml_score", "daily_rank", "is_oos_score"]
     score_cols = [column for column in score_cols if column in scores.columns]
     merged = df.drop(columns=["signal", "score"], errors="ignore").merge(
@@ -182,7 +185,7 @@ def _score_with_latest_model(
     manifest_path: Path = LATEST_MANIFEST_PATH,
 ) -> Optional[pd.DataFrame]:
     manifest = _load_manifest(manifest_path)
-    if not manifest:
+    if not manifest or manifest.get("evaluation_version") != "causal-wf-v2":
         return None
     expected_run_id = str(manifest.get("run_id") or "")
     expected_config_hash = str(manifest.get("config_hash") or "")
@@ -205,7 +208,13 @@ def _score_with_latest_model(
     except Exception:
         return None
 
+    cutoff = manifest.get("trained_through")
+    if not cutoff or df["date"].astype(str).max() <= str(cutoff):
+        return None
     features, _ = generate_features(df)
+    for column, bounds in bundle.get("feature_bounds", {}).items():
+        if column in features:
+            features[column] = features[column].clip(*bounds)
     try:
         from .pipeline import _candidate_factor_recipes
         for name, _, dependencies, builder in _candidate_factor_recipes():
@@ -219,11 +228,16 @@ def _score_with_latest_model(
     if missing_features or not feature_columns:
         return None
 
-    scored = features.copy()
+    scored = features[features.date.astype(str) > str(cutoff)].copy()
+    for column, bounds in bundle.get("feature_bounds", {}).items():
+        if column in scored:
+            scored[column] = scored[column].clip(*bounds)
     try:
         scored["ml_pred"] = model.predict(scored[feature_columns])
         if baseline_model is not None:
             scored["baseline_pred"] = baseline_model.predict(scored[feature_columns])
+        if bundle.get("nonlinear_v2_model") is not None:
+            scored["nonlinear_v2_pred"] = bundle["nonlinear_v2_model"].predict(scored[feature_columns])
     except Exception:
         return None
     scored["ml_score"] = scored.groupby("date")["ml_pred"].rank(pct=True)
@@ -238,6 +252,11 @@ def _score_with_latest_model(
         ) / total_weight
     else:
         scored["score"] = scored["ml_score"]
+    if "nonlinear_v2_pred" in scored and "baseline_pred" in scored:
+        from .pipeline import _blend_score_multi
+        scored["baseline_score"] = scored.groupby("date").baseline_pred.rank(pct=True)
+        scored["ml_v2_score"] = scored.groupby("date").nonlinear_v2_pred.rank(pct=True)
+        scored["score"] = _blend_score_multi(scored, recipe.get("baseline_weight", .35), recipe.get("nonlinear_weight", .65), recipe.get("nonlinear_v2_weight", 0))
     return scored
 
 
@@ -271,8 +290,13 @@ def _fallback_composite_score(df: pd.DataFrame) -> pd.DataFrame:
 
 def _build_ml_signals(df: pd.DataFrame, top_n: int, min_score: float = 0.0) -> pd.DataFrame:
     scored = _merge_persisted_scores(df)
+    live = _score_with_latest_model(df)
     if scored is None or scored["score"].notna().sum() == 0:
-        scored = _score_with_latest_model(df)
+        scored = live
+    elif live is not None:
+        updates = live.set_index(["date", "stock_code"])["score"]
+        keys = pd.MultiIndex.from_frame(scored[["date", "stock_code"]])
+        scored["score"] = scored["score"].fillna(pd.Series(updates.reindex(keys).to_numpy(), index=scored.index))
     if scored is None or scored["score"].notna().sum() == 0:
         raise FactorLabScoringError(
             "Factor Lab scoring artifact is missing, stale, or incompatible. "

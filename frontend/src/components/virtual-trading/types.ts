@@ -140,6 +140,7 @@ export interface AutomationStatus {
     next_jobs?: { job_type: string; work_type?: string; run_at: string }[];
   };
   data_freshness?: {
+    calendar_error?: string;
     target_date?: string;
     status?: string;
     score?: number;

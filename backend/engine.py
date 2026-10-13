@@ -14,8 +14,7 @@ STAMP_TAX_CUT_DATE = "2023-08-28"
 STAMP_TAX_RATE_CURRENT = 0.0005   # 2023-08-28（含）之后
 STAMP_TAX_RATE_LEGACY = 0.001     # 2023-08-28 之前
 
-# 沪市过户费：按成交金额 0.001% 双向收取（中国结算 2022-04-29 起标准）；
-# 深市/北交所不单独收取过户费。
+# A股过户费：沪深北统一按成交金额0.001%双向收取（2022-04-29起），此前按市场分段。
 SH_TRANSFER_FEE_RATE = 0.00001
 
 # 《中华人民共和国印花税法》（2022-07-01 施行）规定：证券交易印花税的征税范围是
@@ -47,7 +46,7 @@ class CostModel:
     # 尾盘（收盘价）成交滑点：尾盘竞价/扫货时收盘价与实际可得均价偏差
     # 显著大于日内 VWAP 执行，独立参数化。
     close_slippage_rate: float = 0.0015
-    # 沪市过户费（买卖双向，仅 6 开头沪市股票）。
+    # 股票过户费（买卖双向，沪深北按成交日费率）。
     transfer_fee_rate: float = SH_TRANSFER_FEE_RATE
     # 显式指定 2023-08-28 之前的印花税率；为 None 时：
     # - stamp_tax_rate 等于法定现行默认值 0.0005 -> 按法定分段自动取 0.001；
@@ -83,12 +82,9 @@ class CostModel:
 
     @classmethod
     def _is_sh_stock(cls, stock_code: Optional[str]) -> bool:
-        """过户费只对沪市**股票**（60/68 开头，含科创板）双向收取。
-
-        沪市基金/债券（5/1 开头）以及深市、北交所标的都不收过户费，
-        因此这里保持"仅 6 开头"的判定。
-        """
-        return cls._normalized_code(stock_code).startswith("6")
+        """股票过户费（保留旧方法名兼容调用方）；基金/债券不适用。"""
+        code = cls._normalized_code(stock_code)
+        return bool(code) and not cls.is_stamp_tax_exempt(code)
 
     def calculate_cost_breakdown(
         self,
@@ -105,7 +101,10 @@ class CostModel:
             if is_sell and not self.is_stamp_tax_exempt(stock_code)
             else 0.0
         )
-        transfer_fee = amount * self.transfer_fee_rate if self._is_sh_stock(stock_code) else 0.0
+        transfer_rate = self.transfer_fee_rate
+        if transfer_rate == SH_TRANSFER_FEE_RATE and trade_date and str(trade_date) < "2022-04-29":
+            transfer_rate = .000025 if self._normalized_code(stock_code).startswith(("43", "83", "87", "88", "92")) else .00002
+        transfer_fee = amount * transfer_rate if self._is_sh_stock(stock_code) else 0.0
         base_slippage_rate = self.close_slippage_rate if at_close else self.slippage_rate
         effective_slippage = (
             base_slippage_rate * self.order_slicing_slippage_factor
@@ -167,10 +166,10 @@ class Position:
 
     def available_quantity(self, current_date: str, enforce_t1: bool = True) -> int:
         if not enforce_t1:
-            return self.quantity
+            return sum(lot.quantity for lot in self.lots if not lot.available_from or lot.available_from <= current_date) if self.lots else self.quantity
         if not self.lots:
             return self.quantity if (self.entry_date and self.entry_date < current_date) else 0
-        return sum(lot.quantity for lot in self.lots if lot.entry_date < current_date)
+        return sum(lot.quantity for lot in self.lots if lot.entry_date < current_date and (not lot.available_from or lot.available_from <= current_date))
 
 class Portfolio:
     def __init__(self, initial_capital: float = 1000000.0):
@@ -178,11 +177,12 @@ class Portfolio:
         self.cash = initial_capital
         self.positions: Dict[str, Position] = {}
         self.history: List[Dict] = []
+        self.dividend_receivables: List[Dict] = []
         
     @property
     def total_value(self) -> float:
         market_value = sum(pos.market_value for pos in self.positions.values())
-        return self.cash + market_value
+        return self.cash + market_value + sum(r["amount"] for r in self.dividend_receivables)
 
     def record_state(self, date: str, daily_trades: List[Dict]):
         state = {
@@ -343,6 +343,10 @@ class BacktestEngine:
         self._reset_diagnostics()
         
         data = data.sort_values(['date', 'stock_code']).copy()
+        self._indicator_by_date = {d: g for d, g in data.groupby("date", sort=False)}
+        for field in ("open", "high", "low", "close", "prev_close"):
+            if f"raw_{field}" in data:
+                data[field] = data[f"raw_{field}"]
         data_by_date = {
             date: group.set_index("stock_code", drop=False)
             for date, group in data.groupby("date", sort=False)
@@ -363,41 +367,65 @@ class BacktestEngine:
         
         for date in test_dates:
             day_data = data_by_date.get(date, pd.DataFrame())
-            prev_trade_count = len(self.trades)
-            blocked_reentry_codes: Set[str] = set()
-
-            # 1. Open-time risk checks and pending execution. Do not use today's
-            # close to decide trades that execute at today's open.
-            self._mark_positions_to_price(day_data, "open")
-
-            # 2. Gap-open risk exits: decidable from today's open price alone,
-            #    so they settle at the open together with the rebalance.
-            blocked_reentry_codes = self._check_price_risk_exits(
-                date, day_data, phase=self.RISK_EXIT_PHASE_OPEN
-            )
-
-            # 3. Execute pending signals at today's open.
-            if pending_signals is not None:
-                self._rebalance(date, day_data, pending_signals, blocked_reentry_codes)
-
-            # 4. Intraday touch-triggered risk exits run AFTER the open rebalance.
-            #    low/high 只有盘中才知道，若排在前面，止损释放的现金会被拿去支付
-            #    同一天开盘价的买单——现实中不可能（前视偏差）。放在这里之后，
-            #    这笔现金最早只能给次日开盘的买单用。
-            self._check_price_risk_exits(
-                date, day_data, phase=self.RISK_EXIT_PHASE_INTRADAY
-            )
-
-            today_trades = self.trades[prev_trade_count:]
-
-            # 5. Mark to close and record the end-of-day portfolio state.
-            self._mark_positions_to_price(day_data, "close")
-            self.portfolio.record_state(date, today_trades)
-
-            # 6. Generate NEW signals for tomorrow.
+            self.step(date, day_data, pending_signals)
             pending_signals = self._invoke_signal_func(signal_func, date, day_data) or {}
-            
+
         return self._generate_report()
+
+    def step(self, date, day_data, pending_signals=None):
+        """The same daily ledger transition is used by backtests and v2 accounts."""
+        if "stock_code" not in day_data.index.names:
+            day_data = day_data.set_index("stock_code", drop=False)
+        for field in ("open", "high", "low", "close", "prev_close"):
+            if f"raw_{field}" in day_data:
+                day_data = day_data.copy()
+                day_data[field] = day_data[f"raw_{field}"]
+        self._t0_codes = set(day_data.loc[pd.to_numeric(day_data.get("settlement_days", pd.Series(1, index=day_data.index)), errors="coerce").eq(0), "stock_code"].astype(str))
+        self._apply_company_actions(date, day_data)
+        previous = len(self.trades)
+        self._mark_positions_to_price(day_data, "open")
+        blocked = self._check_price_risk_exits(date, day_data, phase=self.RISK_EXIT_PHASE_OPEN)
+        if pending_signals is not None:
+            self._rebalance(date, day_data, pending_signals, blocked)
+        self._check_price_risk_exits(date, day_data, phase=self.RISK_EXIT_PHASE_INTRADAY)
+        self._mark_positions_to_price(day_data, "close")
+        self.portfolio.record_state(date, self.trades[previous:])
+
+    def _apply_company_actions(self, date, day_data):
+        due = [r for r in self.portfolio.dividend_receivables if r.get("pay_date") and r["pay_date"] <= date]
+        self.portfolio.cash += sum(r["amount"] for r in due)
+        self.portfolio.dividend_receivables = [r for r in self.portfolio.dividend_receivables if r not in due]
+        for code, pos in self.portfolio.positions.items():
+            row = self._row_for_code(day_data, code)
+            if row is None:
+                continue
+            dividend = self._safe_float(row.get("cash_dividend_per_share")) or 0.0
+            multiplier = self._safe_float(row.get("share_multiplier")) or 1.0
+            if dividend:
+                if code in self._open_round_trips:
+                    info = self._open_round_trips[code]
+                    info["dividend_amount"] = info.get("dividend_amount", 0.0) + pos.quantity * dividend
+                self.portfolio.dividend_receivables.append({"amount": pos.quantity * dividend, "pay_date": str(row.get("dividend_pay_date") or ""), "stock_code": code})
+            if multiplier != 1:
+                if multiplier <= 0 or any(abs(lot.quantity * multiplier - round(lot.quantity * multiplier)) > 1e-8 for lot in pos.lots):
+                    raise ValueError("公司行动包含无法处理的零碎股，需要明确现金补偿记录。")
+                original_quantity = pos.quantity
+                for lot in pos.lots:
+                    lot.price /= multiplier
+                extra = round(original_quantity * (multiplier - 1))
+                if extra < 0:
+                    raise ValueError("反向合股需要明确零碎股补偿记录。")
+                pos.lots.append(Lot(quantity=extra, price=pos.avg_price / multiplier, entry_date=date,
+                                    available_from=str(row.get("share_available_date") or date)))
+                pos.quantity = sum(lot.quantity for lot in pos.lots)
+                pos.avg_price /= multiplier
+                if code in self._open_round_trips:
+                    self._open_round_trips[code]["qty"] = pos.quantity
+                    self._open_round_trips[code]["entry_price"] /= multiplier
+        # Same-day payment is available at today's open only when explicitly supplied.
+        due = [r for r in self.portfolio.dividend_receivables if r.get("pay_date") and r["pay_date"] <= date]
+        self.portfolio.cash += sum(r["amount"] for r in due)
+        self.portfolio.dividend_receivables = [r for r in self.portfolio.dividend_receivables if r not in due]
 
     def _run_signal_close_to_next_open(self, data_by_date: Dict[str, pd.DataFrame], signal_func, test_dates: List[str]) -> Dict:
         if not test_dates:
@@ -430,7 +458,7 @@ class BacktestEngine:
         return self._generate_report()
 
     def _invoke_signal_func(self, signal_func, date: str, day_data: pd.DataFrame) -> Dict[str, float]:
-        signal_day_data = self._signal_day_data(day_data)
+        signal_day_data = getattr(self, "_indicator_by_date", {}).get(date, self._signal_day_data(day_data))
         try:
             signature = inspect.signature(signal_func)
             params = list(signature.parameters.values())
@@ -509,6 +537,14 @@ class BacktestEngine:
         # 先判板块再判 ST：注册制下创业板/科创板（含 ST）±20%、北交所（含 ST）±30%，
         # 仅主板 ST 为 ±5%。
         code = str(stock_row.get("stock_code", "") or "")
+        explicit = self._safe_float(stock_row.get("price_limit_pct"))
+        if explicit is not None:
+            return explicit - .005
+        # SZSE's 2020-08-24 fund list explicitly includes the default 159915 pool member.
+        if code == "159915" and str(stock_row.get("date") or "9999") >= "2020-08-24":
+            return self.GEM_STAR_LIMIT_MOVE
+        if code.startswith(("300", "301")) and stock_row.get("date") and str(stock_row["date"]) < "2020-08-24":
+            return self.ST_MAIN_BOARD_LIMIT_MOVE if self._is_st_stock(stock_row) else self.limit_move_threshold
         if code.startswith(("300", "301", "688", "689")):
             return self.GEM_STAR_LIMIT_MOVE
         if code.startswith(("43", "83", "87", "88", "92")):
@@ -523,6 +559,8 @@ class BacktestEngine:
 
         上市天数用"数据面板中该代码首次出现日"起算的交易日序号近似；
         与面板同日起始的代码视为存量老股，不适用。"""
+        if "raw_open" in stock_row.index and not stock_row.get("listing_date"):
+            return False
         if not self._global_date_index or self._panel_first_date is None:
             return False
         code = str(stock_row.get("stock_code", "") or "")
@@ -596,7 +634,7 @@ class BacktestEngine:
     def _is_t1_sell_blocked(self, pos: Position, date: str) -> bool:
         if not self.enforce_t1:
             return False
-        return pos.available_quantity(date, enforce_t1=True) <= 0
+        return pos.available_quantity(date, enforce_t1=self.enforce_t1 and not getattr(self, "_t0_codes", set()).__contains__(pos.stock_code)) <= 0
 
     def _cap_order_quantity(self, stock_row: pd.Series, requested_qty: int) -> Tuple[int, bool]:
         requested_qty = int(requested_qty or 0)
@@ -685,13 +723,17 @@ class BacktestEngine:
             "transfer_fee": cost_breakdown.get("transfer_fee", 0.0),
             "slippage": cost_breakdown["slippage"],
         })
-        self._open_round_trips[code] = {
-            "entry_date": date,
-            "entry_price": float(price),
-            "qty": int(qty),
-            "entry_notional": float(exec_amt),
-            "entry_cost": float(total_cost),
-        }
+        previous = self._open_round_trips.get(code)
+        if previous:
+            previous["qty"] += int(qty)
+            previous["entry_notional"] += float(exec_amt)
+            previous["entry_cost"] += float(total_cost)
+            previous["entry_price"] = previous["entry_notional"] / previous["qty"]
+        else:
+            self._open_round_trips[code] = {
+                "entry_date": date, "entry_price": float(price), "qty": int(qty),
+                "entry_notional": float(exec_amt), "entry_cost": float(total_cost), "dividend_amount": 0.0,
+            }
         return True
 
     def _close_position(
@@ -761,8 +803,9 @@ class BacktestEngine:
             close_fraction = min(1.0, close_qty / entry_qty) if entry_qty > 0 else 1.0
             closed_entry_notional = float(entry_info["entry_notional"]) * close_fraction
             closed_entry_cost = float(entry_info["entry_cost"]) * close_fraction
-            gross_pnl = amount - closed_entry_notional
-            net_pnl = amount - total_cost - closed_entry_notional - closed_entry_cost
+            dividend = float(entry_info.get("dividend_amount", 0.0)) * close_fraction
+            gross_pnl = amount + dividend - closed_entry_notional
+            net_pnl = amount + dividend - total_cost - closed_entry_notional - closed_entry_cost
             gross_return = gross_pnl / closed_entry_notional if closed_entry_notional > 0 else 0.0
             net_denominator = closed_entry_notional + closed_entry_cost
             net_return = net_pnl / net_denominator if net_denominator > 0 else 0.0
@@ -778,6 +821,7 @@ class BacktestEngine:
                 "entry_notional": float(closed_entry_notional),
                 "exit_notional": float(amount),
                 "entry_cost": float(closed_entry_cost),
+                "dividend_amount": dividend,
                 "exit_cost": float(total_cost),
                 "total_cost": float(closed_entry_cost + total_cost),
                 "gross_return": float(gross_return),
@@ -791,6 +835,7 @@ class BacktestEngine:
                 entry_info["qty"] = int(remaining_entry_qty)
                 entry_info["entry_notional"] = float(entry_info["entry_notional"] - closed_entry_notional)
                 entry_info["entry_cost"] = float(entry_info["entry_cost"] - closed_entry_cost)
+                entry_info["dividend_amount"] = float(entry_info.get("dividend_amount", 0.0) - dividend)
             else:
                 self._open_round_trips.pop(code, None)
         return True
@@ -845,7 +890,7 @@ class BacktestEngine:
                     if block_reason is not None:
                         self._record_trade_block(block_reason, "sell")
                         continue
-                    requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
+                    requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1 and code not in getattr(self, "_t0_codes", set()))
                     qty, partial = self._cap_order_quantity(stock_row, requested_qty)
                     if qty > 0:
                         fill_status = "partial" if partial else "filled"
@@ -902,7 +947,7 @@ class BacktestEngine:
                 self._record_trade_block("limit_down", "sell")
                 continue
 
-            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1 and code not in getattr(self, "_t0_codes", set()))
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 continue
@@ -934,7 +979,7 @@ class BacktestEngine:
                     self.execution_stats["delayed_exit_count"] += 1
                 continue
 
-            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1 and code not in getattr(self, "_t0_codes", set()))
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 if self.execution_mode == "signal_close_to_next_open":
@@ -968,7 +1013,7 @@ class BacktestEngine:
                 continue
 
             name = stock_row['stock_name']
-            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1 and code not in getattr(self, "_t0_codes", set()))
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 continue
@@ -1031,7 +1076,7 @@ class BacktestEngine:
                 self.execution_stats["delayed_exit_count"] += 1
                 continue
 
-            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1)
+            requested_qty = pos.available_quantity(date, enforce_t1=self.enforce_t1 and code not in getattr(self, "_t0_codes", set()))
             qty, partial = self._cap_order_quantity(stock_row, requested_qty)
             if qty <= 0:
                 self.execution_stats["delayed_exit_count"] += 1

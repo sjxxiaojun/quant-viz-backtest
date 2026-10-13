@@ -1,661 +1,44 @@
+import { FactorTaskState } from './factor-lab/FactorTaskState';
+import { FactorVerdict } from './factor-lab/FactorVerdict';
+import { ConfigPanel } from './factor-lab/ConfigPanel';
+import { useFactorCharts } from './factor-lab/useFactorCharts';
+import { formatValue, formatPercent, formatAbsPercent, formatCompactNumber, formatStrategyLabel, formatScoreSource, formatModelBlend, formatOosState, signalState, getFailureMessage, getFailureCode, getFailureConfig, formatConfigSummary, getReadinessMessages, buildStrategyCards, buildUserVerdict, buildReliabilityChecks, buildPlainFeatureRows, getReliabilityTone, getCandidateStatusLabel, getPromotionTone, getScenarioTone, getScenarioPlainText, buildStressCards, getSelfIterationSummary, formatVersionShort, getLifecycleTitle, getVersionActionLabel, getLifecycleStatusLabel, getGateRows, getIterationStatusLabel, getIterationActionText } from './factor-lab/presenters';
 import React, { useEffect, useMemo, useState } from 'react';
 import { EChart } from './EChart';
 import {
   Activity,
-  AlertTriangle,
   BarChart3,
+  AlertTriangle,
   BrainCircuit,
-  Calendar,
   ChevronDown,
   ChevronUp,
-  Database,
   Loader2,
   Play,
   ShieldCheck,
   Target,
   TrendingUp,
 } from 'lucide-react';
-import { cn, escapeHtml } from '../utils';
+import { cn } from '../utils';
 import { colorMap, factorLabPoolOptions, factorLabStrategyMeta } from '../config/strategies';
 import { useFactorLab } from '../hooks/useFactorLab';
-import type {
-  FactorLabFailureState,
-  FactorLabMetricItem,
-  FactorLabResult,
-  FactorLabRunConfig,
-  FactorLabRunReadiness,
-  FactorLabSelfIteration,
-  FactorLabStrategyLifecycle,
-  FactorLabStrategyBacktest,
-  FactorLabStressScenario,
-  StrategyVersionIteration,
-  StrategyVersionRecord,
-} from '../types';
+import type { FactorLabRunConfig, FactorLabStrategyBacktest } from '../types';
 
 const DEFAULT_START_DATE = '2022-01-01';
-const DEFAULT_END_DATE = new Date().toISOString().slice(0, 10);
-const TOP_N_OPTIONS = [3, 5, 10, 20] as const;
-const SAMPLE_SIZE_OPTIONS = [180, 300, 500] as const;
 const DEFAULT_EXPANDED: Record<string, boolean> = {
   ml_factor_ranker: true,
   ml_factor_filter: false,
 };
 
-type StrategyDetailCard = {
-  key: string;
-  name: string;
-  shortDesc: string;
-  totalReturn?: number;
-  winRate?: number;
-  triggerText: string;
-  lastTriggerDate: string;
-  maxDrawdown?: number;
-  annualReturn?: number;
-  costDrag?: number;
-  recentHits: string[];
-  suitableFor: string[];
-  backtestRange: string;
-  runNote: string;
-  focusPoints: string[];
-};
-
-type UserVerdict = {
-  level: 'strong' | 'watch' | 'weak';
-  title: string;
-  score: number;
-  summary: string;
-  reasons: string[];
-  risks: string[];
-  nextSteps: string[];
-  leadingStrategy?: StrategyDetailCard;
-};
-
-type ReliabilityStatus = 'good' | 'warn' | 'bad' | 'neutral';
-
-type ReliabilityCheck = {
-  label: string;
-  value: string;
-  detail: string;
-  status: ReliabilityStatus;
-};
-
-type PlainFeatureRow = {
-  feature: string;
-  name: string;
-  explanation: string;
-  importance: number;
-  directionText: string;
-  source?: string;
-  rankIc?: number;
-};
-
-type StressCard = {
-  scenario: FactorLabStressScenario;
-  medianReturn?: number;
-  downsideReturn?: number;
-  upsideReturn?: number;
-  positiveChance?: number;
-  p95Drawdown?: number;
-  survivalRate?: number;
-};
-
-const STRATEGY_COPY: Record<string, { name: string; shortDesc: string; suitableFor: string }> = {
-  ml_factor_ranker: {
-    name: '排序策略',
-    shortDesc: '把候选股票按综合得分排队，优先拿最强的一组。',
-    suitableFor: '适合想先追求收益弹性、能接受一定波动的人。',
-  },
-  ml_factor_filter: {
-    name: '筛选策略',
-    shortDesc: '先排除质量不稳的标的，再从剩余股票里挑更稳的一组。',
-    suitableFor: '适合更在意回撤控制、希望组合更平滑的人。',
-  },
-};
-
-function formatValue(
-  value: number | string | null | undefined,
-  format: FactorLabMetricItem['format'] = 'number'
-): string {
-  if (value === null || value === undefined) return '--';
-  if (typeof value === 'string') return value;
-
-  if (format === 'percent') return `${(value * 100).toFixed(2)}%`;
-  if (format === 'integer') return Math.round(value).toString();
-  if (format === 'ratio') return value.toFixed(Math.abs(value) < 1 ? 3 : 2);
-  return value.toFixed(2);
-}
-
-function formatPercent(value: number | undefined): string {
-  if (value === undefined || Number.isNaN(value)) return '--';
-  return `${(value * 100).toFixed(2)}%`;
-}
-
-function formatAbsPercent(value: number | undefined): string {
-  if (value === undefined || Number.isNaN(value)) return '--';
-  return `${(Math.abs(value) * 100).toFixed(2)}%`;
-}
-
-function formatCompactNumber(value: number | undefined): string {
-  if (value === undefined || Number.isNaN(value)) return '--';
-  return new Intl.NumberFormat('zh-CN', {
-    notation: 'compact',
-    maximumFractionDigits: 1,
-  }).format(value);
-}
-
-function formatStrategyLabel(factor: string | undefined): string {
-  if (!factor) return '--';
-  return STRATEGY_COPY[factor]?.name ?? factor;
-}
-
-function formatScoreSource(source: string | undefined): string {
-  const map: Record<string, string> = {
-    walk_forward_composite_score: '滚动样本外综合分',
-    walk_forward_score: '滚动样本外模型分',
-    composite_score: '综合因子分',
-    ml_score: '机器学习分',
-    baseline_score: '基线模型分',
-    score: '模型分数',
-  };
-  return source ? (map[source] ?? source) : '后端未返回';
-}
-
-function formatModelBlend(result: FactorLabResult | null): string {
-  const recipe = result?.summary.model_recipe ?? result?.research_iteration?.model_recipe;
-  if (!recipe) return '融合比例后端未返回';
-  return `线性 ${formatPercent(recipe.baseline_weight)} / 非线性 ${formatPercent(recipe.nonlinear_weight)}`;
-}
-
-function formatOosState(value: boolean | undefined): string {
-  if (value === true) return '是';
-  if (value === false) return '否';
-  return '未返回';
-}
-
-function signalState(value: number | undefined): { label: string; active: boolean } {
-  if (value === 1) return { label: '触发', active: true };
-  if (value === 0 || value === undefined) return { label: '观察', active: false };
-  return { label: '未知', active: false };
-}
-
-function getFailureMessage(lastFailure: FactorLabFailureState | null | undefined): string {
-  if (!lastFailure) return '';
-  return lastFailure.detail || '';
-}
-
-function getFailureCode(lastFailure: FactorLabFailureState | null | undefined): string {
-  if (!lastFailure?.error_code) return '';
-  return lastFailure.error_code;
-}
-
-function getFailureConfig(lastFailure: FactorLabFailureState | null | undefined): Partial<FactorLabRunConfig> | null {
-  if (!lastFailure) return null;
-  return lastFailure.config ?? null;
-}
-
-function formatConfigSummary(config: Partial<FactorLabRunConfig> | null | undefined): string {
-  if (!config) return '--';
-  const poolLabel = config.pool
-    ? (factorLabPoolOptions.find((option) => option.value === config.pool)?.label ?? config.pool)
-    : null;
-  const parts = [
-    config.start_date ? `开始 ${config.start_date}` : null,
-    config.end_date ? `结束 ${config.end_date}` : null,
-    poolLabel ? `股票池 ${poolLabel}` : null,
-    config.top_n ? `Top ${config.top_n}` : null,
-    config.max_symbols ? `样本上限 ${config.max_symbols} 只` : null,
-  ].filter(Boolean);
-  return parts.length > 0 ? parts.join('，') : '--';
-}
-
-function explainFocusPoint(point: string): string {
-  const raw = point.trim();
-  const key = raw.toLowerCase();
-  const mapped: Record<string, string> = {
-    turnover: '更看重换手节奏是否稳定，避免组合频繁大换仓。',
-    turnover_stability: '更看重换手节奏是否稳定，避免组合频繁大换仓。',
-    drawdown: '重点盯回撤控制，防止收益不错但过程过于难熬。',
-    max_drawdown: '重点盯回撤控制，防止收益不错但过程过于难熬。',
-    cost: '重点看交易成本是否侵蚀收益。',
-    cost_drag: '重点看交易成本是否侵蚀收益。',
-    coverage: '重点看有效样本覆盖是否足够，避免结果只靠少量股票。',
-    win_rate: '重点看胜率是否稳定，不只看少数大赚样本。',
-    quality: '重点看信号质量是否稳定，避免一段时间失真。',
-    regime: '重点看不同市场环境下表现是否分化明显。',
-    liquidity: '重点看流动性约束，避免选到难成交的股票。',
-  };
-  return mapped[key] || raw;
-}
-
-function getReadinessMessages(readiness: FactorLabRunReadiness | null, checkingReadiness: boolean): string[] {
-  if (checkingReadiness) {
-    return ['正在检查本地数据完整性与可运行性。'];
-  }
-  if (!readiness) {
-    return ['暂未拿到本地数据检查结果，运行前会先做检查。'];
-  }
-  if (readiness.warning_message) {
-    return [readiness.warning_message];
-  }
-  if (readiness.needs_backfill) {
-    return ['本地数据仍有缺口，运行时会优先补齐缺失部分。'];
-  }
-  if (readiness.cache_window_start && readiness.cache_window_end) {
-    return [`本地缓存公共覆盖区间为 ${readiness.cache_window_start} 至 ${readiness.cache_window_end}，可以直接运行。`];
-  }
-  return ['运行前会先检查本地数据，确认是否需要补数。'];
-}
-
-function buildStrategyCards(displayedResult: FactorLabResult | null): StrategyDetailCard[] {
-  const strategyBacktests = (displayedResult?.strategy_backtests ?? {}) as Record<string, FactorLabStrategyBacktest>;
-  const range =
-    displayedResult?.summary.start_date && displayedResult?.summary.end_date
-      ? `${displayedResult.summary.start_date} ~ ${displayedResult.summary.end_date}`
-      : '--';
-  const sharedRunNote = displayedResult?.summary.research_note || '--';
-
-  return ['ml_factor_ranker', 'ml_factor_filter'].map((key) => {
-    const detail = strategyBacktests[key] ?? {};
-    const withCost = detail.with_cost ?? {};
-    const summary = withCost.summary ?? {};
-    const userView = detail.user_view;
-    const triggerText = userView
-      ? `${userView.trigger_days} 个交易日 / ${userView.total_trades} 笔交易`
-      : summary.total_trades !== undefined
-        ? `累计触发 ${summary.total_trades} 笔交易`
-        : '--';
-    const lastTriggerDate = userView?.last_signal_date || '--';
-    const recentHits = userView?.recent_signal_symbols ?? [];
-    const focusPoints = (userView?.focus_points ?? []).map(explainFocusPoint);
-
-    return {
-      key,
-      name: userView?.name_cn || STRATEGY_COPY[key].name,
-      shortDesc: userView?.description_cn || STRATEGY_COPY[key].shortDesc,
-      totalReturn: userView?.total_return ?? withCost.total_return,
-      winRate: userView?.win_rate ?? summary.win_rate,
-      triggerText,
-      lastTriggerDate,
-      maxDrawdown: userView?.max_drawdown ?? summary.max_drawdown,
-      annualReturn: userView?.annual_return ?? summary.annual_return,
-      costDrag: userView?.cost_drag?.total_return_diff ?? detail.cost_drag?.total_return_diff,
-      recentHits,
-      suitableFor: userView?.suitable_for ?? [STRATEGY_COPY[key].suitableFor],
-      backtestRange: range,
-      runNote: sharedRunNote,
-      focusPoints,
-    };
-  });
-}
-
-function clampScore(value: number): number {
-  return Math.max(0, Math.min(100, Math.round(value)));
-}
-
-function pickLeadingStrategy(cards: StrategyDetailCard[], preferredKey?: string): StrategyDetailCard | undefined {
-  const preferred = preferredKey ? cards.find((card) => card.key === preferredKey) : undefined;
-  if (preferred) return preferred;
-  return [...cards].sort((left, right) => (right.totalReturn ?? -Infinity) - (left.totalReturn ?? -Infinity))[0];
-}
-
-function buildUserVerdict(
-  result: FactorLabResult | null,
-  cards: StrategyDetailCard[],
-  currentReadiness: FactorLabRunReadiness | null
-): UserVerdict | null {
-  if (!result || cards.length === 0) return null;
-
-  const leadingStrategy = pickLeadingStrategy(cards, result.backtest_compare?.best_total_return_factor);
-  const totalReturn = leadingStrategy?.totalReturn ?? 0;
-  const winRate = leadingStrategy?.winRate ?? 0;
-  const drawdownAbs = Math.abs(leadingStrategy?.maxDrawdown ?? 0);
-  const costDrag = leadingStrategy?.costDrag ?? 0;
-  const coverage = result.summary.walk_forward?.coverage_ratio;
-  const trainSamples = result.summary.train_samples ?? result.summary.rows_sample;
-  const totalSymbols = result.summary.total_symbols;
-  const readiness = result.run_readiness ?? currentReadiness;
-
-  let score = 50;
-  score += totalReturn >= 0.08 ? 18 : totalReturn > 0 ? 8 : totalReturn <= -0.03 ? -18 : -8;
-  score += drawdownAbs <= 0.1 ? 12 : drawdownAbs <= 0.18 ? 4 : -12;
-  score += winRate >= 0.55 ? 8 : winRate >= 0.5 ? 3 : -6;
-  score += coverage === undefined ? 0 : coverage >= 0.85 ? 10 : coverage >= 0.65 ? 3 : -8;
-  score += trainSamples !== undefined && totalSymbols !== undefined && trainSamples >= 30000 && totalSymbols >= 100 ? 8 : 0;
-  score += costDrag > 0.025 ? -7 : costDrag > 0.012 ? -3 : 3;
-  if (readiness?.needs_backfill || readiness?.warning_message) score -= 6;
-
-  const normalizedScore = clampScore(score);
-  const level: UserVerdict['level'] =
-    totalReturn <= 0 || normalizedScore < 55 ? 'weak' : normalizedScore >= 72 && drawdownAbs <= 0.15 ? 'strong' : 'watch';
-  const title =
-    level === 'strong'
-      ? '可以进入小仓观察'
-      : level === 'watch'
-        ? '有观察价值，但先别放大仓位'
-        : '暂不建议直接使用';
-
-  const reasons = [
-    `含成本回测领先的是${leadingStrategy?.name ?? '当前策略'}，累计收益 ${formatPercent(totalReturn)}，年化 ${formatPercent(leadingStrategy?.annualReturn)}。`,
-    `样本覆盖 ${formatCompactNumber(totalSymbols)} 只股票、${formatCompactNumber(trainSamples)} 条训练样本，不是只看少数个案。`,
-    coverage !== undefined
-      ? `滚动验证覆盖率 ${formatPercent(coverage)}，用于判断模型在后续时间段是否还能工作。`
-      : '当前没有滚动验证覆盖率，结论需要再看专家模式里的时间稳定性。',
-  ];
-
-  const risks = [
-    totalReturn <= 0 ? '含成本收益还没有转正，不能只看胜率。' : '',
-    drawdownAbs >= 0.15 ? `过程中最大浮亏约 ${formatAbsPercent(leadingStrategy?.maxDrawdown)}，持有体验偏难受。` : '',
-    costDrag >= 0.02 ? `交易成本吃掉约 ${formatPercent(costDrag)}，频繁换仓会明显影响结果。` : '',
-    winRate < 0.5 ? `胜率 ${formatPercent(winRate)} 未过半，命中稳定性仍需复核。` : '',
-    readiness?.needs_backfill ? '本地数据存在补数动作，建议补齐后再复跑。' : '',
-  ].filter(Boolean);
-
-  const nextSteps =
-    level === 'weak'
-      ? ['先把它当作观察信号，不要直接接入自动交易。', '优先看分层收益和特征解释，确认高分股票是否真的更好。', '用核心池和全市场各复跑一次，排除样本选择带来的误判。']
-      : level === 'watch'
-        ? ['可先放进实盘模拟的小仓观察组。', '连续复跑几次，确认最近信号和成本拖累没有恶化。', '重点跟踪最大回撤，一旦扩大就暂停。']
-        : ['可以进入小仓实盘模拟验证。', '保留个股止损，必要时启用个股止盈，不要因为回测好就放松风控。', '每次数据更新后复查结论是否降级。'];
-
-  return {
-    level,
-    title,
-    score: normalizedScore,
-    summary: `这不是在预测某只股票一定上涨，而是在检查一套“给股票打分再排序”的规则是否有用。本次结论：${title}。`,
-    reasons,
-    risks: risks.length > 0 ? risks : ['暂未看到特别突出的单项风险，但仍需要继续观察真实信号。'],
-    nextSteps,
-    leadingStrategy,
-  };
-}
-
-function buildReliabilityChecks(
-  result: FactorLabResult | null,
-  currentReadiness: FactorLabRunReadiness | null
-): ReliabilityCheck[] {
-  if (!result) return [];
-  const readiness = result.run_readiness ?? currentReadiness;
-  const coverage = result.summary.walk_forward?.coverage_ratio;
-  const trainSamples = result.summary.train_samples ?? result.summary.rows_sample;
-  const totalSymbols = result.summary.total_symbols;
-  const sourceValues = Object.values(result.data_sources_used ?? {});
-  const sourceCounts = sourceValues.reduce<Record<string, number>>((acc, source) => {
-    acc[source] = (acc[source] ?? 0) + 1;
-    return acc;
-  }, {});
-  const sourceSummary = Object.entries(sourceCounts)
-    .map(([source, count]) => `${source} ${count}只`)
-    .join(' / ');
-  const bucketSpread =
-    result.bucket_returns.length >= 2
-      ? result.bucket_returns[result.bucket_returns.length - 1].return - result.bucket_returns[0].return
-      : undefined;
-  const leading = pickLeadingStrategy(buildStrategyCards(result), result.backtest_compare?.best_total_return_factor);
-  const drawdownAbs = Math.abs(leading?.maxDrawdown ?? 0);
-  const costDrag = leading?.costDrag;
-
-  return [
-    {
-      label: '样本是否够多',
-      value: `${formatCompactNumber(totalSymbols)} 只 / ${formatCompactNumber(trainSamples)} 条`,
-      detail: '样本越多，越不容易被一两只股票的偶然表现带偏。',
-      status: trainSamples !== undefined && trainSamples >= 30000 && (totalSymbols ?? 0) >= 100 ? 'good' : 'warn',
-    },
-    {
-      label: '是否做过滚动验证',
-      value: coverage !== undefined ? formatPercent(coverage) : '--',
-      detail: '滚动验证是在后面的时间段继续打分，能减少“只会解释历史”的问题。',
-      status: coverage === undefined ? 'neutral' : coverage >= 0.8 ? 'good' : coverage >= 0.6 ? 'warn' : 'bad',
-    },
-    {
-      label: '高分组是否更强',
-      value: bucketSpread !== undefined ? formatPercent(bucketSpread) : '--',
-      detail: '如果高分组没有明显跑赢低分组，说明打分规则的区分度还不够。',
-      status: bucketSpread === undefined ? 'neutral' : bucketSpread > 0.01 ? 'good' : bucketSpread > 0 ? 'warn' : 'bad',
-    },
-    {
-      label: '回撤是否可承受',
-      value: leading ? formatAbsPercent(leading.maxDrawdown) : '--',
-      detail: '最大回撤表示过程中最难受的浮亏幅度，比单看收益更接近真实体验。',
-      status: drawdownAbs <= 0.1 ? 'good' : drawdownAbs <= 0.18 ? 'warn' : 'bad',
-    },
-    {
-      label: '交易成本是否敏感',
-      value: costDrag !== undefined ? formatPercent(costDrag) : '--',
-      detail: '成本越高，越说明策略依赖频繁交易，真实执行时要更谨慎。',
-      status: costDrag === undefined ? 'neutral' : costDrag <= 0.012 ? 'good' : costDrag <= 0.025 ? 'warn' : 'bad',
-    },
-    {
-      label: '数据来源是否清楚',
-      value: sourceSummary || (readiness?.cache_window_start && readiness.cache_window_end ? '本地缓存' : '--'),
-      detail: readiness?.needs_backfill
-        ? '这次运行需要补齐数据，补齐前结论要降一档看。'
-        : '展示数据来源可以避免把模拟或缺失数据当成真实结果。',
-      status: readiness?.needs_backfill || readiness?.warning_message ? 'warn' : sourceSummary ? 'good' : 'neutral',
-    },
-  ];
-}
-
-function formatFactorPlainName(feature: string): string {
-  const normalized = feature.toLowerCase();
-  const exact: Record<string, string> = {
-    open_gap: '开盘跳空',
-    intraday_ret: '日内涨跌',
-    ma_gap_20d: '20日均线距离',
-    drawdown_20d: '20日回撤',
-    amplitude: '振幅',
-    turnover_rate: '换手率',
-    turnover_z20: '换手异常度',
-    amount_ratio_20d: '成交额变化',
-    relative_strength_20d: '相对强弱',
-    market_breadth_20d: '市场广度',
-    market_ret_1d: '大盘当日表现',
-    value_pe: '市盈率估值',
-    value_pb: '市净率估值',
-    value_ps: '市销率估值',
-    value_pcf: '现金流估值',
-  };
-  if (exact[normalized]) return exact[normalized];
-  if (/^mom_\d+d/.test(normalized)) return `${normalized.match(/\d+/)?.[0] ?? ''}日价格动量`;
-  if (/^reversal_\d+d/.test(normalized)) return `${normalized.match(/\d+/)?.[0] ?? ''}日反转`;
-  if (/^volatility_\d+d/.test(normalized)) return `${normalized.match(/\d+/)?.[0] ?? ''}日波动率`;
-  if (/^volume_ratio_\d+d/.test(normalized)) return `${normalized.match(/\d+/)?.[0] ?? ''}日成交量变化`;
-  if (normalized.endsWith('_rank')) return `${formatFactorPlainName(normalized.replace(/_rank$/, ''))}排名`;
-  return feature.replace(/_/g, ' ');
-}
-
-function explainFeature(feature: string): string {
-  const normalized = feature.toLowerCase();
-  if (normalized.includes('mom') || normalized.includes('relative_strength')) return '看股票最近是不是比其他股票更强。';
-  if (normalized.includes('reversal')) return '看短期下跌后是否有反弹特征。';
-  if (normalized.includes('volatility') || normalized.includes('amplitude')) return '看价格波动是否过大或过小。';
-  if (normalized.includes('turnover') || normalized.includes('volume') || normalized.includes('amount')) return '看成交是否活跃，避免信号只停留在纸面上。';
-  if (normalized.includes('value') || normalized.includes('pe') || normalized.includes('pb')) return '看价格相对基本面是否便宜或昂贵。';
-  if (normalized.includes('gap') || normalized.includes('intraday')) return '看当天开盘和盘中价格行为是否透露短期情绪。';
-  if (normalized.includes('market')) return '看整体市场环境是否支持这个信号。';
-  return '模型认为这个指标对股票排序有解释力。';
-}
-
-function buildPlainFeatureRows(result: FactorLabResult | null): PlainFeatureRow[] {
-  if (!result) return [];
-  if (result.factor_weights?.length) {
-    return [...result.factor_weights]
-      .sort((left, right) => right.weight - left.weight)
-      .slice(0, 6)
-      .map((item) => ({
-        feature: item.feature,
-        name: item.name_cn || formatFactorPlainName(item.feature),
-        explanation: item.explanation || explainFeature(item.feature),
-        importance: item.weight,
-        directionText: item.direction_text || (item.direction === 'short' ? '数值偏低时更有利' : '数值偏高时更有利'),
-        source: item.source,
-        rankIc: item.rank_ic,
-      }));
-  }
-  return [...result.feature_importance]
-    .sort((left, right) => right.importance - left.importance)
-    .slice(0, 5)
-    .map((item) => ({
-      feature: item.feature,
-      name: formatFactorPlainName(item.feature),
-      explanation: explainFeature(item.feature),
-      importance: item.importance,
-      directionText: item.direction === 'negative' ? '数值偏低时更有利' : '数值偏高时更有利',
-      source: '模型特征重要性',
-      rankIc: undefined,
-    }));
-}
-
-function getReliabilityTone(status: ReliabilityStatus): string {
-  const tones: Record<ReliabilityStatus, string> = {
-    good: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100',
-    warn: 'border-amber-500/20 bg-amber-500/10 text-amber-100',
-    bad: 'border-rose-500/20 bg-rose-500/10 text-rose-100',
-    neutral: 'border-slate-700/40 bg-slate-950/20 text-slate-200',
-  };
-  return tones[status];
-}
-
-function getVerdictTone(level: UserVerdict['level']): string {
-  const tones: Record<UserVerdict['level'], string> = {
-    strong: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100',
-    watch: 'border-cyan-500/20 bg-cyan-500/10 text-cyan-100',
-    weak: 'border-amber-500/20 bg-amber-500/10 text-amber-100',
-  };
-  return tones[level];
-}
-
-function getCandidateStatusLabel(status: string | undefined): string {
-  const labels: Record<string, string> = {
-    production: '当前生产规则',
-    draft: '待验证候选',
-    research_pass: '研究层通过',
-    shadow: '影子观察',
-    approved: '已审批',
-    active: '已纳入',
-    retired: '已回滚',
-    rejected: '已拒绝',
-    ready_to_promote: '可提升候选',
-    research_only: '研究观察',
-    no_promotion: '暂不晋级',
-    promoted: '本轮入模',
-    watch: '观察候选',
-    skipped: '样本不足',
-    tested_this_run: '本轮已测',
-    included_this_run: '本轮入模',
-  };
-  return labels[status ?? ''] ?? (status || '--');
-}
-
-function getPromotionTone(status: string | undefined): string {
-  if (status === 'active' || status === 'approved') return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100';
-  if (status === 'shadow') return 'border-cyan-500/20 bg-cyan-500/10 text-cyan-100';
-  if (status === 'research_pass') return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100';
-  if (status === 'no_promotion') return 'border-amber-500/20 bg-amber-500/10 text-amber-100';
-  if (status === 'retired' || status === 'rejected') return 'border-slate-700/40 bg-slate-950/20 text-slate-300';
-  return 'border-slate-700/40 bg-slate-950/20 text-slate-200';
-}
-
-function getScenarioTone(scenario: string): string {
-  if (scenario === 'bull') return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-100';
-  if (scenario === 'bear') return 'border-rose-500/20 bg-rose-500/10 text-rose-100';
-  return 'border-cyan-500/20 bg-cyan-500/10 text-cyan-100';
-}
-
-function getScenarioPlainText(scenario: string): string {
-  if (scenario === 'bull') return '假设市场整体偏强，重点看策略能否跟上机会。';
-  if (scenario === 'bear') return '假设市场整体走弱，重点看回撤和生存率。';
-  return '假设市场来回震荡，重点看是否被成本和换手磨损。';
-}
-
-function buildStressCards(result: FactorLabResult | null, leadingFactor?: string): StressCard[] {
-  const stressTest = result?.stress_test;
-  if (!stressTest?.scenarios?.length) return [];
-  const preferredFactor = leadingFactor || result?.backtest_compare?.best_total_return_factor || 'ml_factor_ranker';
-  return stressTest.scenarios.map((scenario) => {
-    const stats = scenario.factors[preferredFactor] ?? scenario.factors.ml_factor_ranker ?? Object.values(scenario.factors)[0] ?? {};
-    return {
-      scenario,
-      medianReturn: stats.median_total_return,
-      downsideReturn: stats.p05_total_return,
-      upsideReturn: stats.p95_total_return,
-      positiveChance: stats.prob_positive,
-      p95Drawdown: stats.p95_max_drawdown_abs,
-      survivalRate: stats.survival_rate,
-    };
-  });
-}
-
-function getSelfIterationSummary(iteration: FactorLabSelfIteration | null | undefined): string {
-  if (!iteration) return '还没有生成自我复盘结果。';
-  const decision = iteration.promotion_decision?.decision || '当前规则继续保留。';
-  const evidence = iteration.evidence?.score !== undefined ? `证据完整度 ${Math.round(iteration.evidence.score)}/100。` : '';
-  return `${decision}${evidence ? ` ${evidence}` : ''}`;
-}
-
-function formatVersionShort(versionId: string | undefined | null): string {
-  if (!versionId) return '--';
-  if (versionId.length <= 28) return versionId;
-  return `${versionId.slice(0, 18)}…${versionId.slice(-8)}`;
-}
-
-function getLifecycleTitle(lifecycle: FactorLabStrategyLifecycle | null | undefined): string {
-  const status = lifecycle?.status;
-  if (!status) return '策略版本状态待同步';
-  if (status === 'active') return '已有 Factor Lab 版本纳入原策略';
-  if (status === 'approved') return '候选版本已审批，等待切换';
-  if (status === 'shadow') return '候选版本正在影子观察';
-  if (status === 'research_pass') return '研究层通过，建议进入影子观察';
-  if (status === 'ready_to_promote') return '本轮实验可提升为候选版本';
-  return '当前仍是研究结果，未影响原策略';
-}
-
-function getVersionActionLabel(version: StrategyVersionRecord): string {
-  if (version.status === 'research_pass') return '启动影子观察';
-  if (version.status === 'shadow') return '申请审批';
-  if (version.status === 'approved') return '切换活动版本';
-  if (version.status === 'active') return '当前已纳入';
-  return '等待验证';
-}
-
-function getLifecycleStatusLabel(lifecycle: FactorLabStrategyLifecycle | null | undefined): string {
-  if (!lifecycle?.status) return '待同步';
-  return getCandidateStatusLabel(lifecycle.status);
-}
-
-function getGateRows(version: StrategyVersionRecord | null): { label: string; passed: boolean | undefined; value: string }[] {
-  if (!version) return [];
-  return [
-    { label: '样本外 RankIC', passed: version.gates.oos_rank_ic_positive, value: formatValue(version.metrics.test_rank_ic, 'ratio') },
-    { label: '含成本收益', passed: version.gates.with_cost_return_positive, value: formatPercent(version.metrics.with_cost_total_return) },
-    { label: '最大回撤', passed: version.gates.max_drawdown_ok, value: formatAbsPercent(version.metrics.max_drawdown_abs) },
-    { label: '成本拖累', passed: version.gates.cost_drag_ok, value: formatPercent(version.metrics.cost_drag) },
-    { label: '压力测评', passed: version.gates.stress_test_passed, value: version.metrics.stress_gate_passed ? '通过' : '未通过' },
-    { label: '影子观察', passed: version.gates.shadow_min_observation_passed, value: `${version.shadow?.observation_days ?? version.gates.shadow_observation_days ?? 0} 天` },
-  ];
-}
-
-function getIterationStatusLabel(iteration: StrategyVersionIteration | null | undefined): string {
-  if (!iteration) return '未生成';
-  if (iteration.status === 'planned') return '已生成计划';
-  if (iteration.status === 'running') return '执行中';
-  if (iteration.status === 'completed') return '已完成';
-  return iteration.status || '待处理';
-}
-
-function getIterationActionText(action: StrategyVersionIteration['actions'][number]): string {
-  return action.label || action.type || '继续验证';
-}
-
-export function FactorLab() {
-  const [config, setConfig] = useState<FactorLabRunConfig>({
+export function FactorLab({ defaultEndDate = '' }: { defaultEndDate?: string }) {
+  const [storedConfig, setConfig] = useState<FactorLabRunConfig>({
     start_date: DEFAULT_START_DATE,
-    end_date: DEFAULT_END_DATE,
+    end_date: defaultEndDate,
     pool: 'core',
     label: 'next_5d_ret',
     top_n: 5,
     max_symbols: 300,
   });
+  const config = useMemo(() => ({...storedConfig,end_date:storedConfig.end_date || defaultEndDate}), [storedConfig,defaultEndDate]);
   const factorLabState = useFactorLab(config);
 
   const {
@@ -684,6 +67,7 @@ export function FactorLab() {
   const [expandedCards, setExpandedCards] = useState<Record<string, boolean>>(DEFAULT_EXPANDED);
 
   const displayedResult = result ?? latestRealResult;
+  const {featureImportanceOption,bucketReturnOption,stressPathOption} = useFactorCharts(displayedResult);
   const displayedRunConfig = useMemo<FactorLabRunConfig>(() => {
     const summary = displayedResult?.summary;
     if (!summary) return config;
@@ -698,6 +82,8 @@ export function FactorLab() {
       label: summary.label || config.label,
       top_n: summary.top_n || config.top_n,
       max_symbols: summary.max_symbols ?? config.max_symbols,
+      enable_hist_gradient_boosting: summary.enable_hist_gradient_boosting ?? false,
+      price_mode: summary.price_mode === 'approximate_adjusted' ? 'approximate_adjusted' : 'strict_raw',
     };
   }, [config, displayedResult?.summary]);
   useEffect(() => {
@@ -716,6 +102,8 @@ export function FactorLab() {
           top_n: summary.top_n || prev.top_n,
           max_symbols: summary.max_symbols ?? prev.max_symbols,
           label: summary.label || prev.label,
+          enable_hist_gradient_boosting: summary.enable_hist_gradient_boosting ?? false,
+          price_mode: summary.price_mode === 'approximate_adjusted' ? 'approximate_adjusted' : 'strict_raw',
         };
         if (
           nextConfig.start_date === prev.start_date &&
@@ -723,6 +111,8 @@ export function FactorLab() {
           nextConfig.pool === prev.pool &&
           nextConfig.top_n === prev.top_n &&
           nextConfig.max_symbols === prev.max_symbols &&
+          nextConfig.enable_hist_gradient_boosting === prev.enable_hist_gradient_boosting &&
+          nextConfig.price_mode === prev.price_mode &&
           nextConfig.label === prev.label
         ) {
           return prev;
@@ -739,7 +129,7 @@ export function FactorLab() {
   const showFailureBanner = Boolean(failureMessage);
   const readinessMessages = getReadinessMessages(readiness, checkingReadiness);
   const needsBackfill = Boolean(readiness?.needs_backfill);
-  const dateRangeInvalid = Boolean(config.start_date && config.end_date && config.start_date > config.end_date);
+  const dateRangeInvalid = !config.start_date || !config.end_date || config.start_date > config.end_date;
   const runningStatus = checkingReadiness
     ? '检查本地数据'
     : loadingAction === 'run'
@@ -748,98 +138,9 @@ export function FactorLab() {
         ? '三行情景测评中'
         : null;
 
-  const featureImportanceOption = useMemo(() => {
-    if (!displayedResult) return {};
-    const sorted = [...displayedResult.feature_importance]
-      .sort((left, right) => right.importance - left.importance)
-      .slice(0, 8)
-      .reverse();
 
-    return {
-      backgroundColor: 'transparent',
-      tooltip: {
-        trigger: 'axis',
-        axisPointer: { type: 'shadow' },
-	        formatter: (params: Array<{ name?: string; value: number }>) => {
-	          const point = params[0];
-	          return `${escapeHtml(point.name)}<br/>重要性: ${(point.value * 100).toFixed(1)}%`;
-	        },
-      },
-      grid: { left: '4%', right: '6%', bottom: '5%', top: '5%', containLabel: true },
-      xAxis: {
-        type: 'value',
-        axisLine: { show: false },
-        axisLabel: { color: '#94a3b8', formatter: (value: number) => `${(value * 100).toFixed(0)}%` },
-        splitLine: { lineStyle: { color: '#0d2244', type: 'dashed' } },
-      },
-      yAxis: {
-        type: 'category',
-        data: sorted.map((item) => item.feature),
-        axisLine: { lineStyle: { color: '#334155' } },
-        axisLabel: { color: '#cbd5e1', fontSize: 11 },
-      },
-      series: [
-        {
-          type: 'bar',
-          data: sorted.map((item) => ({
-            value: item.importance,
-            itemStyle: {
-              color: item.direction === 'negative' ? '#22c55e' : '#38bdf8',
-              borderRadius: [10, 10, 10, 10],
-            },
-          })),
-          barWidth: 12,
-        },
-      ],
-    };
-  }, [displayedResult]);
 
-  const bucketReturnOption = useMemo(() => {
-    if (!displayedResult) return {};
-    return {
-      backgroundColor: 'transparent',
-      tooltip: {
-        trigger: 'axis',
-	        axisPointer: { type: 'shadow' },
-	        formatter: (params: Array<{ marker?: string; seriesName?: string; value: number; name?: string }>) => {
-	          const rows = params
-	            .map((point) => `${point.marker || ''} ${escapeHtml(point.seriesName)}: ${(point.value * 100).toFixed(2)}%`)
-	            .join('<br/>');
-	          return `${escapeHtml(params[0]?.name || '')}<br/>${rows}`;
-	        },
-      },
-      legend: { textStyle: { color: '#94a3b8' }, top: 0 },
-      grid: { left: '4%', right: '4%', bottom: '5%', top: '15%', containLabel: true },
-      xAxis: {
-        type: 'category',
-        data: displayedResult.bucket_returns.map((item) => item.bucket),
-        axisLine: { lineStyle: { color: '#334155' } },
-        axisLabel: { color: '#94a3b8' },
-      },
-      yAxis: {
-        type: 'value',
-        axisLine: { show: false },
-        axisLabel: { color: '#94a3b8', formatter: (value: number) => `${(value * 100).toFixed(0)}%` },
-        splitLine: { lineStyle: { color: '#0d2244', type: 'dashed' } },
-      },
-      series: [
-        {
-          name: '分桶收益',
-          type: 'bar',
-          data: displayedResult.bucket_returns.map((item) => item.return),
-          itemStyle: { color: '#38bdf8', borderRadius: [10, 10, 0, 0] },
-          barWidth: 18,
-        },
-        {
-          name: '超额收益',
-          type: 'bar',
-          data: displayedResult.bucket_returns.map((item) => item.excess_return ?? 0),
-          itemStyle: { color: '#818cf8', borderRadius: [10, 10, 0, 0] },
-          barWidth: 18,
-        },
-      ],
-    };
-  }, [displayedResult]);
+
 
   const selfIteration = displayedResult?.self_iteration ?? null;
   const lifecycle = displayedResult?.strategy_lifecycle ?? null;
@@ -854,54 +155,7 @@ export function FactorLab() {
     () => buildStressCards(displayedResult, displayedResult?.backtest_compare?.best_total_return_factor),
     [displayedResult]
   );
-  const stressPathOption = useMemo(() => {
-    const stressTest = displayedResult?.stress_test;
-    if (!stressTest?.scenarios?.length) return {};
-    const series = stressTest.scenarios.flatMap((scenario) =>
-      (scenario.sample_paths ?? [])
-        .filter((path) => path.factor === (displayedResult?.backtest_compare?.best_total_return_factor || 'ml_factor_ranker'))
-        .slice(0, 1)
-        .map((path) => ({
-          name: scenario.name_cn,
-          type: 'line',
-          smooth: true,
-          showSymbol: false,
-          data: path.history.map((point) => [point.date, point.total_value]),
-        }))
-    );
-    return {
-      backgroundColor: 'transparent',
-      tooltip: {
-        trigger: 'axis',
-        formatter: (params: Array<{ marker?: string; seriesName?: string; value?: [string, number] | number; name?: string }>) => {
-          if (!params.length) return '';
-          const firstValue = params[0]?.value;
-          const label = params[0]?.name || (Array.isArray(firstValue) ? firstValue[0] : '');
-          const rows = params
-            .map((point) => {
-              const rawValue = Array.isArray(point.value) ? point.value[1] : point.value;
-              return `${point.marker || ''} ${escapeHtml(point.seriesName || '')}: ${Number(rawValue || 0).toLocaleString('zh-CN')}`;
-            })
-            .join('<br/>');
-          return `${escapeHtml(label)}<br/>${rows}`;
-        },
-      },
-      legend: { textStyle: { color: '#94a3b8' }, top: 0 },
-      grid: { left: '4%', right: '4%', bottom: '8%', top: '15%', containLabel: true },
-      xAxis: {
-        type: 'time',
-        axisLine: { lineStyle: { color: '#334155' } },
-        axisLabel: { color: '#94a3b8' },
-      },
-      yAxis: {
-        type: 'value',
-        axisLine: { show: false },
-        axisLabel: { color: '#94a3b8' },
-        splitLine: { lineStyle: { color: '#0d2244', type: 'dashed' } },
-      },
-      series,
-    };
-  }, [displayedResult]);
+
 
   const displayedMetrics = displayedResult?.model_metrics.slice(0, 6) ?? [];
   const walkForward = displayedResult?.summary.walk_forward;
@@ -938,18 +192,21 @@ export function FactorLab() {
 
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
+      {displayedResult?.summary.price_mode === 'approximate_adjusted' && <div role="status" className="rounded-xl bg-amber-950/30 p-3 text-amber-200">当前结果使用近似复权价格；可用于研究比较，不可用于新版模拟账户。</div>}
+      <label className="block text-xs text-amber-200"><input type="checkbox" checked={config.price_mode === 'approximate_adjusted'} onChange={e => setConfig(prev => ({...prev, price_mode: e.target.checked ? 'approximate_adjusted' : 'strict_raw'}))}/> 使用近似复权数据研究（产物不可用于新版模拟账户）</label>
+      <div className="rounded-xl border border-amber-900/40 p-3 text-sm text-amber-200">因子成绩以滚动样本外窗口为准。旧评估产物需重新运行才能用于新版账户；窗口不足160个交易日时不会生成有效研究成绩。</div>
       <section
-        className="rounded-[2.5rem] p-8 backdrop-blur-xl shadow-2xl space-y-6"
+        className="rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-6"
         style={{ background: 'rgba(13, 27, 50, 0.55)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
       >
-        <div className="flex flex-col xl:flex-row gap-8 xl:items-start xl:justify-between">
+        <div className="flex flex-col xl:flex-row gap-4 xl:items-start xl:justify-between">
           <div className="max-w-3xl space-y-5">
             <div className="flex items-center gap-4">
-              <div className={cn('p-4 rounded-3xl', colorMap[factorLabStrategyMeta.color]?.textBg, colorMap[factorLabStrategyMeta.color]?.text)}>
+              <div className={cn('p-4 rounded-panel', colorMap[factorLabStrategyMeta.color]?.textBg, colorMap[factorLabStrategyMeta.color]?.text)}>
                 <BrainCircuit className="w-8 h-8" />
               </div>
               <div>
-                <h2 className="text-2xl font-black tracking-tight text-slate-100">
+                <h2 className="text-lg font-semibold tracking-tight text-slate-100">
                   {expertMode ? 'Factor Lab / 因子实验室' : '策略体检报告'}
                 </h2>
                 <p className="text-sm text-slate-400 mt-1">
@@ -997,33 +254,10 @@ export function FactorLab() {
               </button>
             </div>
 
-            <div className="rounded-3xl border border-amber-400/20 bg-amber-400/10 p-4 space-y-3">
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="inline-flex items-center gap-2 text-sm font-semibold text-amber-100">
-                  <ShieldCheck className="w-4 h-4" />
-                  数据准备情况
-                </div>
-                {runningStatus && (
-                  <span className="inline-flex items-center gap-2 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-3 py-1 text-xs font-semibold text-cyan-100">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    {runningStatus}
-                  </span>
-                )}
-                {needsBackfill && (
-                  <span className="inline-flex rounded-full border border-amber-300/20 bg-amber-300/10 px-3 py-1 text-xs font-semibold text-amber-100">
-                    包含历史补数，可能较慢
-                  </span>
-                )}
-              </div>
-              <div className="space-y-2 text-sm text-amber-50/90">
-                {readinessMessages.map((message) => (
-                  <p key={message}>{message}</p>
-                ))}
-              </div>
-            </div>
+            <FactorTaskState runningStatus={runningStatus} needsBackfill={needsBackfill} readinessMessages={readinessMessages}/>
             <div
               className={cn(
-                'rounded-3xl border p-4 space-y-2',
+                'rounded-panel border p-4 space-y-2',
                 artifactStatusReady
                   ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-50'
                   : 'border-amber-400/20 bg-amber-400/10 text-amber-50'
@@ -1050,7 +284,7 @@ export function FactorLab() {
             </div>
             {dateRangeInvalid && (
               <div className="rounded-2xl border border-rose-500/20 bg-rose-500/10 p-4 text-sm text-rose-100">
-                开始日期不能晚于结束日期。
+                请填写有效的起止日期，开始日期不能晚于结束日期。
               </div>
             )}
             {notice && !showFailureBanner && (
@@ -1060,124 +294,12 @@ export function FactorLab() {
             )}
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 xl:max-w-3xl w-full">
-            <div className="rounded-3xl p-5 space-y-4" style={{ background: 'rgba(8, 18, 36, 0.72)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.12)' }}>
-              <div className="flex items-center gap-2 text-blue-300">
-                <Calendar className="w-4 h-4" />
-                <span className="text-[11px] font-bold tracking-[0.16em]">回看时间</span>
-              </div>
-              <div className="space-y-3">
-                <div>
-                  <label className="text-[10px] font-bold tracking-wider text-slate-400">开始日期</label>
-                  <input
-                    type="date"
-                    value={config.start_date}
-                    min={DEFAULT_START_DATE}
-                    max={DEFAULT_END_DATE}
-                    onChange={(event) => setConfig((prev) => ({ ...prev, start_date: event.target.value }))}
-                    className="w-full mt-1 rounded-xl px-3 py-2.5 text-xs focus:ring-1 focus:ring-blue-500 outline-none text-slate-200 font-mono"
-                    style={{ background: 'rgba(13, 27, 50, 0.72)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.12)' }}
-                  />
-                </div>
-                <div>
-                  <label className="text-[10px] font-bold tracking-wider text-slate-400">结束日期</label>
-                  <input
-                    type="date"
-                    value={config.end_date}
-                    min={DEFAULT_START_DATE}
-                    max={DEFAULT_END_DATE}
-                    onChange={(event) => setConfig((prev) => ({ ...prev, end_date: event.target.value }))}
-                    className="w-full mt-1 rounded-xl px-3 py-2.5 text-xs focus:ring-1 focus:ring-blue-500 outline-none text-slate-200 font-mono"
-                    style={{ background: 'rgba(13, 27, 50, 0.72)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.12)' }}
-                  />
-                </div>
-                <p className="text-[11px] leading-relaxed text-slate-500">
-                  时间拉得更长，能看到策略在不同市场阶段里的表现；运行前会自动检查是否需要补数。
-                </p>
-              </div>
-            </div>
-
-            <div className="rounded-3xl p-5 space-y-3" style={{ background: 'rgba(8, 18, 36, 0.72)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.12)' }}>
-              <div className="flex items-center gap-2 text-cyan-300">
-                <Database className="w-4 h-4" />
-                <span className="text-[11px] font-bold tracking-[0.16em]">股票池范围</span>
-              </div>
-              <div className="space-y-2">
-                {factorLabPoolOptions.map((option) => {
-                  const accent = colorMap[option.accent];
-                  const selected = config.pool === option.value;
-                  return (
-                    <button
-                      key={option.value}
-                      type="button"
-                      onClick={() => setConfig((prev) => ({ ...prev, pool: option.value as FactorLabRunConfig['pool'] }))}
-                      className={cn(
-                        'w-full rounded-2xl px-4 py-3 text-left border transition-all',
-                        selected ? `${accent?.textBg} ${accent?.text} ${accent?.border}` : 'border-slate-700/40 text-slate-400 hover:text-slate-200 hover:bg-white/5'
-                      )}
-                    >
-                      <div className="text-xs font-bold">{option.label}</div>
-                      <div className="text-[10px] mt-1 opacity-80">{option.description}</div>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="rounded-3xl p-5 space-y-4" style={{ background: 'rgba(8, 18, 36, 0.72)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.12)' }}>
-              <div className="flex items-center gap-2 text-violet-300">
-                <BarChart3 className="w-4 h-4" />
-                <span className="text-[11px] font-bold tracking-[0.16em]">持仓数量</span>
-              </div>
-              <div>
-                <label className="text-[10px] font-bold tracking-wider text-slate-400">每次保留前几只股票</label>
-                <div className="grid grid-cols-4 gap-2 mt-2">
-                  {TOP_N_OPTIONS.map((option) => (
-                    <button
-                      key={option}
-                      type="button"
-                      onClick={() => setConfig((prev) => ({ ...prev, top_n: option }))}
-                      className={cn(
-                        'rounded-xl py-2 text-[10px] font-bold transition-all border',
-                        config.top_n === option ? 'bg-cyan-500/20 text-cyan-200 border-cyan-500/40' : 'border-slate-700/40 text-slate-400 hover:text-slate-200 hover:bg-white/5'
-                      )}
-                    >
-                      Top {option}
-                    </button>
-                  ))}
-                </div>
-                <p className="text-[11px] leading-relaxed text-slate-500 mt-3">
-                  数量越少，组合更集中；数量越多，波动通常会更平滑。
-                </p>
-              </div>
-              <div>
-                <label className="text-[10px] font-bold tracking-wider text-slate-400">研究样本预算</label>
-                <div className="grid grid-cols-3 gap-2 mt-2">
-                  {SAMPLE_SIZE_OPTIONS.map((option) => (
-                    <button
-                      key={option}
-                      type="button"
-                      onClick={() => setConfig((prev) => ({ ...prev, max_symbols: option }))}
-                      className={cn(
-                        'rounded-xl py-2 text-[10px] font-bold transition-all border',
-                        config.max_symbols === option ? 'bg-violet-500/20 text-violet-200 border-violet-500/40' : 'border-slate-700/40 text-slate-400 hover:text-slate-200 hover:bg-white/5'
-                      )}
-                    >
-                      {option} 只
-                    </button>
-                  ))}
-                </div>
-                <p className="text-[11px] leading-relaxed text-slate-500 mt-3">
-                  全市场会先从本地数据湖做轻量预筛，再把预算内样本送进深度因子实验。
-                </p>
-              </div>
-            </div>
-          </div>
+          <ConfigPanel config={config} onChange={patch=>setConfig(prev=>({...prev,...patch}))} dateRangeInvalid={dateRangeInvalid}/>
         </div>
       </section>
 
       {showFailureBanner && hasHistoricalResult && (
-        <section className="rounded-[2rem] border border-rose-500/20 bg-rose-500/10 p-6 text-sm text-rose-100 space-y-3">
+        <section className="rounded-panel border border-rose-500/20 bg-rose-500/10 p-4 text-sm text-rose-100 space-y-3">
           <div className="flex items-center gap-2 font-semibold">
             <AlertTriangle className="w-4 h-4" />
             本次体检失败，当前展示的是上次真实报告
@@ -1190,7 +312,7 @@ export function FactorLab() {
       )}
 
       {!hasHistoricalResult && showFailureBanner && (
-        <section className="rounded-[2.5rem] p-10 backdrop-blur-xl shadow-2xl text-center space-y-4" style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(239, 68, 68, 0.16)' }}>
+        <section className="rounded-panel p-5 backdrop-blur-xl shadow-panel text-center space-y-4" style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(239, 68, 68, 0.16)' }}>
           <AlertTriangle className="w-10 h-10 mx-auto text-rose-300" />
           <div className="text-xl font-bold text-slate-100">当前没有可展示的真实结果</div>
           {failureCode && <div className="text-sm text-rose-200">错误码：{failureCode}</div>}
@@ -1201,7 +323,7 @@ export function FactorLab() {
       )}
 
       {!hasHistoricalResult && !showFailureBanner && !loading && (
-        <section className="rounded-[2.5rem] p-10 backdrop-blur-xl shadow-2xl text-center space-y-4" style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}>
+        <section className="rounded-panel p-5 backdrop-blur-xl shadow-panel text-center space-y-4" style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}>
           <BrainCircuit className="w-10 h-10 mx-auto text-slate-400" />
           <div className="text-xl font-bold text-slate-100">当前还没有真实体检报告</div>
           <div className="text-sm text-slate-400">点击“开新实验”后，系统会检查数据、给股票打分、分组验证，再输出是否值得观察。</div>
@@ -1210,13 +332,13 @@ export function FactorLab() {
 
       {hasHistoricalResult && (
         <section
-          className="rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+          className="rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
           style={{ background: 'rgba(13, 27, 50, 0.5)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
         >
           <div className="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-5">
             <div className="space-y-3">
               <div className="text-[11px] font-bold tracking-[0.18em] text-emerald-300">策略研发飞轮</div>
-              <h3 className="text-2xl font-black text-slate-100">{getLifecycleTitle(lifecycle)}</h3>
+              <h3 className="text-lg font-semibold text-slate-100">{getLifecycleTitle(lifecycle)}</h3>
               <p className="text-sm text-slate-300 leading-relaxed max-w-4xl">
                 {lifecycle?.next_action || '后端策略版本状态尚未同步；Factor Lab 的研究结果不会自动覆盖原策略，刷新报告后会显示候选版本、影子观察和审批状态。'}
               </p>
@@ -1473,69 +595,11 @@ export function FactorLab() {
 
       {hasHistoricalResult && !expertMode && (
         <section className="space-y-6">
-          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-            <article
-              className="xl:col-span-7 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
-              style={{ background: 'rgba(13, 27, 50, 0.5)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
-            >
-              <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
-                <div className="space-y-3">
-                  <div className="text-[11px] font-bold tracking-[0.18em] text-cyan-300">本次研究结论</div>
-                  <h3 className="text-3xl font-black text-slate-100">
-                    {userVerdict?.title ?? '等待真实研究结果'}
-                  </h3>
-                  <p className="text-sm text-slate-300 leading-relaxed max-w-3xl">
-                    {userVerdict?.summary ?? '系统会先检查数据，再用历史行情验证这套选股打分规则是否真的有区分度。'}
-                  </p>
-                  {displayedResult?.summary.sample_source_note && (
-                    <p className="text-xs text-slate-500 leading-relaxed max-w-3xl">
-                      {displayedResult.summary.sample_source_note}
-                    </p>
-                  )}
-                </div>
-                {userVerdict && (
-                  <div className={cn('rounded-3xl border px-5 py-4 min-w-[160px]', getVerdictTone(userVerdict.level))}>
-                    <div className="text-[10px] font-bold tracking-[0.18em] opacity-80">可信度</div>
-                    <div className="mt-2 text-3xl font-black">{userVerdict.score}</div>
-                    <div className="text-xs opacity-80">满分 100</div>
-                  </div>
-                )}
-              </div>
-
-              {userVerdict && (
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                  <div className="rounded-2xl border border-slate-700/40 bg-slate-950/20 p-4 lg:col-span-2">
-                    <div className="text-[10px] font-bold tracking-[0.18em] text-slate-500">为什么这么判断</div>
-                    <div className="mt-3 space-y-2 text-sm leading-relaxed text-slate-200">
-                      {userVerdict.reasons.map((reason) => (
-                        <p key={reason}>{reason}</p>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
-                    <div className="text-[10px] font-bold tracking-[0.18em] text-amber-200">主要风险</div>
-                    <div className="mt-3 space-y-2 text-sm leading-relaxed text-amber-50/90">
-                      {userVerdict.risks.map((risk) => (
-                        <p key={risk}>{risk}</p>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              )}
-              {(displayedResult?.summary.run_difference_note || (displayedResult?.summary.run_difference_reasons ?? []).length > 0) && (
-                <div className="rounded-2xl border border-cyan-500/15 bg-cyan-500/5 p-4 text-sm leading-relaxed text-cyan-50/90">
-                  <div className="font-semibold text-cyan-100">
-                    {displayedResult?.summary.run_difference_note || '本轮结果已重新训练和重新调权。'}
-                  </div>
-                  {(displayedResult?.summary.run_difference_reasons ?? []).slice(0, 3).map((reason) => (
-                    <p key={reason} className="mt-2 text-xs text-cyan-100/75">{reason}</p>
-                  ))}
-                </div>
-              )}
-            </article>
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
+            <FactorVerdict displayedResult={displayedResult} userVerdict={userVerdict}/>
 
             <article
-              className="xl:col-span-5 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+              className="xl:col-span-5 rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
               style={{ background: 'rgba(13, 27, 50, 0.5)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div className="flex items-center gap-3">
@@ -1555,9 +619,9 @@ export function FactorLab() {
             </article>
 	          </div>
 
-	          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+	          <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
 	            <article
-	              className="xl:col-span-5 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+	              className="xl:col-span-5 rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
 	              style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
 	            >
 	              <div className="flex items-start justify-between gap-4">
@@ -1632,7 +696,7 @@ export function FactorLab() {
 	            </article>
 
 	            <article
-	              className="xl:col-span-7 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+	              className="xl:col-span-7 rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
 	              style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
 	            >
 	              <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
@@ -1696,9 +760,9 @@ export function FactorLab() {
 	            </article>
 	          </div>
 
-	          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+	          <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
 	            <article
-              className="xl:col-span-5 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+              className="xl:col-span-5 rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div>
@@ -1727,7 +791,7 @@ export function FactorLab() {
             </article>
 
             <article
-              className="xl:col-span-7 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+              className="xl:col-span-7 rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div className="flex items-center justify-between gap-4">
@@ -1751,9 +815,9 @@ export function FactorLab() {
             </article>
           </div>
 
-          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
             <article
-              className="xl:col-span-7 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+              className="xl:col-span-7 rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div className="flex items-center justify-between gap-4">
@@ -1804,7 +868,7 @@ export function FactorLab() {
             </article>
 
             <article
-              className="xl:col-span-5 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+              className="xl:col-span-5 rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div>
@@ -1829,7 +893,7 @@ export function FactorLab() {
 
           {previewSignals.length > 0 && (
             <article
-              className="rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+              className="rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
@@ -1902,19 +966,19 @@ export function FactorLab() {
 	            </article>
 	          )}
 
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
             {strategyCards.map((card) => {
               const expanded = expandedCards[card.key];
               return (
                 <article
                   key={card.key}
-                  className="rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl space-y-5"
+                  className="rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-5"
                   style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div className="space-y-2">
                       <div className="text-[11px] font-bold tracking-[0.18em] text-cyan-300">策略卡</div>
-                      <h3 className="text-2xl font-black text-slate-100">{card.name}</h3>
+                      <h3 className="text-lg font-semibold text-slate-100">{card.name}</h3>
                       <p className="text-sm text-slate-400 leading-relaxed">{card.shortDesc}</p>
                     </div>
                     <button
@@ -1999,32 +1063,32 @@ export function FactorLab() {
 
       {hasHistoricalResult && expertMode && (
         <>
-          <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-6">
+          <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-4">
             {displayedMetrics.map((metric) => (
               <div
                 key={metric.key}
-                className="rounded-3xl p-6 shadow-xl"
+                className="rounded-panel p-4 shadow-xl"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <p className="text-[10px] font-bold text-slate-500 tracking-[0.18em]">{metric.label}</p>
-                <p className="text-2xl font-black text-slate-100 mt-3">{formatValue(metric.value, metric.format)}</p>
+                <p className="text-lg font-semibold text-slate-100 mt-3">{formatValue(metric.value, metric.format)}</p>
                 {metric.note && <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">{metric.note}</p>}
               </div>
             ))}
           </section>
 
           {walkForward && (
-            <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-6">
+            <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
               <div
-                className="rounded-3xl p-6 shadow-xl"
+                className="rounded-panel p-4 shadow-xl"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <p className="text-[10px] font-bold text-slate-500 tracking-[0.18em]">滚动训练</p>
-                <p className="text-2xl font-black text-slate-100 mt-3">{walkForward.enabled ? '已启用' : '未启用'}</p>
+                <p className="text-lg font-semibold text-slate-100 mt-3">{walkForward.enabled ? '已启用' : '未启用'}</p>
                 <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">{walkForward.message || '研究结果不再只依赖单次静态切分。'}</p>
               </div>
               <div
-                className="rounded-3xl p-6 shadow-xl"
+                className="rounded-panel p-4 shadow-xl"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <p className="text-[10px] font-bold text-slate-500 tracking-[0.18em]">评分来源</p>
@@ -2034,25 +1098,25 @@ export function FactorLab() {
                 <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">前端回测与预览分数优先跟随这个评分列。</p>
               </div>
               <div
-                className="rounded-3xl p-6 shadow-xl"
+                className="rounded-panel p-4 shadow-xl"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <p className="text-[10px] font-bold text-slate-500 tracking-[0.18em]">预测覆盖率</p>
-                <p className="text-2xl font-black text-slate-100 mt-3">{formatPercent(walkForward.coverage_ratio)}</p>
+                <p className="text-lg font-semibold text-slate-100 mt-3">{formatPercent(walkForward.coverage_ratio)}</p>
                 <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">滚动窗口里真正写回分数的样本占比。</p>
               </div>
               <div
-                className="rounded-3xl p-6 shadow-xl"
+                className="rounded-panel p-4 shadow-xl"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <p className="text-[10px] font-bold text-slate-500 tracking-[0.18em]">重训窗口</p>
-                <p className="text-2xl font-black text-slate-100 mt-3">{formatValue(walkForward.retrain_windows ?? null, 'integer')}</p>
+                <p className="text-lg font-semibold text-slate-100 mt-3">{formatValue(walkForward.retrain_windows ?? null, 'integer')}</p>
                 <p className="text-[11px] text-slate-400 mt-2 leading-relaxed">
                   每 {formatValue(walkForward.retrain_interval_dates ?? null, 'integer')} 个交易日滚动一次。
                 </p>
               </div>
               <div
-                className="rounded-3xl p-6 shadow-xl"
+                className="rounded-panel p-4 shadow-xl"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <p className="text-[10px] font-bold text-slate-500 tracking-[0.18em]">预测区间</p>
@@ -2066,9 +1130,9 @@ export function FactorLab() {
             </section>
           )}
 
-          <section className="grid grid-cols-1 xl:grid-cols-12 gap-8">
+          <section className="grid grid-cols-1 xl:grid-cols-12 gap-4">
             <div
-              className="xl:col-span-7 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl overflow-x-auto"
+              className="xl:col-span-7 rounded-panel p-4 backdrop-blur-xl shadow-panel overflow-x-auto"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div className="flex items-center justify-between gap-4 mb-5">
@@ -2126,7 +1190,7 @@ export function FactorLab() {
             </div>
 
             <div
-              className="xl:col-span-5 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl"
+              className="xl:col-span-5 rounded-panel p-4 backdrop-blur-xl shadow-panel"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div className="flex items-center gap-3 mb-4">
@@ -2142,9 +1206,9 @@ export function FactorLab() {
             </div>
           </section>
 
-          <section className="grid grid-cols-1 xl:grid-cols-12 gap-8">
+          <section className="grid grid-cols-1 xl:grid-cols-12 gap-4">
             <div
-              className="xl:col-span-7 rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl"
+              className="xl:col-span-7 rounded-panel p-4 backdrop-blur-xl shadow-panel"
               style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
             >
               <div className="flex items-center gap-3 mb-4">
@@ -2161,7 +1225,7 @@ export function FactorLab() {
 
             <div className="xl:col-span-5 space-y-6">
               <div
-                className="rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl"
+                className="rounded-panel p-4 backdrop-blur-xl shadow-panel"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <div className="flex items-center gap-3 mb-5">
@@ -2191,7 +1255,7 @@ export function FactorLab() {
               </div>
 
               <div
-                className="rounded-[2rem] p-6 backdrop-blur-xl shadow-2xl"
+                className="rounded-panel p-4 backdrop-blur-xl shadow-panel"
                 style={{ background: 'rgba(13, 27, 50, 0.45)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
               >
                 <div className="grid grid-cols-2 gap-4 text-sm">
@@ -2222,7 +1286,7 @@ export function FactorLab() {
           </section>
 
           <section
-            className="rounded-[2.5rem] p-8 backdrop-blur-xl shadow-2xl space-y-6"
+            className="rounded-panel p-4 backdrop-blur-xl shadow-panel space-y-6"
             style={{ background: 'rgba(13, 27, 50, 0.55)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.08)' }}
           >
             <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
@@ -2260,7 +1324,7 @@ export function FactorLab() {
                   ].map((item) => (
                     <div
                       key={item.label}
-                      className="rounded-3xl p-5 flex items-center gap-4"
+                      className="rounded-panel p-5 flex items-center gap-4"
                       style={{ background: 'rgba(8, 18, 36, 0.72)', borderWidth: '1px', borderStyle: 'solid', borderColor: 'rgba(59, 130, 246, 0.12)' }}
                     >
                       <div className={cn('p-3 rounded-2xl', colorMap[item.color]?.textBg, colorMap[item.color]?.text)}>
@@ -2289,7 +1353,7 @@ export function FactorLab() {
                         return (
                           <div
                             key={card.key}
-                            className="rounded-3xl p-5 border border-slate-700/40 bg-slate-950/20 space-y-4"
+                            className="rounded-panel p-5 border border-slate-700/40 bg-slate-950/20 space-y-4"
                           >
                             <div className="flex items-center justify-between gap-3">
                               <div>
@@ -2325,15 +1389,15 @@ export function FactorLab() {
                 )}
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 text-sm">
-                  <div className="rounded-3xl p-5 border border-slate-700/40 bg-slate-950/20">
+                  <div className="rounded-panel p-5 border border-slate-700/40 bg-slate-950/20">
                     <div className="text-[10px] tracking-[0.18em] font-bold text-slate-500">最终净值</div>
-                    <div className="text-slate-100 text-2xl font-black mt-2">
+                    <div className="text-slate-100 text-lg font-semibold mt-2">
                       {new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 0 }).format(backtest.summary.final_value)}
                     </div>
                     <div className="text-xs text-slate-500 mt-2">初始资金 {new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 0 }).format(backtest.summary.initial_capital)}</div>
                   </div>
 
-                  <div className="rounded-3xl p-5 border border-slate-700/40 bg-slate-950/20">
+                  <div className="rounded-panel p-5 border border-slate-700/40 bg-slate-950/20">
                     <div className="text-[10px] tracking-[0.18em] font-bold text-slate-500">组合风格</div>
                     <div className="text-slate-100 text-lg font-bold mt-2">
                       {backtest.metadata?.latest_regime ? `市场环境 ${backtest.metadata.latest_regime}` : '--'}
@@ -2341,7 +1405,7 @@ export function FactorLab() {
                     <div className="text-xs text-slate-500 mt-2">回测按因子分数排序执行，持仓数取 Top {config.top_n}。</div>
                   </div>
 
-                  <div className="rounded-3xl p-5 border border-slate-700/40 bg-slate-950/20">
+                  <div className="rounded-panel p-5 border border-slate-700/40 bg-slate-950/20">
                     <div className="text-[10px] tracking-[0.18em] font-bold text-slate-500">数据路由</div>
                     <div className="text-slate-100 text-lg font-bold mt-2">{backtest.resolved_pool?.effective_pool ?? config.pool}</div>
                     <div className="text-xs text-slate-500 mt-2">
@@ -2353,7 +1417,7 @@ export function FactorLab() {
                 </div>
               </div>
             ) : (
-              <div className="rounded-3xl p-8 border border-slate-700/40 bg-slate-950/20 text-slate-400 text-sm">
+              <div className="rounded-panel p-4 border border-slate-700/40 bg-slate-950/20 text-slate-400 text-sm">
                 当前还没有详细回测摘要。
               </div>
             )}

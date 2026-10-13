@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { pollJobResult } from '../api/pollJob';
 import { apiGet, apiPost, getApiErrorMessage, getApiErrorPayload, isRequestCanceled } from '../api/client';
 import { isRecord, toStr } from '../components/factor-lab/parse';
 import {
@@ -30,6 +31,8 @@ function buildBacktestRequest(config: FactorLabRunConfig) {
     end_date: config.end_date,
     initial_capital: 1000000,
     factor: 'ml_factor_ranker',
+    enable_hist_gradient_boosting: config.enable_hist_gradient_boosting ?? false,
+    price_mode: config.price_mode ?? 'strict_raw',
     commission_rate: 0.0003,
     slippage_rate: 0.0003,
     pool: config.pool,
@@ -143,7 +146,9 @@ export function useFactorLab(currentConfig?: FactorLabRunConfig) {
     const { requestId, signal } = beginRequest();
     updateState({ loading: true, loadingAction: 'load', error: null, notice: null, lastFailure: null });
     try {
-      const response = await apiGet<unknown>('/api/factor-lab/results', { timeout: 20000, signal });
+      const query = location.hash.startsWith('#factorLab') ? location.hash.split('?')[1] : undefined;
+      const job = new URLSearchParams(query).get('job');
+      const response = job ? await pollJobResult<unknown>(`/api/research/jobs/${job}`, `/api/research/jobs/${job}/result`, { signal, timeoutMs: 60 * 60 * 1000 }) : await apiGet<unknown>('/api/factor-lab/results', { timeout: 20000, signal });
       if (!isLatestRequest(requestId)) return null;
       const normalized = normalizeFactorLabResult(response, DEFAULT_FACTOR_LAB_RUN_CONFIG);
       setState((prev) => ({
@@ -210,7 +215,8 @@ export function useFactorLab(currentConfig?: FactorLabRunConfig) {
     }
 
     try {
-      const response = await apiPost<unknown>('/api/factor-lab/run', config, { timeout: 600000, signal });
+      const submit = await apiPost<{ job_id: string }>('/api/factor-lab/jobs', config, { timeout: 15000, signal });
+      const response = await pollJobResult<unknown>(`/api/research/jobs/${submit.job_id}`, `/api/research/jobs/${submit.job_id}/result`, { signal, timeoutMs: 60 * 60 * 1000 });
       if (!isLatestRequest(requestId)) return null;
       const normalized = normalizeFactorLabResult(response, config);
       if (!normalized) {

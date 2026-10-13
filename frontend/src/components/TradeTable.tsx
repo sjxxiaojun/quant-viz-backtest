@@ -60,6 +60,12 @@ export function TradeTable({ result }: TradeTableProps) {
   return (
     <Panel padded={false} className="p-3">
       <SectionTitle right={pager}>历史成交记录</SectionTitle>
+      {result.trades_truncated && <p className="text-amber-300">旧结果仅包含部分成交，请重新运行获取完整流水。</p>}
+      <button className="my-2 text-xs text-blue-300" onClick={() => {
+        const lines = ['date,stock_code,side,price,qty', ...result.trades.map(t => [t.date,t.stock_code,t.side,t.price,t.qty].join(','))];
+        const url = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' }));
+        const link = document.createElement('a'); link.href = url; link.download = 'backtest-trades.csv'; link.click(); URL.revokeObjectURL(url);
+      }}>导出完整成交（{result.trades_total ?? trades.length}笔）</button>
       {trades.length === 0 ? (
         <EmptyState title="回测期间没有产生任何成交" className="border-0 py-6" />
       ) : (

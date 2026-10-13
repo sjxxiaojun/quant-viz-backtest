@@ -33,7 +33,7 @@ interface ConfigPanelProps {
 /** 运行参数配置面板: 回看区间 / 股票池 / 持仓数量 / 样本预算 */
 export function ConfigPanel({ config, onChange, dateRangeInvalid }: ConfigPanelProps) {
   return (
-    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+    <div className="space-y-3"><div className="grid grid-cols-1 gap-3 md:grid-cols-3">
       <div className="rounded-ctl border border-line bg-bg2 p-3">
         <div className="mb-2 flex items-center gap-1.5 text-slate-400">
           <Calendar className="h-3.5 w-3.5" />
@@ -64,7 +64,7 @@ export function ConfigPanel({ config, onChange, dateRangeInvalid }: ConfigPanelP
           </label>
         </div>
         {dateRangeInvalid ? (
-          <p className="mt-2 text-[11px] text-rose-400">开始日期不能晚于结束日期。</p>
+          <p className="mt-2 text-[11px] text-rose-400">请填写有效的起止日期，开始日期不能晚于结束日期。</p>
         ) : (
           <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
             区间越长越能覆盖不同市场阶段；运行前自动检查是否需要补数。
@@ -138,6 +138,9 @@ export function ConfigPanel({ config, onChange, dateRangeInvalid }: ConfigPanelP
           </p>
         </div>
       </div>
-    </div>
+    </div><div className="space-y-2 rounded-md border border-line bg-bg2 p-3 text-xs">
+      <label className="flex gap-2 text-amber-300"><input type="checkbox" checked={config.price_mode==='approximate_adjusted'} onChange={e=>onChange({price_mode:e.target.checked ? 'approximate_adjusted' : 'strict_raw'})}/>允许复权价近似研究（默认严格未复权成交数据）</label>
+      <label className="flex gap-2 text-slate-300"><input type="checkbox" checked={config.enable_hist_gradient_boosting ?? false} onChange={e=>onChange({enable_hist_gradient_boosting:e.target.checked})}/>加入 HistGradientBoosting 候选（只在历史验证窗口选择融合权重）</label>
+    </div></div>
   );
 }

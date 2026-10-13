@@ -10,6 +10,15 @@ export function getApiErrorMessage(error: unknown, fallback: string): string {
   if (axios.isAxiosError(error)) {
     const payload = error.response?.data;
     if (payload && typeof payload === 'object' && 'detail' in payload) {
+      if (Array.isArray(payload.detail)) {
+        return payload.detail.map((item: unknown) => {
+          if (item && typeof item === 'object' && 'msg' in item) {
+            const field = 'loc' in item && Array.isArray(item.loc) ? item.loc.slice(1).join('.') : '';
+            return `${field ? `${field}: ` : ''}${String(item.msg)}`;
+          }
+          return fallback;
+        }).join('；') || fallback;
+      }
       return String(payload.detail || fallback);
     }
     return error.message || fallback;

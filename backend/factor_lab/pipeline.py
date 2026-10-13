@@ -11,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -134,16 +134,18 @@ class FactorLabConfig:
     start_date: str
     end_date: str
     pool: str = "core"
+    price_mode: str = "strict_raw"
+    enable_hist_gradient_boosting: bool = False
     label: str = "next_5d_ret"
     top_n: int = 5
     max_symbols: Optional[int] = None
     random_state: int = 42
     rf_n_estimators: int = 40
     rf_max_samples: float = 0.65
-    rf_n_jobs: int = -1
+    rf_n_jobs: int = 1
     walk_forward_rf_n_estimators: int = 24
-    walk_forward_max_windows: int = 4
-    walk_forward_max_train_rows: int = 36000
+    walk_forward_max_windows: int = 0
+    walk_forward_max_train_rows: int = 80000
 
 
 def _config_hash(config: FactorLabConfig) -> str:
@@ -559,7 +561,8 @@ def _build_model_pipelines(
     random_state: int,
     rf_n_estimators: int = 40,
     rf_max_samples: Optional[float] = 0.65,
-    rf_n_jobs: int = -1,
+    rf_n_jobs: int = 1,
+    enable_hist_gradient_boosting: bool = False,
 ) -> Dict[str, Pipeline]:
     rf_kwargs = {
         "n_estimators": max(8, int(rf_n_estimators)),
@@ -570,7 +573,7 @@ def _build_model_pipelines(
     }
     if rf_max_samples is not None and 0 < float(rf_max_samples) <= 1:
         rf_kwargs["max_samples"] = float(rf_max_samples)
-    return {
+    pipelines = {
         "baseline": Pipeline(
             steps=[
                 ("imputer", SimpleImputer(strategy="median")),
@@ -604,6 +607,11 @@ def _build_model_pipelines(
             ]
         ),
     }
+    if enable_hist_gradient_boosting:
+        pipelines['nonlinear_v2'] = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')),
+            ('model', HistGradientBoostingRegressor(max_iter=80, max_leaf_nodes=15,
+                learning_rate=.05, l2_regularization=1, early_stopping=False, random_state=random_state))])
+    return pipelines
 
 
 def _safe_predict(model: Pipeline, features: pd.DataFrame) -> np.ndarray:
@@ -709,7 +717,8 @@ def train_models(
     random_state: int,
     rf_n_estimators: int = 40,
     rf_max_samples: Optional[float] = 0.65,
-    rf_n_jobs: int = -1,
+    rf_n_jobs: int = 1,
+    enable_hist_gradient_boosting: bool = False,
 ) -> Dict[str, object]:
     train = sample[sample["split"] == "train"].copy()
     if train.empty:
@@ -730,6 +739,7 @@ def train_models(
         rf_n_estimators=rf_n_estimators,
         rf_max_samples=rf_max_samples,
         rf_n_jobs=rf_n_jobs,
+        enable_hist_gradient_boosting=enable_hist_gradient_boosting,
     )
     baseline = pipelines["baseline"]
     nonlinear = pipelines["nonlinear"]
@@ -753,6 +763,7 @@ def train_models(
     scored["ml_score"] = scored.groupby("date")["nonlinear_pred"].rank(pct=True)
     scored["ml_v2_score"] = scored.groupby("date")["nonlinear_v2_pred"].rank(pct=True)
     model_recipe = _optimize_model_blend(scored)
+    model_recipe["nonlinear_v2_model"] = "hist_gradient_boosting" if enable_hist_gradient_boosting else "random_forest_v2"
     scored["composite_score"] = _blend_score_multi(
         scored,
         float(model_recipe["baseline_weight"]),
@@ -779,7 +790,7 @@ def train_models(
     rf_v2_importance = pd.DataFrame(
         {
             "feature": fit_feature_columns,
-            "importance": rf_v2_model.feature_importances_,
+            "importance": getattr(rf_v2_model, "feature_importances_", np.zeros(len(fit_feature_columns))),
             "model": "random_forest_v2",
         }
     )
@@ -791,7 +802,8 @@ def train_models(
             "model": "ridge_abs_coef",
         }
     )
-    feature_importance = pd.concat([rf_importance, rf_v2_importance, ridge_importance], ignore_index=True)
+    importance_frames = [rf_importance, ridge_importance] if enable_hist_gradient_boosting else [rf_importance, rf_v2_importance, ridge_importance]
+    feature_importance = pd.concat(importance_frames, ignore_index=True)
     feature_importance["importance"] = feature_importance.groupby("model")["importance"].transform(
         lambda s: s / (s.sum() + 1e-12)
     )
@@ -809,152 +821,9 @@ def train_models(
     }
 
 
-def generate_walk_forward_predictions(
-    scored_base: pd.DataFrame,
-    feature_columns: List[str],
-    random_state: int,
-    max_windows: int = 4,
-    max_train_rows: int = 36000,
-    rf_n_estimators: int = 24,
-    rf_max_samples: Optional[float] = 0.65,
-    rf_n_jobs: int = -1,
-    baseline_weight: float = DEFAULT_BASELINE_WEIGHT,
-    nonlinear_weight: float = DEFAULT_NONLINEAR_WEIGHT,
-    nonlinear_v2_weight: float = 0.0,
-) -> Dict[str, object]:
-    scored = scored_base.copy()
-    scored["walk_forward_baseline_pred"] = np.nan
-    scored["walk_forward_pred"] = np.nan
-    scored["walk_forward_v2_pred"] = np.nan
-    unique_dates = sorted(scored["date"].dropna().unique().tolist())
-    if len(unique_dates) < 90:
-        return {
-            "scored": scored,
-            "metrics": pd.DataFrame(),
-            "summary": {
-                "enabled": False,
-                "message": "not enough dates for walk-forward evaluation",
-                "score_source": "composite_score",
-                "baseline_weight": float(baseline_weight),
-                "nonlinear_weight": float(nonlinear_weight),
-                "nonlinear_v2_weight": float(nonlinear_v2_weight),
-            },
-        }
-
-    min_train_dates = min(max(60, len(unique_dates) // 3), len(unique_dates) - 10)
-    base_step_size = max(10, min(20, len(unique_dates) // 8))
-    remaining_dates = max(len(unique_dates) - min_train_dates, 0)
-    if max_windows and max_windows > 0:
-        step_size = max(base_step_size, int(np.ceil(remaining_dates / max_windows)))
-    else:
-        step_size = base_step_size
-    retrain_windows = 0
-    predicted_dates = []
-
-    for start_idx in range(min_train_dates, len(unique_dates), step_size):
-        if max_windows and retrain_windows >= max_windows:
-            break
-        train_dates = set(unique_dates[:start_idx])
-        infer_dates = unique_dates[start_idx:start_idx + step_size]
-        if not infer_dates:
-            continue
-        train_chunk = scored[scored["date"].isin(train_dates)].dropna(subset=["label_reg"]).copy()
-        if "label_end_date" in train_chunk.columns:
-            train_chunk = train_chunk[train_chunk["label_end_date"] < infer_dates[0]].copy()
-        infer_chunk = scored[scored["date"].isin(infer_dates)].copy()
-        if len(train_chunk) < 100 or infer_chunk.empty:
-            continue
-        if max_train_rows and len(train_chunk) > max_train_rows:
-            train_chunk = train_chunk.sort_values(["date", "stock_code"]).tail(max_train_rows).copy()
-
-        chunk_feature_columns = [
-            column for column in feature_columns
-            if column in train_chunk.columns and train_chunk[column].replace([np.inf, -np.inf], np.nan).notna().any()
-        ]
-        if len(chunk_feature_columns) < 5:
-            continue
-
-        pipelines = _build_model_pipelines(
-            random_state + retrain_windows,
-            rf_n_estimators=rf_n_estimators,
-            rf_max_samples=rf_max_samples,
-            rf_n_jobs=rf_n_jobs,
-        )
-        x_train = train_chunk[chunk_feature_columns].replace([np.inf, -np.inf], np.nan)
-        y_train = train_chunk["label_reg"]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            pipelines["baseline"].fit(x_train, y_train)
-        pipelines["nonlinear"].fit(x_train, y_train)
-        pipelines["nonlinear_v2"].fit(x_train, y_train)
-
-        x_infer = infer_chunk[chunk_feature_columns].replace([np.inf, -np.inf], np.nan)
-        baseline_pred = _safe_predict(pipelines["baseline"], x_infer)
-        nonlinear_pred = _safe_predict(pipelines["nonlinear"], x_infer)
-        nonlinear_v2_pred = _safe_predict(pipelines["nonlinear_v2"], x_infer)
-        scored.loc[infer_chunk.index, "walk_forward_baseline_pred"] = baseline_pred
-        scored.loc[infer_chunk.index, "walk_forward_pred"] = nonlinear_pred
-        scored.loc[infer_chunk.index, "walk_forward_v2_pred"] = nonlinear_v2_pred
-        retrain_windows += 1
-        predicted_dates.extend(infer_dates)
-
-    scored["walk_forward_baseline_pred"] = scored["walk_forward_baseline_pred"].replace([np.inf, -np.inf], np.nan)
-    scored["walk_forward_pred"] = scored["walk_forward_pred"].replace([np.inf, -np.inf], np.nan)
-    scored["walk_forward_v2_pred"] = scored["walk_forward_v2_pred"].replace([np.inf, -np.inf], np.nan)
-    scored["walk_forward_baseline_score"] = scored.groupby("date")["walk_forward_baseline_pred"].rank(pct=True)
-    scored["walk_forward_score"] = scored.groupby("date")["walk_forward_pred"].rank(pct=True)
-    scored["walk_forward_v2_score"] = scored.groupby("date")["walk_forward_v2_pred"].rank(pct=True)
-    oos_mask = scored["walk_forward_pred"].notna() | scored["walk_forward_baseline_pred"].notna()
-    scored["walk_forward_composite_score"] = np.nan
-    total_weight = max(float(baseline_weight) + float(nonlinear_weight) + float(nonlinear_v2_weight), 1e-9)
-    scored.loc[oos_mask, "walk_forward_composite_score"] = (
-        scored.loc[oos_mask, "walk_forward_baseline_score"].fillna(0.5) * float(baseline_weight)
-        + scored.loc[oos_mask, "walk_forward_score"].fillna(0.5) * float(nonlinear_weight)
-        + scored.loc[oos_mask, "walk_forward_v2_score"].fillna(0.5) * float(nonlinear_v2_weight)
-    ) / total_weight
-
-    metrics_rows = []
-    if scored["walk_forward_baseline_pred"].notna().sum() > 0:
-        metrics_rows.append(
-            _model_metrics(scored, "walk_forward_baseline_score", "walk_forward_baseline_pred", "walk_forward_baseline")
-        )
-    if scored["walk_forward_pred"].notna().sum() > 0:
-        metrics_rows.append(
-            _model_metrics(scored, "walk_forward_score", "walk_forward_pred", "walk_forward_random_forest")
-        )
-    if scored["walk_forward_v2_pred"].notna().sum() > 0:
-        metrics_rows.append(
-            _model_metrics(scored, "walk_forward_v2_score", "walk_forward_v2_pred", "walk_forward_random_forest_v2")
-        )
-        metrics_rows.append(
-            _model_metrics(scored, "walk_forward_composite_score", "walk_forward_pred", "walk_forward_composite")
-        )
-
-    predicted_dates = sorted(set(predicted_dates))
-    coverage = float(scored["walk_forward_pred"].notna().mean()) if len(scored) > 0 else 0.0
-    summary = {
-        "enabled": bool(predicted_dates),
-        "score_source": "walk_forward_composite_score" if predicted_dates else "composite_score",
-        "first_prediction_date": predicted_dates[0] if predicted_dates else None,
-        "last_prediction_date": predicted_dates[-1] if predicted_dates else None,
-        "retrain_windows": retrain_windows,
-        "retrain_interval_dates": step_size,
-        "base_retrain_interval_dates": base_step_size,
-        "max_retrain_windows": int(max_windows) if max_windows else None,
-        "max_train_rows": int(max_train_rows) if max_train_rows else None,
-        "rf_n_estimators": int(rf_n_estimators),
-        "baseline_weight": float(baseline_weight),
-        "nonlinear_weight": float(nonlinear_weight),
-        "nonlinear_v2_weight": float(nonlinear_v2_weight),
-        "sampled_walk_forward": bool(step_size > base_step_size or (max_windows and retrain_windows >= max_windows)),
-        "coverage_ratio": coverage,
-        "oos_enforced": bool(predicted_dates),
-    }
-    return {
-        "scored": scored,
-        "metrics": pd.DataFrame(metrics_rows),
-        "summary": summary,
-    }
+def generate_walk_forward_predictions(scored_base, feature_columns, random_state, **kwargs):
+    from .causal import generate_predictions
+    return generate_predictions(scored_base, feature_columns, random_state, **kwargs)
 
 
 def _signals_from_scores(scored: pd.DataFrame, top_n: int, score_col: str = "composite_score") -> pd.DataFrame:
@@ -981,6 +850,8 @@ def _signals_from_scores(scored: pd.DataFrame, top_n: int, score_col: str = "com
         "walk_forward_composite_score",
         "label_end_date",
         "label_horizon",
+        "fold_id",
+        "recipe_as_of",
     ]
     out = scored[[column for column in cols if column in scored.columns]].copy()
     out["score_source"] = score_col
@@ -1368,7 +1239,13 @@ def run_factor_lab(
     run_config_hash = _config_hash(config)
 
     sample, feature_columns, feature_groups = build_model_sample(raw_df, target_label=config.label, winsorize=False)
+    feature_columns = [column for column in FEATURE_COLUMNS if column in sample]
     sample = sample[(sample["date"] >= config.start_date) & (sample["date"] <= config.end_date)].copy()
+    from .data_prep import generate_features, add_labels
+    causal_features, _ = generate_features(raw_df)
+    causal_sample = add_labels(causal_features, target_label=config.label)
+    causal_sample = causal_sample[(causal_sample.date >= config.start_date) & (causal_sample.date <= config.end_date)].copy()
+    causal_columns = [c for c in FEATURE_COLUMNS if c in causal_sample.columns]
     sample = split_by_time(sample)
     sample = winsorize_features(sample, feature_columns, fit_split="train")
     sample, feature_columns, discovered_groups, mining_report = mine_candidate_factors(sample, feature_columns)
@@ -1389,19 +1266,24 @@ def run_factor_lab(
         rf_n_estimators=config.rf_n_estimators,
         rf_max_samples=config.rf_max_samples,
         rf_n_jobs=config.rf_n_jobs,
+        enable_hist_gradient_boosting=config.enable_hist_gradient_boosting,
     )
     walk_forward_bundle = generate_walk_forward_predictions(
-        model_bundle["scored"],
-        model_bundle["feature_columns"],
+        split_by_time(causal_sample),
+        causal_columns,
         random_state=config.random_state,
         max_windows=config.walk_forward_max_windows,
         max_train_rows=config.walk_forward_max_train_rows,
         rf_n_estimators=config.walk_forward_rf_n_estimators,
         rf_max_samples=config.rf_max_samples,
         rf_n_jobs=config.rf_n_jobs,
+        enable_hist_gradient_boosting=config.enable_hist_gradient_boosting,
         baseline_weight=float(model_bundle["model_recipe"].get("baseline_weight", DEFAULT_BASELINE_WEIGHT)),
         nonlinear_weight=float(model_bundle["model_recipe"].get("nonlinear_weight", DEFAULT_NONLINEAR_WEIGHT)),
     )
+    if walk_forward_bundle.get("latest_bundle") is None:
+        raise ValueError("没有可验证的样本外窗口；请提供超过160个交易日的数据。")
+    model_bundle = walk_forward_bundle["latest_bundle"]
     scored = walk_forward_bundle["scored"]
     model_metrics = pd.concat(
         [model_bundle["metrics"], walk_forward_bundle["metrics"]],
@@ -1431,17 +1313,22 @@ def run_factor_lab(
     summary["pool"] = config.pool
     summary["label"] = config.label
     summary["top_n"] = config.top_n
+    summary["enable_hist_gradient_boosting"] = config.enable_hist_gradient_boosting
     summary["max_symbols"] = config.max_symbols
     summary["total_symbols"] = summary["symbols"]
     summary["train_samples"] = int(summary["split_counts"].get("train", 0))
     summary["inference_date"] = summary["generated_at"]
     summary["universe"] = "%s 股票池" % config.pool
     summary["research_note"] = "本次策略体检已更新两套 ML 策略卡、专家模式研究摘要和详细回测结果。"
+    summary["evaluation_version"] = "causal-wf-v2"
+    summary["research_revision"] = "terminal-v3"
     summary["walk_forward"] = walk_forward_bundle["summary"]
     summary["score_source"] = score_source
     summary["model_recipe"] = {
         "baseline_model": "Ridge 线性基线",
         "nonlinear_model": "RandomForest 非线性模型",
+        "nonlinear_v2_model": model_bundle["model_recipe"].get("nonlinear_v2_model", "random_forest_v2"),
+        "nonlinear_v2_weight": float(model_bundle["model_recipe"].get("nonlinear_v2_weight", 0)),
         "baseline_weight": float(model_bundle["model_recipe"].get("baseline_weight", DEFAULT_BASELINE_WEIGHT)),
         "nonlinear_weight": float(model_bundle["model_recipe"].get("nonlinear_weight", DEFAULT_NONLINEAR_WEIGHT)),
         "selection_metric": model_bundle["model_recipe"].get("selection_metric"),
@@ -1457,6 +1344,12 @@ def run_factor_lab(
     )
     summary.update(_build_run_difference_notes(previous_result, summary, mining_report))
     run_manifest = {
+        "evaluation_version": "causal-wf-v2",
+        "price_mode": config.price_mode,
+        "folds": walk_forward_bundle["summary"]["folds"],
+        "research_revision": "terminal-v3",
+        "trained_through": model_bundle["trained_through"],
+        "feature_bounds": model_bundle["feature_bounds"],
         "run_id": summary["run_id"],
         "config": asdict(config),
         "config_hash": run_config_hash,
@@ -1481,7 +1374,11 @@ def run_factor_lab(
         _atomic_to_csv(scored, output_dir / "training_sample_scored.csv")
         _atomic_joblib_dump(
             {
+                "evaluation_version": "causal-wf-v2",
+                "trained_through": model_bundle["trained_through"],
+                "feature_bounds": model_bundle["feature_bounds"],
                 "model": model_bundle["nonlinear_model"],
+                "nonlinear_v2_model": model_bundle["nonlinear_v2_model"],
                 "baseline_model": model_bundle["baseline_model"],
                 "feature_columns": model_bundle["feature_columns"],
                 "config": asdict(config),

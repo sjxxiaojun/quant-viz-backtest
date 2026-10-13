@@ -16,6 +16,7 @@ from automation_store import AutomationStore
 from data_lake_update_service import DataLakeUpdateService
 from data_manager import DataManager
 from data_sentinel import DataSentinel
+from research_contracts import market_now
 
 
 logger = logging.getLogger("AutomationScheduler")
@@ -237,7 +238,7 @@ class AutomationOrchestrator:
             rows, source = self._fetch_market_snapshot(limit=limit)
             snapshot = self.store.record_market_snapshot(
                 rows,
-                market_session=self._market_session(datetime.now()),
+                market_session=self._market_session(market_now()),
                 source=source,
             )
             summary = {"snapshot": snapshot, "row_count": len(rows), "source": source}
@@ -443,6 +444,7 @@ class AutomationOrchestrator:
                 details={"update": update, "freshness": freshness, "sentinel": sentinel, "retry_run": retry_run},
             )
         return {
+            "status": "failed" if update.get("status") == "failed" else "partial" if not virtual_trade or virtual_trade.get("status") in {"partial", "failed", "blocked"} else "success",
             "update": update,
             "sentinel": sentinel,
             "jiucai": jiucai,
@@ -1478,7 +1480,7 @@ class LightweightScheduler:
             "enabled": self.enabled,
             "running": bool(self._thread and self._thread.is_alive()),
             "poll_seconds": self.poll_seconds,
-            "next_jobs": self.next_jobs(datetime.now()),
+            "next_jobs": self.next_jobs(market_now()),
             "schedules": {
                 "realtime_snapshot": INTRADAY_SNAPSHOT_TIMES,
                 "eod_update": EOD_UPDATE_TIMES,
@@ -1517,7 +1519,7 @@ class LightweightScheduler:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self._tick(datetime.now())
+                self._tick(market_now())
             except Exception:
                 logger.exception("scheduler tick failed")
             self._stop.wait(self.poll_seconds)
@@ -1531,7 +1533,7 @@ class LightweightScheduler:
             date_key = now.strftime("%Y-%m-%d")
             hm = now.strftime("%H:%M")
             for schedule_hm in INTRADAY_SNAPSHOT_TIMES:
-                if hm >= schedule_hm:
+                if schedule_hm <= hm and (now - self._datetime_for_hm(now, schedule_hm)).total_seconds() < 600:
                     self._run_once(date_key, f"realtime_snapshot:{schedule_hm}", lambda: self.orchestrator.run_realtime_snapshot(trigger="scheduler"))
             for idx, schedule_hm in enumerate(EOD_UPDATE_TIMES):
                 if hm >= schedule_hm:
@@ -1561,10 +1563,17 @@ class LightweightScheduler:
         state_key = f"scheduler_done:{date_key}:{task_key}"
         if self.orchestrator.store.get_state(state_key):
             return
+        failed_key = state_key + ":retry_after"
+        retry_after = self.orchestrator.store.get_state(failed_key)
+        if retry_after and time.time() < float(retry_after.get("time", 0)):
+            return
         result = runner()
+        if isinstance(result, dict) and result.get("status") in {"failed", "partial", "blocked"}:
+            self.orchestrator.store.set_state(failed_key, {"time": time.time() + 300, "result": result})
+            return
         self.orchestrator.store.set_state(
             state_key,
-            {"completed_at": datetime.now().isoformat(timespec="seconds"), "result": result},
+            {"completed_at": market_now().isoformat(timespec="seconds"), "result": result},
         )
 
     @staticmethod

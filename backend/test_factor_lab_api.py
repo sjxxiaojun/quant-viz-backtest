@@ -7,6 +7,13 @@ from factor_lab.pipeline import load_latest_result as pipeline_load_latest_resul
 import main
 
 
+@pytest.fixture(autouse=True)
+def isolate_price_adapter(monkeypatch):
+    # Endpoint orchestration tests use injected synthetic data/pipelines.
+    # The strict adapter and future-base invariance are exercised in test_reliable_v2.
+    monkeypatch.setattr(main.execution_data_service, "prepare", lambda frame, **kwargs: frame.copy())
+
+
 client = TestClient(main.app)
 
 

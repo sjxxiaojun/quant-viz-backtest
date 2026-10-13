@@ -46,5 +46,10 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
+if [ ! -x "$BACKEND_DIR/.venv/bin/python" ]; then
+  echo "Run: cd backend && uv sync --locked --python 3.12" >&2
+  exit 1
+fi
+
 # backend.log 由应用内 RotatingFileHandler 负责轮转写入；stdout/stderr 单独落盘避免双写同一文件。
-exec env PYTHONUNBUFFERED=1 "$BACKEND_DIR/venv/bin/python3" -m uvicorn main:app --host 127.0.0.1 --port 8080 >> "$BACKEND_DIR/backend_stdout.log" 2>> "$BACKEND_DIR/backend_stderr.log"
+exec env PYTHONUNBUFFERED=1 "$BACKEND_DIR/.venv/bin/python" -m uvicorn main:app --host 127.0.0.1 --port 8080 >> "$BACKEND_DIR/backend_stdout.log" 2>> "$BACKEND_DIR/backend_stderr.log"

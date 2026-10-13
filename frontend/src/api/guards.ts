@@ -22,6 +22,7 @@ function toStringField(value: unknown, field: string): string {
 function normalizeTrade(source: unknown): Trade {
   if (!isRecord(source)) throw new Error('成交记录格式无效');
   return {
+    ...source,
     date: toStringField(source.date, 'trade.date'),
     stock_code: toStringField(source.stock_code, 'trade.stock_code'),
     stock_name: typeof source.stock_name === 'string' ? source.stock_name : String(source.stock_code ?? ''),
